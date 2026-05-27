@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Plan Renderer</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script>
+      // Apply persisted theme before first paint. Key shared with src/titlebar.ts (THEME_KEY).
+      try { var t = localStorage.getItem("plan-reader-theme");
+            if (t === "dark") document.documentElement.dataset.theme = "dark"; } catch (e) {}
+    </script>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="window" role="application" aria-label="Claude Plan Renderer">
+      <!-- title bar — macOS native-overlay style: the REAL OS traffic lights sit
+           over the top-left of this bar (see titleBarStyle:"Overlay" in
+           tauri.conf.json). The bar itself is the drag region. The
+           .titlebar-controls slot holds genuinely interactive controls (the
+           theme toggle; later sub-plans append their button + overlay as later
+           siblings here). Those controls keep pointer-events:auto and are
+           carved out of window-drag by isDragTarget() in src/titlebar.ts, which
+           bails on interactive targets — NOT by omitting the drag attribute. -->
+      <div class="titlebar" data-tauri-drag-region>
+        <div class="titlebar-controls">
+          <!-- Prompt Feedback button (Sub-Plan 03). FIRST child so #theme-toggle stays
+               far-right. Hidden until >=1 comment exists; main.ts toggles `.hidden` and the
+               #feedback-count badge via applyFeedbackButtonState(). No data-tauri-drag-region —
+               window-drag exclusion for this <button> is handled by isDragTarget() in
+               src/titlebar.ts (interactive-target bail), not by omitting the attribute. -->
+          <button class="feedback-btn hidden" id="feedback-btn" type="button"
+                  title="Show prompt feedback" aria-label="Show prompt feedback">
+            <span class="ico" aria-hidden="true">&#128172;</span>
+            <span class="label">Prompt Feedback</span>
+            <span class="badge" id="feedback-count">0</span>
+          </button>
+          <button class="theme-toggle" id="theme-toggle" type="button"
+                  title="Toggle dark / light theme" aria-label="Toggle dark / light theme">
+            <span class="ico" id="theme-icon">&#9789;</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="body">
+        <!-- sidebar -->
+        <aside class="sidebar">
+          <!-- Tabbed left panel: Plans (default) + Contents (ToC of open plan).
+               initTabs() in main.ts toggles .active on a .tab and its matching
+               .tab-pane. The sidebar↔reading-pane boundary stays disjoint: the
+               ToC is built from a plain TocEntry[] produced by the render
+               facade (extractToc), never by querying #reading-pane here. -->
+          <div class="tab-row" role="tablist">
+            <span class="tab active" data-tab="plans" role="tab">Plans</span>
+            <span class="tab" data-tab="contents" role="tab">Contents</span>
+          </div>
+
+          <!-- Plans pane (default-active). #plan-count stays in this head — a
+               frozen contract selector; do not relocate it. -->
+          <div class="tab-pane active" id="tab-plans">
+            <div class="sidebar-head">
+              <h2>Recent Plans</h2>
+              <span class="count" id="plan-count">0 files</span>
+            </div>
+            <!-- Live sidebar filter (Fix 1). Keeps the frozen .search container class; now an
+                 interactive control: search icon + #plan-filter input + clear (✕) button.
+                 Filters the Plans tab only (never #toc-list). -->
+            <div class="search">
+              <span class="ico" aria-hidden="true">🔍</span>
+              <input id="plan-filter" type="text" placeholder="Filter plans…" autocomplete="off" aria-label="Filter plans" />
+              <button class="clear" type="button" title="Clear filter" aria-label="Clear filter">✕</button>
+            </div>
+            <!-- #plan-list: 03 mutates — sidebar rows rendered/updated here -->
+            <div class="plan-list" id="plan-list"></div>
+          </div>
+
+          <!-- Contents pane — table of contents for the currently-open plan.
+               #toc-list is built by buildToc() in main.ts from extractToc's
+               read-only walk of the rendered pane. -->
+          <div class="tab-pane" id="tab-contents">
+            <div class="toc-head"><h2>Contents</h2></div>
+            <div class="toc-list" id="toc-list"></div>
+          </div>
+        </aside>
+
+        <!-- reading pane -->
+        <!-- #reader-scroll: scroll-preservation anchor (02 refines) -->
+        <main class="reader" id="reader-scroll">
+          <div class="reader-inner">
+            <div class="doc-header">
+              <div class="doc-filename" id="doc-filename"></div>
+              <div class="doc-src" id="doc-src"></div>
+            </div>
+
+            <!-- #reading-pane: 02 renders into — the markdown render target.
+                 Sub-Plan 01 shows raw text only (white-space: pre-wrap). -->
+            <div class="md" id="reading-pane"></div>
+          </div>
+        </main>
+      </div>
+
+      <!-- Selection popover (Sub-Plan 02). Placed OUTSIDE #reading-pane (a child of
+           .window) so renderInto's pane-only innerHTML wipe never removes it. No
+           data-tauri-drag-region (it is not part of the titlebar). The single applier
+           renderPopover() in src/render/comments.ts is the sole writer of `.hidden` /
+           #sp-quote / #sp-text. -->
+      <div class="sel-popover hidden" id="sel-popover">
+        <div class="sp-quote" id="sp-quote"></div>
+        <textarea id="sp-text" placeholder="Add a comment for Claude Code…"></textarea>
+        <div class="sp-foot">
+          <button id="sp-cancel" type="button">Cancel</button>
+          <button class="save" id="sp-save" type="button">Add comment</button>
+        </div>
+      </div>
+
+      <!-- Prompt Feedback overlay (Sub-Plan 03). Placed OUTSIDE the titlebar and the
+           reading pane (a sibling of #sel-popover under .window) so it inherits no
+           drag region and survives the pane's innerHTML wipe. position:fixed (CSS)
+           anchors it top-right beneath the titlebar. main.ts toggles `.hidden`,
+           snapshots the generated prompt into the feedback-body pre on open, and
+           wires Copy / Clear. NO data-tauri-drag-region. -->
+      <div class="feedback-overlay hidden" id="feedback-overlay">
+        <div class="fo-head">
+          <h3>Prompt Feedback</h3>
+          <div class="fo-actions">
+            <button id="feedback-copy" type="button">Copy</button>
+            <button id="feedback-clear" type="button">Clear comments</button>
+          </div>
+        </div>
+        <pre class="fo-body" id="feedback-body"></pre>
+        <div class="fo-foot">Each entry concisely quotes the highlighted snippet, then your comment.</div>
+      </div>
+    </div>
+  </body>
+</html>

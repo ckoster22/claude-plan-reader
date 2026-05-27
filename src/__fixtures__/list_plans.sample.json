@@ -1,0 +1,54 @@
+[
+  {
+    "absolute_path": "/Users/u/.claude/plans/master-alpha.md",
+    "filename_stem": "master-alpha",
+    "mtime_ms": 1700000300000,
+    "cwd": "/Users/u/work/alpha",
+    "unread": true,
+    "flavor": "master",
+    "tree_id": "tree-alpha",
+    "nn": null,
+    "child_count": 2,
+    "collapsed": false,
+    "h1s": ["Plan: Alpha master"]
+  },
+  {
+    "absolute_path": "/Users/u/.claude/plans/alpha-sub01.md",
+    "filename_stem": "alpha-sub01",
+    "mtime_ms": 1700000200000,
+    "cwd": "/Users/u/work/alpha",
+    "unread": false,
+    "flavor": "sub",
+    "tree_id": "tree-alpha",
+    "nn": 1,
+    "child_count": null,
+    "collapsed": false,
+    "h1s": ["Sub-Plan 01 — Foundations"]
+  },
+  {
+    "absolute_path": "/Users/u/.claude/plans/alpha-sub02.md",
+    "filename_stem": "alpha-sub02",
+    "mtime_ms": 1700000100000,
+    "cwd": null,
+    "unread": false,
+    "flavor": "sub",
+    "tree_id": "tree-alpha",
+    "nn": 2,
+    "child_count": null,
+    "collapsed": false,
+    "h1s": []
+  },
+  {
+    "absolute_path": "/Users/u/.claude/plans/standalone-solo.md",
+    "filename_stem": "standalone-solo",
+    "mtime_ms": 1700000050000,
+    "cwd": null,
+    "unread": false,
+    "flavor": "standalone",
+    "tree_id": null,
+    "nn": null,
+    "child_count": null,
+    "collapsed": false,
+    "h1s": ["Standalone solo plan"]
+  }
+]
