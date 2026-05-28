@@ -1,0 +1,34 @@
+[
+  {
+    "absolute_path": "/Users/u/.claude/plans/add-oauth-device-flow.md",
+    "filename_stem": "add-oauth-device-flow",
+    "mtime_ms": 1700000300000,
+    "cwd": "/Users/u/work/auth-gateway",
+    "unread": true,
+    "h1s": ["Add OAuth device-code flow"]
+  },
+  {
+    "absolute_path": "/Users/u/.claude/plans/refactor-sidebar-flat.md",
+    "filename_stem": "refactor-sidebar-flat",
+    "mtime_ms": 1700000200000,
+    "cwd": "/Users/u/work/plan-reader",
+    "unread": false,
+    "h1s": ["Refactor sidebar to a flat list", "Edge cases"]
+  },
+  {
+    "absolute_path": "/Users/u/.claude/plans/fix-reload-race.md",
+    "filename_stem": "fix-reload-race",
+    "mtime_ms": 1700000100000,
+    "cwd": null,
+    "unread": false,
+    "h1s": []
+  },
+  {
+    "absolute_path": "/Users/u/.claude/plans/index-plans-by-cwd.md",
+    "filename_stem": "index-plans-by-cwd",
+    "mtime_ms": 1700000050000,
+    "cwd": null,
+    "unread": false,
+    "h1s": ["Index plans by cwd"]
+  }
+]
