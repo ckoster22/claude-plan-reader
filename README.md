@@ -20,7 +20,8 @@ The app reads (read-only) from two directories under `~/.claude/`:
 
 - **macOS** (Apple Silicon or Intel). Packaged for macOS only.
 - **Node.js 18+** — for the frontend toolchain (Vite + vitest).
-- **Rust toolchain** via [rustup](https://rustup.rs/) — for the Tauri backend.
+- **Rust toolchain** — for the Tauri backend. [rustup](https://rustup.rs/) is recommended, but a Homebrew Rust (`brew install rust`) works too; the build only needs a working `cargo`/`rustc` (1.88 verified).
+- **Xcode Command Line Tools** — provides the `clang`/`cc` linker that cargo needs to link the Rust binary. Install with `xcode-select --install` (a full Xcode install also satisfies this). Without it the Rust build fails at the link step.
 
 Tauri's other system prerequisites come in via the `@tauri-apps/cli` npm dep; you generally don't need extra setup.
 
