@@ -29,7 +29,7 @@ const H = vi.hoisted(() => {
     countQueue: [] as Array<Deferred<number>>,
     // Per-path comment fixtures for get_comments (so the overlay body differs by plan). The value
     // is whatever buildFeedbackPrompt will quote; tests seed this keyed by absolute_path.
-    commentsByPath: {} as Record<string, Array<{ quote: string; comment: string; block_line: null; occurrence: number; id: number }>>,
+    commentsByPath: {} as Record<string, Array<{ quote: string; comment: string; block_line: null; block_end_line: null; occurrence: number; id: number }>>,
   };
 });
 
@@ -73,7 +73,7 @@ vi.mock("./render/scroll", () => ({
   applyDelta: vi.fn(),
   scrollToHeading: vi.fn(),
 }));
-vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn() }));
+vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
 import { openPlan, reloadOpenPlan, refreshCommentCount, currentCommentCount } from "./main";
 import { asAbsPath, asStem } from "./types";
@@ -205,10 +205,10 @@ describe("feedback overlay — never shows a STALE prompt across plan switch / l
     H.countQueue.length = 0;
     // Plan A has a distinctive comment; plan B has a different one.
     H.commentsByPath["/p/A.md"] = [
-      { quote: "ALPHA-SNIPPET", comment: "alpha note", block_line: null, occurrence: 0, id: 0 },
+      { quote: "ALPHA-SNIPPET", comment: "alpha note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
     ];
     H.commentsByPath["/p/B.md"] = [
-      { quote: "BETA-SNIPPET", comment: "beta note", block_line: null, occurrence: 0, id: 0 },
+      { quote: "BETA-SNIPPET", comment: "beta note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
     ];
 
     // Open A, then open the overlay — it shows A's snippet and is visible.
@@ -238,7 +238,7 @@ describe("feedback overlay — never shows a STALE prompt across plan switch / l
     H.countQueue.length = 0;
     // A starts with one comment.
     H.commentsByPath["/p/A.md"] = [
-      { quote: "FIRST-SNIPPET", comment: "note", block_line: null, occurrence: 0, id: 0 },
+      { quote: "FIRST-SNIPPET", comment: "note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
     ];
 
     await openPlan(asAbsPath("/p/A.md"), asStem("A"));
@@ -249,8 +249,8 @@ describe("feedback overlay — never shows a STALE prompt across plan switch / l
 
     // A live edit changes A's comments on disk (e.g. a new comment added by the agent).
     H.commentsByPath["/p/A.md"] = [
-      { quote: "FIRST-SNIPPET", comment: "note", block_line: null, occurrence: 0, id: 0 },
-      { quote: "SECOND-SNIPPET", comment: "extra", block_line: null, occurrence: 0, id: 1 },
+      { quote: "FIRST-SNIPPET", comment: "note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
+      { quote: "SECOND-SNIPPET", comment: "extra", block_line: null, block_end_line: null, occurrence: 0, id: 1 },
     ];
 
     // A live reload of the SAME plan must refresh the body IN PLACE (not close it).

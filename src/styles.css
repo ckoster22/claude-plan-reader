@@ -17,6 +17,12 @@
   /* Comment highlight tokens. */
   --hl: #ffe08a;
   --hl-active: #ffd24d;
+  /* Reading-pane base text size. Theme-independent (one declaration here, NOT
+     duplicated in the dark block). Every .md font-size is `em`-relative to this
+     so the whole reading pane scales as one system. Stepped by the A−/A+
+     titlebar controls (initTextSize, src/titlebar.ts) and read before first
+     paint by the inline anti-FOUC script in index.html. */
+  --reading-font-size: 15px;
 }
 /* Dark variant — redefines the SAME token names so every existing var(--…)
    reference re-themes automatically (no selector/markup duplication). Opted in
@@ -181,7 +187,7 @@ body {
    text (.search.has-text .clear). Terracotta focus ring matches the app's accent tokens. */
 .search {
   margin: 0 12px 8px; padding: 0 0 0 10px;
-  background: #fff; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg-window); border: 1px solid var(--border); border-radius: 7px;
   display: flex; align-items: center; gap: 6px;
   transition: border-color .12s, box-shadow .12s;
 }
@@ -314,10 +320,10 @@ body {
 .doc-src .folder { color: var(--accent); }
 
 /* rich markdown typography */
-.md { font-size: 15px; line-height: 1.62; color: var(--text); }
-.md h1 { font-size: 27px; font-weight: 700; margin: 14px 0 6px; line-height: 1.2; }
-.md h2 { font-size: 20px; font-weight: 700; margin: 30px 0 8px; padding-top: 6px; }
-.md h3 { font-size: 16px; font-weight: 700; margin: 22px 0 6px; color: #2b2b2e; }
+.md { font-size: var(--reading-font-size); line-height: 1.62; color: var(--text); }
+.md h1 { font-size: 1.8em; font-weight: 700; margin: 14px 0 6px; line-height: 1.2; }
+.md h2 { font-size: 1.333em; font-weight: 700; margin: 30px 0 8px; padding-top: 6px; }
+.md h3 { font-size: 1.067em; font-weight: 700; margin: 22px 0 6px; color: var(--text); }
 .md p { margin: 10px 0; }
 .md strong { font-weight: 700; }
 .md em { font-style: italic; }
@@ -334,7 +340,7 @@ body {
 .md table {
   border-collapse: collapse;
   margin: 14px 0;
-  font-size: 13.5px;
+  font-size: 0.9em;
   width: auto;
   max-width: 100%;
   display: block;
@@ -450,16 +456,24 @@ body {
   white-space: pre-wrap; word-break: break-word;
 }
 .md code {
-  font-family: var(--mono); font-size: 12.5px;
+  font-family: var(--mono); font-size: 0.833em;
   background: var(--code-bg); padding: 1.5px 5px; border-radius: 4px;
   border: 1px solid var(--border);
 }
+/* 0.926em (NOT 0.833em): inline code inside a table cell inherits `.md table`'s
+   0.9em context, so the plain 0.833em above would compound to 0.833 × 0.9 ≈
+   0.75em of base and render smaller than prose code. 0.926em counter-scales
+   (0.833 / 0.9) so 0.926 × 0.9 ≈ 0.833em of base — matching inline code in prose. */
+.md td code, .md th code { font-size: 0.926em; }
 .md pre {
   background: #1e1e22; color: #e6e6ea; border-radius: 9px;
   padding: 14px 16px; overflow-x: auto; margin: 14px 0;
-  font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  font-family: var(--mono); font-size: 0.833em; line-height: 1.55;
 }
-.md pre code { background: none; border: none; padding: 0; color: inherit; font-size: 12.5px; }
+/* 1em (NOT 0.833em): the code element is a CHILD of `.md pre` (already 0.833em),
+   so 0.833em here would compound and shrink it below the intended size. 1em
+   keeps it equal to its `.md pre` parent — preserving the original 12.5px ratio. */
+.md pre code { background: none; border: none; padding: 0; color: inherit; font-size: 1em; }
 .md pre .kw { color: #c792ea; }
 .md pre .str { color: #c3e88d; }
 .md pre .cm { color: #6a7080; }
@@ -541,7 +555,7 @@ figcaption { font-size: 11px; color: var(--text-dim); text-align: center; margin
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 0.833em;
   line-height: 1.55;
 }
 

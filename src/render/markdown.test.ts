@@ -18,7 +18,7 @@ describe("renderMarkdown — fence rules", () => {
     const src = "```rust\nfn main() { let x = 1; }\n```\n";
     const html = renderMarkdown(src);
     expect(html).toContain("hljs");
-    expect(html).toMatch(/<pre data-source-line="\d+"><code class="hljs/);
+    expect(html).toMatch(/<pre data-source-line="\d+" data-source-end-line="\d+"><code class="hljs/);
     // highlight.js wraps tokens in spans with hljs-* classes.
     expect(html).toContain("hljs-keyword");
   });
@@ -29,7 +29,7 @@ describe("renderMarkdown — GFM tables", () => {
     const src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
     const html = renderMarkdown(src);
     // Table is rendered as an HTML <table> (it also carries a source-line stamp).
-    expect(html).toMatch(/<table( data-source-line="\d+")?>/);
+    expect(html).toMatch(/<table( data-source-line="\d+" data-source-end-line="\d+")?>/);
     expect(html).toContain("<th>a</th>");
     expect(html).toContain("<td>1</td>");
   });
@@ -41,13 +41,28 @@ describe("renderMarkdown — source-line stamping", () => {
     const html = renderMarkdown(src);
     // The h2 opens on source line index 2 (0-based) — assert the attr exists on
     // an h2 regardless of exact number.
-    expect(html).toMatch(/<h2 data-source-line="\d+">Section Two<\/h2>/);
+    expect(html).toMatch(/<h2 data-source-line="\d+" data-source-end-line="\d+">Section Two<\/h2>/);
   });
 
   it("stamps the first heading with the correct 0-based source line", () => {
     const src = "# Title\n\nbody\n";
     const html = renderMarkdown(src);
-    expect(html).toContain('<h1 data-source-line="0">Title</h1>');
+    expect(html).toContain('<h1 data-source-line="0" data-source-end-line="1">Title</h1>');
+  });
+
+  it("stamps a paragraph with BOTH data-source-line and data-source-end-line (token.map [start,end))", () => {
+    // Source lines (0-based): 0="# H", 1="", 2="para A", 3="para B", 4="" (trailing newline).
+    // markdown-it token.map is 0-based, end-EXCLUSIVE. The paragraph spans source lines 2 and 3,
+    // so its map is [2, 4): start=2 (data-source-line), end=4 (data-source-end-line). Hand-counted
+    // from markdown-it semantics, NOT copied from code output.
+    const src = "# H\n\npara A\npara B\n";
+    const html = renderMarkdown(src);
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    const p = host.querySelector("p");
+    expect(p).not.toBeNull();
+    expect(p!.getAttribute("data-source-line")).toBe("2");
+    expect(p!.getAttribute("data-source-end-line")).toBe("4");
   });
 });
 
