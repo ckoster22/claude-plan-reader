@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { wireTitlebar, initThemeToggle, THEME_KEY } from "./titlebar";
+import {
+  wireTitlebar,
+  initThemeToggle,
+  THEME_KEY,
+  nextTextSize,
+  TEXT_SIZE_LADDER,
+} from "./titlebar";
 
 // Window-drag regression guard.
 //
@@ -242,5 +248,50 @@ describe("initThemeToggle behavior", () => {
 
     expect(storage.setItem).toHaveBeenNthCalledWith(1, THEME_KEY, "dark");
     expect(storage.setItem).toHaveBeenNthCalledWith(2, THEME_KEY, "light");
+  });
+});
+
+// Reading-pane text-size ladder.
+//
+// nextTextSize is the pure core of the A−/A+ steppers: it must move EXACTLY one
+// rung per call along [13,14,15,17,19,21], clamp at both ends, and NEVER return a
+// value outside the ladder (even for off-ladder input). The test is falsifiable:
+// breaking the clamp (e.g. not bounding the index) makes the boundary assertions
+// go red.
+describe("nextTextSize steps and clamps", () => {
+  it("test_nextTextSize_steps_and_clamps", () => {
+    const ladder = [...TEXT_SIZE_LADDER];
+
+    // Moves exactly one rung UP per call across the whole ladder.
+    for (let i = 0; i < ladder.length - 1; i++) {
+      expect(nextTextSize(ladder[i], 1)).toBe(ladder[i + 1]);
+    }
+    // Moves exactly one rung DOWN per call across the whole ladder.
+    for (let i = ladder.length - 1; i > 0; i--) {
+      expect(nextTextSize(ladder[i], -1)).toBe(ladder[i - 1]);
+    }
+
+    // Clamps at the ceiling (21, dir +1) and the floor (13, dir -1).
+    const max = ladder[ladder.length - 1];
+    const min = ladder[0];
+    expect(nextTextSize(max, 1)).toBe(max);
+    expect(nextTextSize(min, -1)).toBe(min);
+
+    // Never returns an off-ladder value — including for off-ladder / out-of-range
+    // input (snaps to nearest rung, then steps, then clamps).
+    const probes: Array<[number, 1 | -1]> = [
+      [0, -1], [0, 1], [100, 1], [100, -1],
+      [16, 1], [16, -1], [13.4, -1], [20, 1], [-5, -1],
+    ];
+    for (const [px, dir] of probes) {
+      expect(ladder).toContain(nextTextSize(px, dir));
+    }
+    // Spot-check the snap-then-step semantics: 16 is between 15 and 17; nearest
+    // rung is 15 (or 17 — both equidistant, first-wins picks 15), so +1 → 17.
+    expect(nextTextSize(16, 1)).toBe(17);
+    // 13.4 snaps to 13, then -1 clamps at the floor 13.
+    expect(nextTextSize(13.4, -1)).toBe(13);
+    // Way above the ceiling snaps to 21, then +1 clamps at 21.
+    expect(nextTextSize(100, 1)).toBe(21);
   });
 });

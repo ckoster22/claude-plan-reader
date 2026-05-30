@@ -29,7 +29,7 @@ export interface PlanRecord {
 
 // ---- Comment record (mirrors Rust CommentRecord in CONTRACT.md) ---------------------------
 //
-// A single persisted comment for a plan. FROZEN 5-key wire shape (see CONTRACT.md §"Highlight +
+// A single persisted comment for a plan. FROZEN 6-key wire shape (see CONTRACT.md §"Highlight +
 // comment with quoted-text anchoring"). `block_line` is `number | null` (Rust `Option<i64>`,
 // serde `null`), mirroring
 // the existing `cwd: string | null` precedent — `null` means "no enclosing source block, re-find
@@ -39,6 +39,7 @@ export interface PlanRecord {
 export interface CommentRecord {
   quote: string; // normalized selected text (whitespace-collapsed, trimmed)
   block_line: number | null; // data-source-line of nearest enclosing block; null ⇒ whole-pane scan
+  block_end_line: number | null; // data-source-end-line of that same block (markdown-it [start,end), exclusive); null ⇒ unknown/whole-pane
   occurrence: number; // 0-based Nth match of `quote` within the chosen root
   comment: string; // the user's comment
   id: number; // collision-free id = max(existing ids in this plan)+1; also the span's data-c value
