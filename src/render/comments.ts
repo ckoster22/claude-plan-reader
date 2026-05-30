@@ -40,25 +40,53 @@ export function normalizeQuote(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+/** Parse an attribute as a strict integer, returning null when absent/empty/non-integer. */
+function intAttr(el: HTMLElement, name: string): number | null {
+  const v = el.getAttribute(name);
+  if (v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : null;
+}
+
 /**
- * The nearest ancestor (inclusive of an element node, else its parent) carrying a
- * `data-source-line` attribute, or null if none exists up to (and excluding) `root`.
- * Returns the numeric source line, or null when there is no block ancestor.
+ * The nearest block ELEMENT (inclusive of an element node, else starting at its parent) carrying a
+ * valid integer `data-source-line`, walking up to and excluding `root.parentNode` (and stopping at
+ * `root` itself), or null if no such ancestor exists. This is THE single ancestor-walk: `block_line`
+ * (`data-source-line`) and `block_end_line` (`data-source-end-line`) are both read off THIS one
+ * element, so they can never desync — the "start and end come from the same block" invariant is
+ * structural, not convention.
  */
-export function nearestBlock(node: Node, root: HTMLElement): number | null {
+export function nearestBlockEl(node: Node, root: HTMLElement): HTMLElement | null {
   let el: Node | null = node.nodeType === Node.ELEMENT_NODE ? node : node.parentNode;
   while (el && el !== root.parentNode) {
-    if (el instanceof HTMLElement) {
-      const sl = el.getAttribute("data-source-line");
-      if (sl !== null && sl !== "") {
-        const n = Number(sl);
-        if (Number.isInteger(n)) return n;
-      }
+    if (el instanceof HTMLElement && intAttr(el, "data-source-line") !== null) {
+      return el;
     }
     if (el === root) break;
     el = el.parentNode;
   }
   return null;
+}
+
+/**
+ * The numeric `data-source-line` (0-based start) of the nearest enclosing block, or null when there
+ * is no block ancestor. Thin wrapper over `nearestBlockEl` — this is the anchor key.
+ */
+export function nearestBlock(node: Node, root: HTMLElement): number | null {
+  const el = nearestBlockEl(node, root);
+  return el === null ? null : intAttr(el, "data-source-line");
+}
+
+/**
+ * The `data-source-end-line` (markdown-it's exclusive end of the [start, end) source map) of the
+ * SAME nearest block `nearestBlock` resolves to. Returns the numeric end line, or null when no such
+ * block exists OR the block lacks the (newer) end-line attribute. Pairs with `nearestBlock` to give
+ * the block's full source range; the anchor key stays `nearestBlock`'s start line. Because both read
+ * the SAME `nearestBlockEl`, the start and end cannot come from different blocks.
+ */
+export function nearestBlockEndLine(node: Node, root: HTMLElement): number | null {
+  const el = nearestBlockEl(node, root);
+  return el === null ? null : intAttr(el, "data-source-end-line");
 }
 
 /** True iff `node` (or an ancestor up to `root`) is a fenced code block or a mermaid/SVG node. */
@@ -269,7 +297,14 @@ export function applyComments(paneEl: HTMLElement, records: CommentRecord[]): vo
 // existing record id. Visibility is `kind !== "hidden"` (no separate boolean to drift).
 type PopoverState =
   | { kind: "hidden" }
-  | { kind: "create"; range: Range; quote: string; blockLine: number | null; occurrence: number }
+  | {
+      kind: "create";
+      range: Range;
+      quote: string;
+      blockLine: number | null;
+      blockEndLine: number | null;
+      occurrence: number;
+    }
   | { kind: "view"; id: number };
 
 // A capture snapshot taken at mouseup (everything needed to build a record on save).
@@ -277,6 +312,7 @@ interface Capture {
   range: Range;
   quote: string;
   blockLine: number | null;
+  blockEndLine: number | null;
   occurrence: number;
 }
 
@@ -385,6 +421,7 @@ export function initComments(
     const rec: CommentRecord = {
       quote: normalizeQuote(capture.quote),
       block_line: capture.blockLine,
+      block_end_line: capture.blockEndLine,
       occurrence: capture.occurrence,
       comment,
       id: mintId(existing),
@@ -459,18 +496,21 @@ export function initComments(
 
     // Clamp to a single block: start/end must resolve to the SAME [data-source-line] block
     // (or both to whole-pane null). A cross-block selection is rejected (no popover).
-    const startBlock = nearestBlock(range.startContainer, paneEl);
-    const endBlock = nearestBlock(range.endContainer, paneEl);
-    if (startBlock !== endBlock) return null;
+    const startBlockEl = nearestBlockEl(range.startContainer, paneEl);
+    const endBlockEl = nearestBlockEl(range.endContainer, paneEl);
+    if (startBlockEl !== endBlockEl) return null;
 
-    const blockLine = startBlock;
+    // Derive BOTH the start line and the end line from the SINGLE resolved element so they can never
+    // desync (structural "same block" guarantee). null element ⇒ whole-pane selection.
+    const blockLine = startBlockEl === null ? null : intAttr(startBlockEl, "data-source-line");
+    const blockEndLine = startBlockEl === null ? null : intAttr(startBlockEl, "data-source-end-line");
     const quote = normalizeQuote(rawText);
 
     // occurrence = count of `quote` matches in the chosen root BEFORE the selection's start.
     const root = blockLine === null ? paneEl : paneEl.querySelector<HTMLElement>(`[data-source-line="${blockLine}"]`);
     const occurrence = countOccurrencesBefore(root, quote, range);
 
-    return { range, quote, blockLine, occurrence };
+    return { range, quote, blockLine, blockEndLine, occurrence };
   }
 
   // ---- Listeners (the single-applier funnel: each sets state then renderPopover) ----
@@ -487,6 +527,7 @@ export function initComments(
       range: capture.range,
       quote: capture.quote,
       blockLine: capture.blockLine,
+      blockEndLine: capture.blockEndLine,
       occurrence: capture.occurrence,
     });
   });
@@ -515,6 +556,7 @@ export function initComments(
         range: state.range,
         quote: state.quote,
         blockLine: state.blockLine,
+        blockEndLine: state.blockEndLine,
         occurrence: state.occurrence,
       };
       const comment = textEl?.value ?? "";

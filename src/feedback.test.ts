@@ -22,17 +22,17 @@ vi.mock("./render", () => ({
   clearAllComments: vi.fn(),
 }));
 vi.mock("./render/scroll", () => ({ captureAnchor: vi.fn(), applyDelta: vi.fn(), scrollToHeading: vi.fn() }));
-vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn() }));
+vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
 import { applyFeedbackButtonState } from "./main";
 
-type R = { quote: string; comment: string };
+type R = { quote: string; comment: string; block_line: number | null; block_end_line: number | null };
 
 describe("buildFeedbackPrompt — format + numbering", () => {
   it("emits the lead line then one numbered `N. Re: \"<quote>\"` + indented comment per record", () => {
     const recs: R[] = [
-      { quote: "scan the projects tree", comment: "cache this per session" },
-      { quote: "auto-reloads in place", comment: "preserve my scroll position" },
+      { quote: "scan the projects tree", comment: "cache this per session", block_line: null, block_end_line: null },
+      { quote: "auto-reloads in place", comment: "preserve my scroll position", block_line: null, block_end_line: null },
     ];
     const out = buildFeedbackPrompt(recs);
 
@@ -52,7 +52,7 @@ describe("buildFeedbackPrompt — format + numbering", () => {
 
   it("clamps a very long quote to ~90 chars + ellipsis", () => {
     const longQuote = "x".repeat(200);
-    const out = buildFeedbackPrompt([{ quote: longQuote, comment: "note" }]);
+    const out = buildFeedbackPrompt([{ quote: longQuote, comment: "note", block_line: null, block_end_line: null }]);
     // The full 200-char quote must NOT appear; a 90-char prefix + ellipsis must.
     expect(out).not.toContain(longQuote);
     expect(out).toContain("x".repeat(90) + "…");
@@ -64,8 +64,8 @@ describe("buildFeedbackPrompt — format + numbering", () => {
     // 02's save flow does not reject an empty comment, so a record with comment:"" exists on disk
     // AND counts toward the badge. It must produce an entry (quote-only) so the entry count matches.
     const recs: R[] = [
-      { quote: "first snippet", comment: "" }, // empty comment
-      { quote: "second snippet", comment: "a real note" },
+      { quote: "first snippet", comment: "", block_line: null, block_end_line: null }, // empty comment
+      { quote: "second snippet", comment: "a real note", block_line: null, block_end_line: null },
     ];
     const out = buildFeedbackPrompt(recs);
 
@@ -85,6 +85,36 @@ describe("buildFeedbackPrompt — format + numbering", () => {
     const out = buildFeedbackPrompt([]);
     expect(out).toBe("Please revise the plan based on this feedback:");
     expect(out.match(/^\d+\. Re:/gm)).toBeNull();
+  });
+
+  // HAND-COUNTED line math. markdown-it token.map = [start, end) is 0-based, end-exclusive.
+  // 1-based inclusive range: start = block_line + 1, end = block_end_line.
+  //   - multi-line: block_line=41, block_end_line=45 → start=42, end=45 → "(lines 42-45)".
+  //   - single-line: block_line=2, block_end_line=3 → start=3, end=3 (end<=start) → "(line 3)".
+  //   - block_line=null → no suffix.
+  it("test_buildFeedbackPrompt_line_range — appends (lines N-M) / (line N) / nothing per the source range", () => {
+    const recs: R[] = [
+      { quote: "multi block", comment: "a", block_line: 41, block_end_line: 45 },
+      { quote: "single block", comment: "b", block_line: 2, block_end_line: 3 },
+      { quote: "whole pane", comment: "c", block_line: null, block_end_line: null },
+    ];
+    const out = buildFeedbackPrompt(recs);
+
+    expect(out).toContain('1. Re: "multi block" (lines 42-45)');
+    expect(out).toContain('2. Re: "single block" (line 3)');
+    // whole-pane: NO suffix — the quote line ends right at the closing quote.
+    expect(out).toMatch(/^3\. Re: "whole pane"$/m);
+    expect(out).not.toContain('"whole pane" (');
+  });
+
+  // FALSIFICATION (b): bumping an input line by +1 MUST change the asserted range — catches an
+  // off-by-one in the start = block_line + 1 conversion.
+  it("test_buildFeedbackPrompt_line_range falsifies via input perturbation (+1 shifts the range)", () => {
+    const base = buildFeedbackPrompt([{ quote: "q", comment: "c", block_line: 41, block_end_line: 45 }]);
+    expect(base).toContain("(lines 42-45)");
+    const bumped = buildFeedbackPrompt([{ quote: "q", comment: "c", block_line: 42, block_end_line: 45 }]);
+    expect(bumped).toContain("(lines 43-45)");
+    expect(bumped).not.toContain("(lines 42-45)");
   });
 });
 

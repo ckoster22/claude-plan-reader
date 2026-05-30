@@ -19,7 +19,7 @@ import { collapseHome } from "./cwd";
 import { resolveCwds } from "./resolve";
 import { filterRecords, highlightInto, planCountText } from "./filter";
 import { RenderGuard } from "./render-guard";
-import { initTitlebar, initThemeToggle } from "./titlebar";
+import { initTitlebar, initThemeToggle, initTextSize } from "./titlebar";
 import type { PlanRecord, SidebarCtx, CommentRecord } from "./types";
 import { asAbsPath, asStem, cwdState, type AbsPath, type Stem } from "./types";
 
@@ -882,6 +882,8 @@ window.addEventListener("DOMContentLoaded", () => {
   initTitlebar();
   // Wire the icon-only dark/light theme toggle in the titlebar-controls slot.
   initThemeToggle(document.querySelector("#theme-toggle"));
+  // Wire the A−/A+ reading-pane text-size steppers (left of the theme toggle).
+  initTextSize(document.querySelector("#text-dec"), document.querySelector("#text-inc"));
 
   // Sub-Plan 02: wire the highlight/comment feature behind the render facade. main.ts only
   // hands the pane element + a LIVE openPath reader + the IO adapters to the facade — it never

@@ -99,17 +99,25 @@ struct PlanChanged {
     kind: String,
 }
 
-/// One persisted comment for a plan (Sub-Plan 02). FROZEN wire shape — exactly 5 keys (see
-/// CONTRACT.md §"Sub-Plan 02 additions"). `block_line` is `Option<i64>` (serde emits `null`)
+/// One persisted comment for a plan (Sub-Plan 02). FROZEN wire shape — exactly 6 keys (see
+/// CONTRACT.md §"Sub-Plan 02 additions" / §"Highlight + comment with quoted-text anchoring").
+/// `block_line` is `Option<i64>` (serde emits `null`)
 /// — it mirrors the existing `cwd: Option<String>` precedent; there is NO `-1` sentinel.
 /// `null` means the captured selection had no enclosing source block (re-find scans the whole
-/// pane by `occurrence`). Keyed-by-plan-path lives in the store map, not the record.
+/// pane by `occurrence`). `block_end_line` is the matching `data-source-end-line` of that same
+/// block (markdown-it's `[start, end)` exclusive end); it is `#[serde(default)]` so older saved
+/// files lacking the key deserialize to `None`. Keyed-by-plan-path lives in the store map, not
+/// the record.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct CommentRecord {
     /// Normalized (whitespace-collapsed, trimmed) selected text — the re-anchor key.
     quote: String,
     /// `data-source-line` of the nearest enclosing block, or `null` for a whole-pane anchor.
     block_line: Option<i64>,
+    /// `data-source-end-line` (markdown-it `[start, end)` exclusive end) of that same block, or
+    /// `null` (unknown / whole-pane). `#[serde(default)]` rescues old files lacking the key.
+    #[serde(default)]
+    block_end_line: Option<i64>,
     /// 0-based Nth match of `quote` within the chosen root (block element, or whole pane).
     occurrence: i64,
     /// The user's comment text.
@@ -2994,6 +3002,9 @@ mod tests {
         CommentRecord {
             quote: quote.to_string(),
             block_line,
+            // Derive a plausible end line from the start (start + 2) so round-trip exercises a
+            // populated value; None when there is no block (whole-pane anchor).
+            block_end_line: block_line.map(|s| s + 2),
             occurrence,
             comment: format!("note for {quote}"),
             id,
@@ -3111,18 +3122,20 @@ mod tests {
         assert!(again.is_empty());
     }
 
-    /// Locks the `CommentRecord` wire shape to the frozen contract: exactly 5 snake_case keys,
-    /// with `block_line` present as JSON `null` when `None` (mirrors the `cwd: Option<String>`
-    /// precedent — never omitted, never a -1 sentinel). Twin of `planrecord_wire_contract_is_frozen`.
+    /// Locks the `CommentRecord` wire shape to the frozen contract: exactly 6 snake_case keys,
+    /// with `block_line` / `block_end_line` present as JSON `null` when `None` (mirrors the
+    /// `cwd: Option<String>` precedent — never omitted, never a -1 sentinel). Twin of
+    /// `planrecord_wire_contract_is_frozen`.
     #[test]
     fn comment_record_wire_contract_is_frozen() {
         use std::collections::BTreeSet;
 
-        let expected_keys: BTreeSet<&str> = ["quote", "block_line", "occurrence", "comment", "id"]
-            .into_iter()
-            .collect();
+        let expected_keys: BTreeSet<&str> =
+            ["quote", "block_line", "block_end_line", "occurrence", "comment", "id"]
+                .into_iter()
+                .collect();
 
-        // One record with a real block_line, one with None — both must carry all 5 keys.
+        // One record with a real block_line, one with None — both must carry all 6 keys.
         let with_block = comment_rec("anchored quote", Some(7), 2, 0);
         let whole_pane = comment_rec("floating quote", None, 0, 1);
 
@@ -3134,7 +3147,7 @@ mod tests {
             let actual_keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
             assert_eq!(
                 actual_keys, expected_keys,
-                "CommentRecord top-level JSON keys drifted from the frozen 5-key contract"
+                "CommentRecord top-level JSON keys drifted from the frozen 6-key contract"
             );
 
             // Value types of the always-present scalar fields.
@@ -3156,5 +3169,38 @@ mod tests {
             Some(&serde_json::Value::Null),
             "block_line must be present as JSON null when None (no -1 sentinel, never omitted)"
         );
+
+        // `block_end_line` follows the same rule: integer when Some, present JSON null when None.
+        assert!(
+            with_block_value["block_end_line"].is_i64() || with_block_value["block_end_line"].is_u64(),
+            "block_end_line must be a JSON integer when populated"
+        );
+        assert_eq!(
+            whole_pane_value.get("block_end_line"),
+            Some(&serde_json::Value::Null),
+            "block_end_line must be present as JSON null when None (never omitted)"
+        );
+    }
+
+    /// `#[serde(default)]` must rescue OLD saved files that predate `block_end_line`: a comments
+    /// JSON object whose records lack the key deserializes to `None` (not an error). Pins the
+    /// backward-compat guarantee the task requires.
+    #[test]
+    fn old_comment_files_without_block_end_line_deserialize() {
+        let dir = unique_dir("commentsOld");
+        // Hand-written legacy 5-key record (no `block_end_line`).
+        let legacy = r#"{"/plans/old.md":[{"quote":"legacy quote","block_line":3,"occurrence":0,"comment":"old note","id":0}]}"#;
+        std::fs::write(dir.join(COMMENTS_FILE), legacy).expect("write legacy comments");
+
+        let loaded = load_comments(&dir);
+        let recs = loaded.get("/plans/old.md").expect("legacy key present");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].block_line, Some(3));
+        assert_eq!(
+            recs[0].block_end_line, None,
+            "a record missing block_end_line must deserialize to None via serde(default)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

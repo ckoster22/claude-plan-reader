@@ -117,3 +117,86 @@ export function initThemeToggle(
     paint();
   });
 }
+
+// ---- Reading-pane text-size control (A− / A+) ----
+//
+// The whole reading pane scales from a single CSS custom property
+// (--reading-font-size on :root); every .md font-size is `em`-relative to it
+// (src/styles.css). The A−/A+ titlebar buttons step that value through a FIXED
+// ladder and persist the choice. The persisted value is READ before first paint
+// by the inline anti-FOUC script in index.html (which duplicates the key + the
+// ladder literally — pinned against TEXT_SIZE_KEY / TEXT_SIZE_LADDER by
+// src/contract.test.ts, so inline-script drift turns those assertions red);
+// initTextSize re-applies it on init and writes on click.
+
+// The fixed text-size ladder (px). Mirrored in index.html's anti-FOUC script.
+export const TEXT_SIZE_LADDER: readonly number[] = [13, 14, 15, 17, 19, 21];
+// localStorage key for the persisted reading-pane text size.
+export const TEXT_SIZE_KEY = "plan-reader-text-size";
+// Default (the original hard-coded .md base) used when nothing is persisted.
+export const DEFAULT_TEXT_SIZE = 15;
+
+// Pure: return the adjacent ladder value in direction `dir` (+1 up / -1 down),
+// clamped at both ends. If `currentPx` is OFF the ladder it is first snapped to
+// the nearest in-range rung, then stepped — so the result is ALWAYS a ladder
+// value. Dependency-free and unit-tested (src/titlebar.test.ts).
+export function nextTextSize(currentPx: number, dir: 1 | -1): number {
+  const ladder = TEXT_SIZE_LADDER;
+  // Snap to the nearest rung (handles off-ladder / NaN-ish input deterministically).
+  let idx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < ladder.length; i++) {
+    const d = Math.abs(ladder[i] - currentPx);
+    if (d < bestDist) {
+      bestDist = d;
+      idx = i;
+    }
+  }
+  // Step one rung and clamp to the ladder ends.
+  const next = Math.min(ladder.length - 1, Math.max(0, idx + dir));
+  return ladder[next];
+}
+
+// Wire the A− / A+ reading-pane text-size steppers. Mirrors initThemeToggle:
+// pure-ish + dependency-injected so jsdom tests can pass fake elements + storage.
+//   - reads the persisted size (default DEFAULT_TEXT_SIZE; validated against the ladder)
+//   - applies it via root.style.setProperty("--reading-font-size", px + "px")
+//   - on a button click: computes nextTextSize, persists, re-applies, updates disabled state
+//   - disables A− at the ladder floor and A+ at the ladder ceiling
+// No-op (safe) when both buttons are null.
+export function initTextSize(
+  decButton: Element | null,
+  incButton: Element | null,
+  root: HTMLElement = document.documentElement,
+  storage: Pick<Storage, "getItem" | "setItem"> = localStorage,
+): void {
+  const ladder = TEXT_SIZE_LADDER;
+  const min = ladder[0];
+  const max = ladder[ladder.length - 1];
+
+  const readSize = (): number => {
+    const raw = parseInt(storage.getItem(TEXT_SIZE_KEY) ?? "", 10);
+    return ladder.indexOf(raw) === -1 ? DEFAULT_TEXT_SIZE : raw;
+  };
+
+  let size = readSize();
+
+  const apply = (): void => {
+    root.style.setProperty("--reading-font-size", size + "px");
+    // Disable the stepper that would overshoot the ladder end.
+    if (decButton instanceof HTMLButtonElement) decButton.disabled = size <= min;
+    if (incButton instanceof HTMLButtonElement) incButton.disabled = size >= max;
+  };
+  apply();
+
+  const step = (dir: 1 | -1): void => {
+    const next = nextTextSize(size, dir);
+    if (next === size) return; // already clamped at an end — nothing to persist
+    size = next;
+    storage.setItem(TEXT_SIZE_KEY, String(size));
+    apply();
+  };
+
+  decButton?.addEventListener("click", () => step(-1));
+  incButton?.addEventListener("click", () => step(1));
+}

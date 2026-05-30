@@ -23,7 +23,7 @@ vi.mock("./render/scroll", () => ({
   applyDelta: vi.fn(),
   scrollToHeading: vi.fn(),
 }));
-vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn() }));
+vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
 import { renderSidebar, buildToc, initTabs } from "./main";
 import { scrollToHeading } from "./render/scroll";

@@ -89,7 +89,7 @@ vi.mock("./render/scroll", () => ({
   applyDelta: vi.fn(),
   scrollToHeading: vi.fn(),
 }));
-vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn() }));
+vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
 import { openPlan, reloadOpenPlan } from "./main";
 import { asAbsPath, asStem } from "./types";

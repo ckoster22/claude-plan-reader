@@ -22,6 +22,24 @@ function clampQuote(s: string): string {
 }
 
 /**
+ * The trailing ` (line N)` / ` (lines N-M)` suffix for a record's `Re: "..."` line, derived from
+ * the block's source-line range. markdown-it's `token.map = [start, end)` is 0-based, end-exclusive;
+ * the 1-based INCLUSIVE range is `start = block_line + 1`, `end = block_end_line` (converting the
+ * 0-based exclusive end to 1-based inclusive is a no-op). Rules:
+ *   - block_line == null                          → no suffix (whole-pane comment).
+ *   - block_end_line == null OR end <= start      → ` (line {start})` (single line / unknown end).
+ *   - else                                        → ` (lines {start}-{end})`.
+ */
+function lineSuffix(blockLine: number | null, blockEndLine: number | null): string {
+  if (blockLine === null) return "";
+  const start = blockLine + 1;
+  if (blockEndLine === null) return ` (line ${start})`;
+  const end = blockEndLine;
+  if (end <= start) return ` (line ${start})`;
+  return ` (lines ${start}-${end})`;
+}
+
+/**
  * Build the Claude Code feedback prompt from the open plan's comment records.
  *
  * - Lead line, then a blank line, then one numbered entry per record.
@@ -37,12 +55,12 @@ function clampQuote(s: string): string {
  * PURE: deterministic output for a given input, no side effects.
  */
 export function buildFeedbackPrompt(
-  records: Pick<CommentRecord, "quote" | "comment">[],
+  records: Pick<CommentRecord, "quote" | "comment" | "block_line" | "block_end_line">[],
 ): string {
   const parts: string[] = [LEAD];
   records.forEach((rec, i) => {
     const n = i + 1;
-    let entry = `${n}. Re: "${clampQuote(rec.quote)}"`;
+    let entry = `${n}. Re: "${clampQuote(rec.quote)}"${lineSuffix(rec.block_line, rec.block_end_line)}`;
     // Empty comment → quote-only entry (no comment line) so entry count == record count.
     if (rec.comment.length > 0) {
       entry += `\n   ${rec.comment}`;

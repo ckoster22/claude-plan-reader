@@ -38,9 +38,16 @@ vi.mock("./render", () => ({
   clearAllComments: vi.fn(),
 }));
 vi.mock("./render/scroll", () => ({ captureAnchor: vi.fn(), applyDelta: vi.fn() }));
-vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn() }));
+// Stub the titlebar wiring functions (importing main.ts must be a no-op), but keep the REAL
+// exported constants (TEXT_SIZE_KEY / TEXT_SIZE_LADDER) so the index.html anti-FOUC assertions
+// below can be pinned to the single source of truth rather than hardcoded copies.
+vi.mock("./titlebar", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./titlebar")>();
+  return { ...actual, initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() };
+});
 
 import { renderSidebar } from "./main";
+import { TEXT_SIZE_KEY, TEXT_SIZE_LADDER } from "./titlebar";
 import { asAbsPath, asStem, type PlanRecord, type SidebarCtx, type CommentRecord } from "./types";
 import fixture from "./__fixtures__/list_plans.sample.json";
 
@@ -189,6 +196,33 @@ describe("contract — table-of-contents sidebar selectors present in index.html
   });
 });
 
+describe("contract — text-size anti-FOUC literals pinned in index.html", () => {
+  // The inline anti-FOUC script in index.html duplicates the text-size key + ladder literally
+  // (it cannot import module constants before first paint). These assertions read the REAL
+  // index.html and pin those literals to titlebar.ts's single source of truth, so if the inline
+  // script drifts from TEXT_SIZE_KEY / TEXT_SIZE_LADDER (or the steppers / CSS var are removed),
+  // the relevant assertion goes red. Mirrors how `plan-reader-theme` is pinned above.
+
+  it("pins the localStorage key against titlebar.ts's TEXT_SIZE_KEY", () => {
+    expect(TEXT_SIZE_KEY).toBe("plan-reader-text-size");
+    expect(INDEX_HTML).toContain(TEXT_SIZE_KEY);
+  });
+
+  it("pins the ladder literal byte-for-byte against titlebar.ts's TEXT_SIZE_LADDER", () => {
+    // index.html writes the ladder as a JS array literal with `, ` separators: `[13, 14, 15, 17, 19, 21]`.
+    // Build the expected string from the real constant so a changed rung fails BOTH sides at once.
+    const ladderLiteral = "[" + TEXT_SIZE_LADDER.join(", ") + "]";
+    expect(ladderLiteral).toBe("[13, 14, 15, 17, 19, 21]");
+    expect(INDEX_HTML).toContain(ladderLiteral);
+  });
+
+  it("pins the stepper button ids and the --reading-font-size CSS variable", () => {
+    expect(INDEX_HTML).toContain('id="text-dec"');
+    expect(INDEX_HTML).toContain('id="text-inc"');
+    expect(INDEX_HTML).toContain("--reading-font-size");
+  });
+});
+
 describe("contract — Sub-Plan 02 highlight/comment selectors present in index.html", () => {
   // Popover markup the comment feature depends on. Reads the real file, so removing any of
   // these from index.html turns its assertion red.
@@ -282,7 +316,7 @@ describe("contract — Sub-Plan 03 Prompt Feedback selectors present in index.ht
   });
 });
 
-describe("contract — CommentRecord carries exactly its 5 fields (separate from PlanRecord)", () => {
+describe("contract — CommentRecord carries exactly its 6 fields (separate from PlanRecord)", () => {
   // DERIVED FROM THE TYPE, not a hand-written literal: the keymap is `satisfies
   // Record<keyof CommentRecord, true>`, so the COMPILER enforces it covers EVERY key of the
   // interface. Adding a 6th interface field → tsc fails (the keymap is missing that key);
@@ -293,25 +327,26 @@ describe("contract — CommentRecord carries exactly its 5 fields (separate from
   const COMMENT_KEY_MAP = {
     quote: true,
     block_line: true,
+    block_end_line: true,
     occurrence: true,
     comment: true,
     id: true,
   } satisfies Record<keyof CommentRecord, true>;
   const COMMENT_KEYS = Object.keys(COMMENT_KEY_MAP).sort();
 
-  const EXPECTED_COMMENT_KEYS = ["block_line", "comment", "id", "occurrence", "quote"].sort();
+  const EXPECTED_COMMENT_KEYS = ["block_end_line", "block_line", "comment", "id", "occurrence", "quote"].sort();
 
-  it("the type-derived CommentRecord key set is exactly the five expected snake_case keys", () => {
+  it("the type-derived CommentRecord key set is exactly the six expected snake_case keys", () => {
     // The keymap is exhaustive over keyof CommentRecord (compile-enforced); this runtime check
     // pins the EXACT key names so a renamed field (which still type-checks if both sides rename)
     // is caught against the written contract.
     expect(COMMENT_KEYS).toEqual(EXPECTED_COMMENT_KEYS);
-    expect(COMMENT_KEYS).toHaveLength(5);
+    expect(COMMENT_KEYS).toHaveLength(6);
   });
 
   it("a CommentRecord literal carries exactly those keys, with block_line nullable (both branches)", () => {
-    const anchored: CommentRecord = { quote: "hello", block_line: 5, occurrence: 1, comment: "note", id: 0 };
-    const wholePane: CommentRecord = { quote: "floating", block_line: null, occurrence: 0, comment: "note2", id: 1 };
+    const anchored: CommentRecord = { quote: "hello", block_line: 5, block_end_line: 8, occurrence: 1, comment: "note", id: 0 };
+    const wholePane: CommentRecord = { quote: "floating", block_line: null, block_end_line: null, occurrence: 0, comment: "note2", id: 1 };
     expect(Object.keys(anchored).sort()).toEqual(COMMENT_KEYS);
     expect(Object.keys(wholePane).sort()).toEqual(COMMENT_KEYS);
     // block_line covers BOTH branches: a number and null (the no-block-ancestor type, no -1).

@@ -40,11 +40,12 @@ function buildMd(): MarkdownIt {
     const info = token.info ? token.info.trim() : "";
     const lang = info.split(/\s+/g)[0] || "";
     const sourceLine = token.map ? String(token.map[0]) : "";
+    const sourceEndLine = token.map ? String(token.map[1]) : "";
 
     if (lang === "mermaid") {
       // Carry the diagram SOURCE verbatim (escaped) — rendered later by mermaid.ts.
       return (
-        `<pre class="mermaid-src" data-source-line="${sourceLine}">` +
+        `<pre class="mermaid-src" data-source-line="${sourceLine}" data-source-end-line="${sourceEndLine}">` +
         esc(token.content) +
         `</pre>\n`
       );
@@ -66,7 +67,7 @@ function buildMd(): MarkdownIt {
     const body = highlighted || esc(token.content);
     const langClass = lang ? ` language-${esc(lang)}` : "";
     return (
-      `<pre data-source-line="${sourceLine}"><code class="hljs${langClass}">` +
+      `<pre data-source-line="${sourceLine}" data-source-end-line="${sourceEndLine}"><code class="hljs${langClass}">` +
       body +
       `</code></pre>\n`
     );
@@ -135,6 +136,13 @@ function buildMd(): MarkdownIt {
       // (inline tokens have null .map so they never reach here anyway).
       if (token.attrIndex("data-source-line") < 0) {
         token.attrSet("data-source-line", String(token.map[0]));
+      }
+      // Also stamp the end line (markdown-it map is [start, end) 0-based). Feedback
+      // reads this off prose blocks to render a line range; fenced blocks are
+      // comment-excluded so their end-line is never read, but it is stamped above
+      // for contract symmetry.
+      if (token.attrIndex("data-source-end-line") < 0) {
+        token.attrSet("data-source-end-line", String(token.map[1]));
       }
     }
     return defaultRenderToken(tokens, idx, options);

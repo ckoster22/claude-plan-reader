@@ -9,6 +9,8 @@ import {
   onCommentCountChanged,
   loadCommentsFor,
   clearAllComments,
+  nearestBlock,
+  nearestBlockEndLine,
   type CommentsIO,
 } from "./comments";
 import type { CommentRecord } from "../types";
@@ -30,6 +32,7 @@ function pane(html: string): HTMLElement {
 function rec(over: Partial<CommentRecord> & { quote: string }): CommentRecord {
   return {
     block_line: null,
+    block_end_line: null,
     occurrence: 0,
     comment: "",
     id: 0,
@@ -424,6 +427,35 @@ describe("normalizeQuote", () => {
   it("collapses internal whitespace runs to a single space and trims", () => {
     expect(normalizeQuote("  foo   bar\n\tbaz  ")).toBe("foo bar baz");
     expect(normalizeQuote("")).toBe("");
+  });
+});
+
+// nearestBlock + nearestBlockEndLine — start AND end resolve from the SAME single block element,
+// so the recorded (lines N-M) range can never be assembled from two different blocks. The walk is
+// shared (nearestBlockEl), making the "same block" guarantee structural rather than convention.
+describe("nearestBlock / nearestBlockEndLine — single-element resolution", () => {
+  it("reads start and end off a block carrying both attributes", () => {
+    const p = pane('<p data-source-line="2" data-source-end-line="4">hello</p>');
+    const textNode = p.querySelector("p")!.firstChild!; // the Text node "hello"
+    expect(nearestBlock(textNode, p)).toBe(2);
+    expect(nearestBlockEndLine(textNode, p)).toBe(4);
+  });
+
+  it("returns null end when the block has no data-source-end-line", () => {
+    const p = pane('<p data-source-line="2">hello</p>');
+    const textNode = p.querySelector("p")!.firstChild!;
+    expect(nearestBlock(textNode, p)).toBe(2);
+    expect(nearestBlockEndLine(textNode, p)).toBeNull();
+  });
+
+  it("returns null/null for a text node with no block ancestor", () => {
+    // A bare text node whose only ancestor (the root) carries no data-source-line.
+    const root = document.createElement("div");
+    const textNode = document.createTextNode("orphan");
+    root.appendChild(textNode);
+    document.body.appendChild(root);
+    expect(nearestBlock(textNode, root)).toBeNull();
+    expect(nearestBlockEndLine(textNode, root)).toBeNull();
   });
 });
 

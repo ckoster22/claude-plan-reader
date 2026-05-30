@@ -197,6 +197,7 @@ directory (absolute `src` used as-is); `http(s):`/`data:` srcs bypass the comman
 | attribute / class | element | meaning |
 |-------------------|---------|---------|
 | `data-source-line="<n>"` | every top-level block-open tag (and code/mermaid `<pre>`) | 0-based source line of the markdown block — the anchor key for scroll restore |
+| `data-source-end-line="<n>"` | same elements as `data-source-line` | markdown-it `token.map[1]` — the 0-based **exclusive** end of the block's `[start, end)` source range. Stamped alongside `data-source-line` (renderToken override + fence templates). Read by the comment-capture path to record a block's full line range; fenced/mermaid blocks carry it for symmetry but it is never read off them (they are comment-excluded). |
 | `data-external="1"` | `<a>` | href is `http(s):`/`mailto:` → click opens **externally** (opener plugin), never navigates the WebView |
 | `class="mermaid-src"` | `<pre>` | carries raw mermaid **source**; replaced in place by rendered SVG (or a raw-source error box) by `settle()` |
 | `data-resolve="1"` + `data-local-src` | `<img>` | local-image placeholder; an async pass swaps in the resolved `data:` URL after insertion |
@@ -814,20 +815,30 @@ command, never the DOM. `PlanRecord` is **UNCHANGED (11 keys)** — comments do 
 `--hl` / `--hl-active` are defined for BOTH the light `:root` and the dark `:root[data-theme="dark"]`
 (values sourced from the prototype). They back `.cmt-hl` / `.cmt-hl.active` and `.md ::selection`.
 
-### `CommentRecord` (mirrors the Rust struct; frozen 5-key wire shape)
+### `CommentRecord` (mirrors the Rust struct; frozen 6-key wire shape)
 
 ```
-{ quote: string,            // normalized (whitespace-collapsed, trimmed) selected text
-  block_line: number | null,// data-source-line of nearest enclosing block; `null` ⇒ whole-pane scan
-  occurrence: number,       // 0-based Nth match of `quote` within the chosen root
-  comment: string,          // the user's comment
-  id: number }              // collision-free id (= max existing id + 1); also the span's data-c
+{ quote: string,             // normalized (whitespace-collapsed, trimmed) selected text
+  block_line: number | null, // data-source-line of nearest enclosing block; `null` ⇒ whole-pane scan
+  block_end_line: number | null, // data-source-end-line of that SAME block (markdown-it [start,end) exclusive end); `null` ⇒ unknown / whole-pane
+  occurrence: number,        // 0-based Nth match of `quote` within the chosen root
+  comment: string,           // the user's comment
+  id: number }               // collision-free id (= max existing id + 1); also the span's data-c
 ```
 
-`block_line` is `Option<i64>` in Rust (serde emits `null`) / `number | null` in TS — mirroring the
-existing `cwd: Option<String>` precedent. There is **NO `-1` sentinel**: "no enclosing block" is the
-type. `block_line` + `occurrence` together are the minimal deterministic re-anchor disambiguator.
-Keying-by-plan-path lives in the store map, not the record (mirrors `read-state.json`).
+> **Wire change (additive, backward-compatible):** the record grew from 5 to **6 keys** with the
+> addition of `block_end_line`. The Rust field is `#[serde(default)]` so **old saved comment files
+> lacking the key still deserialize** (the field becomes `None`/`null`). It always **serializes**
+> (present as JSON `null` when unknown — never omitted, no `-1` sentinel), so the frozen-key freezes
+> (`comment_record_wire_contract_is_frozen` in Rust; the type-derived key set in `contract.test.ts`)
+> assert exactly 6 keys.
+
+`block_line` and `block_end_line` are each `Option<i64>` in Rust (serde emits `null`) / `number | null`
+in TS — mirroring the existing `cwd: Option<String>` precedent. There is **NO `-1` sentinel**: "no
+enclosing block" is the type. `block_line` remains the sole anchor key; `block_end_line` is recorded
+only to render the comment's source-line range in the feedback prompt (it does **not** participate in
+re-anchoring). `block_line` + `occurrence` together are the minimal deterministic re-anchor
+disambiguator. Keying-by-plan-path lives in the store map, not the record (mirrors `read-state.json`).
 
 ### New commands (registered in `invoke_handler`)
 
@@ -883,11 +894,20 @@ source of truth for the count** (read via `get_comment_count` / `get_comments`, 
 
 ### Pure prompt builder (`src/feedback.ts`)
 
-`buildFeedbackPrompt(records: Pick<CommentRecord, "quote" | "comment">[]): string` — a lead line,
-then ONE numbered entry per record (`N. Re: "<quote>"`, the comment on the next indented line). It
-**emits one entry per record and never skips empty-comment records** (an empty comment yields a
-quote-only entry), so the entry count always equals the badge count. Long quotes are clamped (~90
-chars + ellipsis). Pure: lives in the `main.ts`/title-bar domain, NOT the render facade.
+`buildFeedbackPrompt(records: Pick<CommentRecord, "quote" | "comment" | "block_line" | "block_end_line">[]): string`
+— a lead line, then ONE numbered entry per record (`N. Re: "<quote>"`, the comment on the next
+indented line). It **emits one entry per record and never skips empty-comment records** (an empty
+comment yields a quote-only entry), so the entry count always equals the badge count. Long quotes
+are clamped (~90 chars + ellipsis). Pure: lives in the `main.ts`/title-bar domain, NOT the render
+facade.
+
+Each `Re: "<quote>"` line carries a **source-line suffix** derived from the block's range. Since
+markdown-it `token.map = [start, end)` is 0-based and end-exclusive, the 1-based **inclusive** range
+is `start = block_line + 1`, `end = block_end_line` (converting the 0-based exclusive end to 1-based
+inclusive is a no-op). The suffix is:
+- `block_line === null` → **no suffix** (whole-pane comment);
+- `block_end_line === null` OR computed `end <= start` → ` (line {start})` (single line / unknown end);
+- otherwise → ` (lines {start}-{end})`.
 
 ### Facade surface additions (`src/render/index.ts`)
 
@@ -898,3 +918,45 @@ every highlight by iterating the cached record ids via `clearHighlight` (BEFORE 
 since `io.clearAll` returns `[]`), then calls `io.clearAll(path)`, adopts the returned `[]` into the
 cache, and fires `onCommentCountChanged`. `main.ts` hands in the pane element exactly like
 `initComments` / `loadCommentsFor` — it never reaches into `#reading-pane`.
+
+## Reading-pane text-size control (additive, non-breaking)
+
+Added 2026-05-29. Two `A−` / `A+` stepper buttons in the `.titlebar-controls` slot scale the
+**entire reading pane** (headings, body, code, tables) as one system. None of the §1/§2/§3 or prior
+surfaces are altered; `PlanRecord` is **UNCHANGED (still 6 keys)**.
+
+### Single-variable scaling
+
+Every reading-pane (`.md …`) `font-size` in `src/styles.css` is `em`-relative to a single CSS custom
+property **`--reading-font-size`** (declared once on the light `:root`, theme-independent — NOT
+duplicated in the dark block). `.md` itself is `font-size: var(--reading-font-size)`; headings/table/
+code/pre/raw are `em` multiples preserving the original 15px-base ratios (h1 `1.8em`, h2 `1.333em`,
+h3 `1.067em`, `.md table` `0.9em`, inline `.md code` `0.833em`, `.md pre` `0.833em` with `.md pre code`
+`1em` to avoid compounding, `.md.raw` `0.833em`). Stepping the one variable rescales the whole pane.
+
+### New DOM selectors
+
+| selector | element | role |
+|----------|---------|------|
+| `#text-dec` | `<button class="theme-toggle">` in `.titlebar-controls`, **immediately before `#theme-toggle`** | decrease reading-pane text size (label `A−`, U+2212). Drag-immunity via the `isDragTarget()` interactive-target bail (it is a `<button>`), NOT `data-tauri-drag-region`. Disabled at the ladder floor. |
+| `#text-inc` | `<button class="theme-toggle">` in `.titlebar-controls`, between `#text-dec` and `#theme-toggle` | increase reading-pane text size (label `A+`). Same drag-immunity. Disabled at the ladder ceiling. |
+
+### Persistence + ladder
+
+The fixed ladder is **`[13, 14, 15, 17, 19, 21]`** (px); the default is **15**. The persisted choice
+lives under the localStorage key **`plan-reader-text-size`** (a ladder integer). It is **read before
+first paint** by the inline anti-FOUC script in `index.html` (which sets
+`--reading-font-size` on `document.documentElement`, validating against the ladder and defaulting to
+15 on a missing/invalid value) and **written on click** by `initTextSize` (`src/titlebar.ts`, exporting
+`TEXT_SIZE_KEY`, `DEFAULT_TEXT_SIZE`, `TEXT_SIZE_LADDER`, and the pure `nextTextSize(currentPx, dir)`
+stepper). The key + ladder literal are duplicated between the inline script and the module — mirroring
+the `plan-reader-theme` precedent. `nextTextSize` snaps off-ladder input to the nearest rung, steps one
+rung, and clamps at both ends (always returns a ladder value); it is pinned by `src/titlebar.test.ts`
+(`test_nextTextSize_steps_and_clamps`).
+
+The inline-script duplicates (the `plan-reader-text-size` key and the `[13, 14, 15, 17, 19, 21]` ladder
+literal) are themselves pinned against the `index.html` source by `src/contract.test.ts` (suite
+*"text-size anti-FOUC literals pinned in index.html"*): the key and ladder are asserted equal to
+titlebar.ts's exported `TEXT_SIZE_KEY` / `TEXT_SIZE_LADDER`, and the `#text-dec` / `#text-inc` ids and
+the `--reading-font-size` variable are asserted present — so if the inline script drifts from the module
+source of truth, those assertions go red (mirroring how `plan-reader-theme` is pinned).

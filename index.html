@@ -9,6 +9,12 @@
       // Apply persisted theme before first paint. Key shared with src/titlebar.ts (THEME_KEY).
       try { var t = localStorage.getItem("plan-reader-theme");
             if (t === "dark") document.documentElement.dataset.theme = "dark"; } catch (e) {}
+      // Apply persisted reading-pane text size before first paint (no flash).
+      // Key + ladder shared with src/titlebar.ts (TEXT_SIZE_KEY / the [13,14,15,17,19,21]
+      // ladder). Validate against the ladder; default to 15 if missing/invalid.
+      try { var s = parseInt(localStorage.getItem("plan-reader-text-size"), 10);
+            if ([13, 14, 15, 17, 19, 21].indexOf(s) === -1) s = 15;
+            document.documentElement.style.setProperty("--reading-font-size", s + "px"); } catch (e) {}
     </script>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
@@ -34,6 +40,22 @@
             <span class="ico" aria-hidden="true">&#128172;</span>
             <span class="label">Prompt Feedback</span>
             <span class="badge" id="feedback-count">0</span>
+          </button>
+          <!-- Reading-pane text-size steppers. Placed immediately BEFORE
+               #theme-toggle so the theme toggle stays far-right. Like the theme
+               toggle they are ordinary interactive <button>s: window-drag
+               exclusion is handled by isDragTarget()'s interactive-target bail in
+               src/titlebar.ts; they are excluded from the window drag region via
+               that bail, not via the drag attribute or pointer-events. They
+               step the shared --reading-font-size var through a fixed ladder
+               (initTextSize, src/titlebar.ts) and persist to plan-reader-text-size. -->
+          <button class="theme-toggle" id="text-dec" type="button"
+                  title="Decrease text size" aria-label="Decrease text size">
+            <span class="ico" aria-hidden="true">A&#8722;</span>
+          </button>
+          <button class="theme-toggle" id="text-inc" type="button"
+                  title="Increase text size" aria-label="Increase text size">
+            <span class="ico" aria-hidden="true">A+</span>
           </button>
           <button class="theme-toggle" id="theme-toggle" type="button"
                   title="Toggle dark / light theme" aria-label="Toggle dark / light theme">

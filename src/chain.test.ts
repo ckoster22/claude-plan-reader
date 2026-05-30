@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/path", () => ({ homeDir: vi.fn(async () => "/home/u") }
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("./render", () => ({ renderInto: vi.fn(), settle: vi.fn(), clearAllComments: vi.fn() }));
 vi.mock("./render/scroll", () => ({ captureAnchor: vi.fn(), applyDelta: vi.fn() }));
-vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn() }));
+vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
 import { chainHandler } from "./main";
 
