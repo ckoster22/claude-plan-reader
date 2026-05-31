@@ -45,13 +45,15 @@
                the .titlebar-controls slot, so window-drag exclusion is the isDragTarget()
                interactive-target bail in src/titlebar.ts — NOT data-tauri-drag-region.
                #hook-setup installs the PreToolUse/ExitPlanMode hook (install_hook);
-               #hook-remove uninstalls it (uninstall_hook). Phase 6 wires the clicks and
-               toggles which is shown based on install state. -->
+               #hook-remove uninstalls it (uninstall_hook). EXACTLY ONE is visible at a time:
+               refreshHookButtons() queries hook_status on load and toggles `.hidden` so the
+               correct single button shows. #hook-remove starts `.hidden`; refreshHookButtons
+               flips the pair on load and after each single-click install/remove. -->
           <button class="theme-toggle hook-btn" id="hook-setup" type="button"
                   title="Install plan-review hook" aria-label="Install plan-review hook">
             <span class="label">Install plan-review hook</span>
           </button>
-          <button class="theme-toggle hook-btn" id="hook-remove" type="button"
+          <button class="theme-toggle hook-btn hidden" id="hook-remove" type="button"
                   title="Remove plan-review hook" aria-label="Remove plan-review hook">
             <span class="label">Remove</span>
           </button>

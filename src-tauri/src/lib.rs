@@ -446,6 +446,38 @@ fn merge_uninstall_hook(settings: Value) -> Value {
     root
 }
 
+/// PURE detection: is OUR plan-reader `ExitPlanMode` PreToolUse hook present in `settings`?
+/// True iff `settings.hooks.PreToolUse` is an array containing an element whose
+/// `matcher == "ExitPlanMode"` whose own `hooks` array contains an entry whose `command`
+/// (a string) ENDS WITH `PLAN_READER_HOOK_SUFFIX` — the SAME idempotency key the merge
+/// functions match on. Tolerant of odd shapes: any missing/wrong-typed level short-circuits
+/// to `false` (never panics).
+fn hook_is_installed(settings: &Value) -> bool {
+    let Some(pretooluse) = settings
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+    else {
+        return false;
+    };
+    pretooluse.iter().any(|el| {
+        if el.get("matcher").and_then(|m| m.as_str()) != Some(EXIT_PLAN_MODE_MATCHER) {
+            return false;
+        }
+        el.get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.ends_with(PLAN_READER_HOOK_SUFFIX))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// True iff `candidate` lives inside `root`. Both are expected to already be canonicalized
 /// by the caller (so symlinks/`..` are resolved before this check). Extracted from
 /// `read_plan_contents` purely so the containment rule is unit-testable with an arbitrary
@@ -2066,6 +2098,28 @@ fn uninstall_hook() -> Result<(), String> {
     Ok(())
 }
 
+/// Auto-detect whether OUR `ExitPlanMode` PreToolUse hook is currently installed in
+/// `~/.claude/settings.json`. Drives the single-click Install XOR Remove button UX (no
+/// two-click confirm). Failure policy: file ABSENT ⇒ `Ok(false)` (nothing installed); file
+/// present but UNPARSEABLE ⇒ `Ok(false)` (we can't confirm our entry — `install_hook` still
+/// guards a corrupt config separately and refuses to overwrite it); else
+/// `Ok(hook_is_installed(&value))`. Never returns Err except for an unlocatable home dir.
+#[tauri::command]
+fn hook_status() -> Result<bool, String> {
+    let settings_path = dirs::home_dir()
+        .ok_or_else(|| "could not locate home directory".to_string())?
+        .join(".claude")
+        .join("settings.json");
+    let bytes = match std::fs::read(&settings_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(false), // absent ⇒ not installed
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => Ok(hook_is_installed(&value)),
+        Err(_) => Ok(false), // unparseable ⇒ can't confirm our entry
+    }
+}
+
 /// Read `settings.json` into a `serde_json::Value`, distinguishing the two failure modes so a
 /// momentarily-corrupt file can NEVER be clobbered:
 ///   - file ABSENT ⇒ `Ok({})` (a fresh, empty settings object — nothing to preserve);
@@ -2486,7 +2540,8 @@ pub fn run() {
             respond_to_review,
             focus_main_window,
             install_hook,
-            uninstall_hook
+            uninstall_hook,
+            hook_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4389,6 +4444,62 @@ mod tests {
         let once = merge_uninstall_hook(installed);
         let twice = merge_uninstall_hook(once.clone());
         assert_eq!(once, twice, "uninstall must be idempotent (removing twice = no-op)");
+    }
+
+    /// `hook_is_installed` must be FALSE for the user's real settings (which has a Bash PreToolUse
+    /// hook + a PostToolUse/ExitPlanMode hook, but NO plan-reader entry), and TRUE after
+    /// `merge_install_hook` adds our entry. Falsifiability proven by inverting the assertion (see
+    /// the commit report): the fixture passes only because no command ends with the suffix, and the
+    /// merged value passes only because our command does — flipping either `assert!`/`assert!(!…)`
+    /// turns the test red.
+    #[test]
+    fn hook_is_installed_detects_only_our_entry() {
+        let fixture = settings_fixture();
+        assert!(
+            !hook_is_installed(&fixture),
+            "the real-settings fixture (Bash PreToolUse + PostToolUse/ExitPlanMode, NO plan-reader \
+             hook) must NOT be detected as installed"
+        );
+
+        let installed = merge_install_hook(fixture, TEST_HOOK_CMD);
+        assert!(
+            hook_is_installed(&installed),
+            "after merge_install_hook adds our plan-reader/hook.sh command, it MUST be detected"
+        );
+    }
+
+    /// `hook_is_installed` must not panic and must return `false` on odd / non-object shapes, and
+    /// must reject an ExitPlanMode matcher whose only command does NOT end with our suffix.
+    #[test]
+    fn hook_is_installed_false_on_odd_shapes() {
+        assert!(!hook_is_installed(&Value::Null));
+        assert!(!hook_is_installed(&serde_json::json!([1, 2, 3])));
+        assert!(!hook_is_installed(&serde_json::json!({ "hooks": "not-an-object" })));
+        assert!(!hook_is_installed(&serde_json::json!({ "hooks": { "PreToolUse": {} } })));
+        // ExitPlanMode matcher present, but the command is someone ELSE's hook → not ours.
+        let foreign = serde_json::json!({
+            "hooks": { "PreToolUse": [
+                { "matcher": "ExitPlanMode", "hooks": [
+                    { "type": "command", "command": "/some/other/exit-hook.sh", "timeout": 30 }
+                ] }
+            ] }
+        });
+        assert!(
+            !hook_is_installed(&foreign),
+            "an ExitPlanMode matcher whose command is not ours must NOT count as installed"
+        );
+        // Our suffix under a NON-ExitPlanMode matcher must also not count.
+        let wrong_matcher = serde_json::json!({
+            "hooks": { "PreToolUse": [
+                { "matcher": "Bash", "hooks": [
+                    { "type": "command", "command": "/x/plan-reader/hook.sh" }
+                ] }
+            ] }
+        });
+        assert!(
+            !hook_is_installed(&wrong_matcher),
+            "our suffix under a non-ExitPlanMode matcher must NOT count as installed"
+        );
     }
 
     /// `#[serde(default)]` must rescue OLD saved files that predate `block_end_line`: a comments

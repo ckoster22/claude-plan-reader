@@ -1057,11 +1057,16 @@ export function chainHandler(
 // JS dialogs have no UI delegate — window.confirm() returns false and window.alert() is a no-op.
 // So the old `if (window.confirm(...)) invoke(...)` NEVER invoked, and any error alert was
 // invisible → the button "did nothing". We replace both with an in-DOM mechanism that needs no
-// new Tauri plugin/capability: a two-click "click again to confirm" arm on the button, and a
-// transient status line (#hook-status) for success/error.
+// new Tauri plugin/capability: a transient status line (#hook-status) for success/error.
+//
+// AUTO-DETECT single-click UX: there is no "click again to confirm" arming for the hook buttons.
+// `refreshHookButtons()` queries the `hook_status` command and shows EXACTLY ONE of #hook-setup
+// (Install) / #hook-remove (Remove) at a time. A single click on the visible button runs the
+// matching command, then re-queries hook_status so the pair flips. (The #review-clear button keeps
+// its own two-click confirm — that is a separate, destructive comment-wipe action.)
 
-// How long the button stays "armed" (confirming) before reverting (ms), and how long a status
-// message lingers before auto-clearing (ms). Module constants so the test can reason about them.
+// How long the #review-clear two-click confirm stays "armed" before reverting (ms), and how long a
+// status message lingers before auto-clearing (ms). Module constants so the test can reason about them.
 const HOOK_CONFIRM_MS = 4000;
 const HOOK_STATUS_MS = 6000;
 
@@ -1084,21 +1089,42 @@ export function setHookStatus(
   statusEl.classList.remove("hidden");
 }
 
-// Wire a hook install/remove button with a dependency-free in-DOM confirm + status flow:
-//   1st click  → arm: button enters a "Click again to confirm" state (.confirming + relabel),
-//                auto-reverting after HOOK_CONFIRM_MS so a stray click is harmless.
-//   2nd click  → invoke the command (wrapped in try/catch). On success show an in-DOM success
-//                status; on error show the command's error string in-DOM (NOT a silent alert).
-//   Outcome is ALWAYS console.log/console.error'd too (so devtools shows it).
-// The button's original label is captured from its current text so arming can restore it. Timers
-// are tracked per-button so re-arming/re-clicking doesn't leak stale reverts.
-// EXPORTED so the confirm→invoke→status flow is unit-testable without DOMContentLoaded.
+// Auto-detect the installed state and show EXACTLY ONE of #hook-setup (Install) / #hook-remove
+// (Remove). Queries the `hook_status` command; on error treats the hook as NOT installed (shows
+// Install) and surfaces the error string in #hook-status. EXPORTED so the single-button toggle is
+// directly unit-testable without DOMContentLoaded. `invokeFn` is an injection seam for tests.
+export async function refreshHookButtons(
+  setupEl: HTMLElement | null,
+  removeEl: HTMLElement | null,
+  statusEl: HTMLElement | null,
+  invokeFn: (cmd: string) => Promise<unknown> = (cmd) => invoke(cmd),
+): Promise<void> {
+  let installed = false;
+  try {
+    installed = (await invokeFn("hook_status")) as boolean;
+  } catch (e) {
+    console.error("hook_status failed", e);
+    setHookStatus(statusEl, `Could not check hook status: ${String(e)}`, "error");
+    installed = false; // treat as not-installed so the user can still attempt an install
+  }
+  // Exactly one visible: installed ⇒ show Remove, hide Install; else the reverse.
+  setupEl?.classList.toggle("hidden", installed);
+  removeEl?.classList.toggle("hidden", !installed);
+}
+
+// Wire a hook install/remove button as a PLAIN single-click action (NO two-click confirm):
+//   click → invoke the command (try/catch). On success show an in-DOM success status; on error show
+//           the error string in-DOM (NOT a silent alert). ALWAYS console.log/console.error'd too.
+//   finally → refreshHookButtons() so the visible button flips to reflect the new install state.
+// EXPORTED so the click→invoke→status→refresh flow is unit-testable without DOMContentLoaded.
+// `invokeFn` is an injection seam for tests; production passes the real `invoke`.
 export function wireHookButton(
   btn: HTMLElement | null,
+  setupEl: HTMLElement | null,
+  removeEl: HTMLElement | null,
   statusEl: HTMLElement | null,
   command: "install_hook" | "uninstall_hook",
   opts: {
-    confirmLabel: string;
     successText: string;
     errorPrefix: string;
     invokeFn?: (cmd: string) => Promise<unknown>;
@@ -1106,38 +1132,8 @@ export function wireHookButton(
 ): void {
   if (!btn) return;
   const doInvoke = opts.invokeFn ?? ((cmd: string) => invoke(cmd));
-  const labelEl = btn.querySelector(".label");
-  const originalLabel = (labelEl ?? btn).textContent ?? "";
-
-  let armed = false;
-  let revertTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const setLabel = (text: string): void => {
-    if (labelEl) labelEl.textContent = text;
-    else btn.textContent = text;
-  };
-  const disarm = (): void => {
-    armed = false;
-    btn.classList.remove("confirming");
-    setLabel(originalLabel);
-    if (revertTimer !== null) {
-      clearTimeout(revertTimer);
-      revertTimer = null;
-    }
-  };
 
   btn.addEventListener("click", () => {
-    if (!armed) {
-      // First click: arm. Clear any prior status so the confirm prompt is unambiguous.
-      armed = true;
-      btn.classList.add("confirming");
-      setLabel(opts.confirmLabel);
-      setHookStatus(statusEl, "");
-      revertTimer = setTimeout(disarm, HOOK_CONFIRM_MS);
-      return;
-    }
-    // Second click: confirmed. Disarm, then run the command and surface the outcome in-DOM.
-    disarm();
     void (async () => {
       try {
         await doInvoke(command);
@@ -1146,6 +1142,9 @@ export function wireHookButton(
       } catch (e) {
         console.error(`${command} failed`, e);
         setHookStatus(statusEl, `${opts.errorPrefix}: ${String(e)}`, "error");
+      } finally {
+        // Re-detect install state so the visible button flips (install ⇄ remove) after the action.
+        await refreshHookButtons(setupEl, removeEl, statusEl, doInvoke);
       }
       // Auto-clear the (transient) status after a few seconds.
       setTimeout(() => setHookStatus(statusEl, ""), HOOK_STATUS_MS);
@@ -1418,21 +1417,22 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   // ---- Phase 6 — Plan Review hook install/remove buttons (titlebar domain) ----
-  // DEPENDENCY-FREE in-DOM UX (see wireHookButton): a two-click "click again to confirm" arm
-  // gates the mutation of ~/.claude/settings.json, and #hook-status surfaces success/error in
-  // the DOM. This REPLACES window.confirm/window.alert, which are inert in Tauri v2's WKWebView
-  // (confirm returns false → invoke never fired; alert is a no-op → any error was invisible).
-  // install_hook is the idempotent additive merge; uninstall_hook removes our entry.
-  wireHookButton(hookSetupEl, hookStatusEl, "install_hook", {
-    confirmLabel: "Click again to confirm",
+  // AUTO-DETECT single-click UX: refreshHookButtons() queries `hook_status` and shows EXACTLY ONE
+  // of #hook-setup (Install) / #hook-remove (Remove). A SINGLE click on the visible button runs the
+  // matching command (no "click again to confirm" arming — that was removed) and surfaces the
+  // outcome in #hook-status (window.alert is a no-op in Tauri v2's WKWebView), then re-detects so
+  // the pair flips. install_hook is the idempotent additive merge; uninstall_hook removes our entry.
+  wireHookButton(hookSetupEl, hookSetupEl, hookRemoveEl, hookStatusEl, "install_hook", {
     successText: "Plan Reader hook installed.",
     errorPrefix: "Could not install hook",
   });
-  wireHookButton(hookRemoveEl, hookStatusEl, "uninstall_hook", {
-    confirmLabel: "Click again to confirm",
+  wireHookButton(hookRemoveEl, hookSetupEl, hookRemoveEl, hookStatusEl, "uninstall_hook", {
     successText: "Plan Reader hook removed.",
     errorPrefix: "Could not remove hook",
   });
+  // Detect the current install state on launch so the correct single button shows (the other starts
+  // .hidden in index.html; this fixes whichever is wrong). Subsequent flips happen in wireHookButton.
+  void refreshHookButtons(hookSetupEl, hookRemoveEl, hookStatusEl);
 
   if (docHeaderEl) docHeaderEl.classList.add("hidden"); // hide until a plan is opened
   if (readingPaneEl) {

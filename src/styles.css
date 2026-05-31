@@ -111,11 +111,6 @@ body {
   font-family: var(--ui); font-size: 11px; font-weight: 600;
 }
 .theme-toggle.hook-btn.hidden { display: none; }
-/* A hook button in its "click again to confirm" armed state — accent-tinted so the
-   second-click confirmation step is visible (replaces the no-op window.confirm). */
-.theme-toggle.hook-btn.confirming {
-  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
-}
 
 /* In-DOM status readout for the hook install/remove actions (replaces window.alert,
    a no-op in Tauri v2 WKWebView). A transient one-line message; main.ts sets the text,

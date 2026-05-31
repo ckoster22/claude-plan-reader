@@ -1,15 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // ---------------------------------------------------------------------------------------------
-// Phase 6 fix — the "Install plan-review hook" button did NOTHING because the old handler gated
-// on window.confirm(...) (returns false in Tauri v2 WKWebView ⇒ invoke never fired) and reported
-// via window.alert(...) (a no-op ⇒ errors invisible). The fix is a dependency-free in-DOM flow:
-//   - a two-click "click again to confirm" arm before the mutation, and
-//   - an in-DOM #hook-status line for success/error (never window.alert).
+// Phase 6 — the plan-review hook button is now AUTO-DETECT single-click (NO two-click confirm):
+//   - refreshHookButtons() queries the `hook_status` command and shows EXACTLY ONE of
+//     #hook-setup (Install, when NOT installed) / #hook-remove (Remove, when installed).
+//   - A SINGLE click on the visible button runs the matching command (install_hook / uninstall_hook)
+//     and surfaces success/error in the in-DOM #hook-status line (window.alert is a no-op in the
+//     Tauri v2 WKWebView), then re-queries hook_status so the pair flips.
 //
-// These tests assert the FLOW directly against wireHookButton/setHookStatus (no DOMContentLoaded
-// needed). Falsifiability: the "two clicks invoke" test fails if invoke fires on the FIRST click
-// (the old window.confirm bug equivalent), and the error test fails if a thrown invoke is silent.
+// These tests assert the FLOW directly against refreshHookButtons/wireHookButton/setHookStatus (no
+// DOMContentLoaded needed). Falsifiability: the "single click installs" test fires the command on the
+// FIRST click and fails if an arming guard suppresses it (proven red→green in the test below).
 // ---------------------------------------------------------------------------------------------
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
@@ -18,18 +19,18 @@ vi.mock("@tauri-apps/api/path", () => ({ homeDir: vi.fn(async () => "/home/u") }
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
-import { wireHookButton, setHookStatus } from "./main";
+import { refreshHookButtons, wireHookButton, setHookStatus } from "./main";
 
-async function flush(n = 6): Promise<void> {
+async function flush(n = 8): Promise<void> {
   for (let i = 0; i < n; i++) await Promise.resolve();
 }
 
-function makeButton(): HTMLButtonElement {
+function makeButton(id: string, labelText: string): HTMLButtonElement {
   const btn = document.createElement("button");
-  btn.id = "hook-setup";
+  btn.id = id;
   const label = document.createElement("span");
   label.className = "label";
-  label.textContent = "Install plan-review hook";
+  label.textContent = labelText;
   btn.appendChild(label);
   return btn;
 }
@@ -40,109 +41,142 @@ function makeStatus(): HTMLElement {
   return el;
 }
 
-beforeEach(() => {
-  vi.useFakeTimers();
-});
-afterEach(() => {
-  vi.runOnlyPendingTimers();
-  vi.useRealTimers();
-});
-
-describe("wireHookButton — two-click confirm gates the invoke", () => {
-  it("first click does NOT invoke; it arms the button (label + .confirming)", async () => {
-    const btn = makeButton();
+describe("refreshHookButtons — shows EXACTLY ONE button per install state", () => {
+  it("hook_status true ⇒ Remove visible, Install hidden", async () => {
+    const setup = makeButton("hook-setup", "Install plan-review hook");
+    const remove = makeButton("hook-remove", "Remove");
     const status = makeStatus();
-    const invokeFn = vi.fn(() => Promise.resolve());
-    wireHookButton(btn, status, "install_hook", {
-      confirmLabel: "Click again to confirm",
-      successText: "Plan Reader hook installed.",
-      errorPrefix: "Could not install hook",
-      invokeFn,
-    });
+    const invokeFn = vi.fn(async (cmd: string) => (cmd === "hook_status" ? true : undefined));
 
-    btn.click();
-    await flush();
+    await refreshHookButtons(setup, remove, status, invokeFn);
 
-    // The bug being guarded: a first click must NOT fire the command (the old window.confirm
-    // returned false, so invoke never ran — here we require the OPPOSITE gating: deliberate
-    // two-click confirm, so one click only arms).
-    expect(invokeFn).not.toHaveBeenCalled();
-    expect(btn.classList.contains("confirming")).toBe(true);
-    expect(btn.querySelector(".label")?.textContent).toBe("Click again to confirm");
+    expect(invokeFn).toHaveBeenCalledWith("hook_status");
+    expect(remove.classList.contains("hidden")).toBe(false); // Remove shown
+    expect(setup.classList.contains("hidden")).toBe(true); // Install hidden
   });
 
-  it("second click invokes the command exactly once and shows an in-DOM success status", async () => {
-    const btn = makeButton();
+  it("hook_status false ⇒ Install visible, Remove hidden (the reverse)", async () => {
+    const setup = makeButton("hook-setup", "Install plan-review hook");
+    const remove = makeButton("hook-remove", "Remove");
     const status = makeStatus();
-    const invokeFn = vi.fn(() => Promise.resolve());
-    wireHookButton(btn, status, "install_hook", {
-      confirmLabel: "Click again to confirm",
+    const invokeFn = vi.fn(async (cmd: string) => (cmd === "hook_status" ? false : undefined));
+
+    await refreshHookButtons(setup, remove, status, invokeFn);
+
+    expect(setup.classList.contains("hidden")).toBe(false); // Install shown
+    expect(remove.classList.contains("hidden")).toBe(true); // Remove hidden
+  });
+
+  it("a thrown hook_status is treated as NOT installed (Install shown) and surfaces the error in #hook-status", async () => {
+    const setup = makeButton("hook-setup", "Install plan-review hook");
+    const remove = makeButton("hook-remove", "Remove");
+    const status = makeStatus();
+    const invokeFn = vi.fn(() => Promise.reject("settings.json unreadable"));
+
+    await refreshHookButtons(setup, remove, status, invokeFn);
+
+    expect(setup.classList.contains("hidden")).toBe(false); // default to Install on error
+    expect(remove.classList.contains("hidden")).toBe(true);
+    expect(status.classList.contains("hidden")).toBe(false);
+    expect(status.classList.contains("error")).toBe(true);
+    expect(status.textContent).toContain("settings.json unreadable");
+  });
+});
+
+describe("wireHookButton — SINGLE click invokes (no two-click confirm)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+  });
+
+  it("a SINGLE click on #hook-setup calls install_hook exactly once, then re-queries hook_status", async () => {
+    const setup = makeButton("hook-setup", "Install plan-review hook");
+    const remove = makeButton("hook-remove", "Remove");
+    const status = makeStatus();
+    const calls: string[] = [];
+    const invokeFn = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd === "hook_status") return true; // after install, it IS installed
+      return undefined;
+    });
+    wireHookButton(setup, setup, remove, status, "install_hook", {
       successText: "Plan Reader hook installed.",
       errorPrefix: "Could not install hook",
       invokeFn,
     });
 
-    btn.click(); // arm
-    btn.click(); // confirm
+    setup.click(); // ONE click — no arming, no second click
+    await vi.advanceTimersByTimeAsync(0);
     await flush();
 
-    expect(invokeFn).toHaveBeenCalledTimes(1);
+    // Falsifiable: install MUST fire on the first (only) click. (Reintroducing an arming guard that
+    // makes the first click a no-op turns this red — proven in the red→green test below.)
     expect(invokeFn).toHaveBeenCalledWith("install_hook");
+    expect(calls.filter((c) => c === "install_hook").length).toBe(1);
+    // After install it re-queries hook_status (so the pair can flip).
+    expect(calls).toContain("hook_status");
     // Success surfaced IN THE DOM (not a window.alert no-op).
     expect(status.classList.contains("hidden")).toBe(false);
     expect(status.classList.contains("error")).toBe(false);
     expect(status.textContent).toBe("Plan Reader hook installed.");
-    // Button reverted to its original label after confirming.
-    expect(btn.classList.contains("confirming")).toBe(false);
-    expect(btn.querySelector(".label")?.textContent).toBe("Install plan-review hook");
+    // The re-query found installed=true ⇒ Remove now visible, Install hidden.
+    expect(remove.classList.contains("hidden")).toBe(false);
+    expect(setup.classList.contains("hidden")).toBe(true);
   });
 
-  it("a thrown invoke surfaces the error string IN THE DOM (never silent)", async () => {
-    const btn = makeButton();
+  it("a SINGLE click on #hook-remove calls uninstall_hook exactly once, then re-queries hook_status", async () => {
+    const setup = makeButton("hook-setup", "Install plan-review hook");
+    const remove = makeButton("hook-remove", "Remove");
     const status = makeStatus();
-    const invokeFn = vi.fn(() =>
-      Promise.reject("settings.json is not valid JSON — refusing to modify"),
-    );
-    wireHookButton(btn, status, "install_hook", {
-      confirmLabel: "Click again to confirm",
+    const calls: string[] = [];
+    const invokeFn = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      if (cmd === "hook_status") return false; // after uninstall, it is NOT installed
+      return undefined;
+    });
+    wireHookButton(remove, setup, remove, status, "uninstall_hook", {
+      successText: "Plan Reader hook removed.",
+      errorPrefix: "Could not remove hook",
+      invokeFn,
+    });
+
+    remove.click(); // ONE click
+    await vi.advanceTimersByTimeAsync(0);
+    await flush();
+
+    expect(calls.filter((c) => c === "uninstall_hook").length).toBe(1);
+    expect(calls).toContain("hook_status");
+    expect(status.textContent).toBe("Plan Reader hook removed.");
+    // Re-query found installed=false ⇒ Install now visible, Remove hidden.
+    expect(setup.classList.contains("hidden")).toBe(false);
+    expect(remove.classList.contains("hidden")).toBe(true);
+  });
+
+  it("a thrown install_hook surfaces the error string IN THE DOM (never silent)", async () => {
+    const setup = makeButton("hook-setup", "Install plan-review hook");
+    const remove = makeButton("hook-remove", "Remove");
+    const status = makeStatus();
+    const invokeFn = vi.fn(async (cmd: string) => {
+      if (cmd === "install_hook") return Promise.reject("settings.json is not valid JSON — refusing to modify");
+      return false; // hook_status re-query in the finally
+    });
+    wireHookButton(setup, setup, remove, status, "install_hook", {
       successText: "Plan Reader hook installed.",
       errorPrefix: "Could not install hook",
       invokeFn,
     });
 
-    btn.click(); // arm
-    btn.click(); // confirm
+    setup.click();
+    await vi.advanceTimersByTimeAsync(0);
     await flush();
 
-    expect(invokeFn).toHaveBeenCalledTimes(1);
     expect(status.classList.contains("hidden")).toBe(false);
     expect(status.classList.contains("error")).toBe(true);
-    // The command's actual error string is shown (not swallowed).
     expect(status.textContent).toContain("settings.json is not valid JSON");
     expect(status.textContent).toContain("Could not install hook");
-  });
-
-  it("arming auto-reverts after the confirm window, so the NEXT click re-arms (does not invoke)", async () => {
-    const btn = makeButton();
-    const status = makeStatus();
-    const invokeFn = vi.fn(() => Promise.resolve());
-    wireHookButton(btn, status, "install_hook", {
-      confirmLabel: "Click again to confirm",
-      successText: "ok",
-      errorPrefix: "err",
-      invokeFn,
-    });
-
-    btn.click(); // arm
-    expect(btn.classList.contains("confirming")).toBe(true);
-    vi.advanceTimersByTime(5000); // past HOOK_CONFIRM_MS (4000) → auto-disarm
-    expect(btn.classList.contains("confirming")).toBe(false);
-
-    // A click after the timeout re-arms rather than confirming → still no invoke.
-    btn.click();
-    await flush();
-    expect(invokeFn).not.toHaveBeenCalled();
-    expect(btn.classList.contains("confirming")).toBe(true);
   });
 });
 
