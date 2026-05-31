@@ -23,7 +23,4 @@ dist-ssr
 *.sw?
 
 # session scratch / local backups (not for version control)
-.invariant-findings/
-.plan-tree.20260524-2024/
-.plan-tree.archived*/
 .plan-tree*
