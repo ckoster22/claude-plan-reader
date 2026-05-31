@@ -61,6 +61,12 @@ npm run tauri build
 
 Output lands under `src-tauri/target/release/bundle/macos/`. The build is **unsigned** — first launch needs **right-click → Open** to bypass Gatekeeper. Signing and notarization are not configured.
 
+To build and install into `/Applications` in one step (replacing any existing copy), run:
+
+```sh
+bash scripts/install.sh
+```
+
 ## Develop
 
 | Command                              | Does                                           |
