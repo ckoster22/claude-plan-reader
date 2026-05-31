@@ -14,13 +14,21 @@ import {
   type CommentsIO,
 } from "./render";
 import { buildFeedbackPrompt } from "./feedback";
+import { applyReviewButtonState, applyReviewBarState } from "./review";
 import { captureAnchor, applyDelta, scrollToHeading } from "./render/scroll";
 import { collapseHome } from "./cwd";
 import { resolveCwds } from "./resolve";
 import { filterRecords, highlightInto, planCountText } from "./filter";
 import { RenderGuard } from "./render-guard";
 import { initTitlebar, initThemeToggle, initTextSize } from "./titlebar";
-import type { PlanRecord, SidebarCtx, CommentRecord } from "./types";
+import type {
+  PlanRecord,
+  SidebarCtx,
+  CommentRecord,
+  ReviewRequest,
+  ReviewRequested,
+  ReviewCancelled,
+} from "./types";
 import { asAbsPath, asStem, cwdState, type AbsPath, type Stem } from "./types";
 
 // ---- Frozen contract type (mirrors Rust PlanChanged in CONTRACT.md) ----
@@ -48,9 +56,72 @@ let feedbackOverlayEl: HTMLElement | null;
 let feedbackBodyEl: HTMLElement | null;
 let feedbackCopyEl: HTMLElement | null;
 let feedbackClearEl: HTMLElement | null;
+// Phase 6 — Plan Review (ExitPlanMode hook): hook install/remove buttons.
+// Review action bar (non-occluding affordance docked in the reading-pane column header so inline
+// commenting in the pane stays fully usable). Shown whenever a review is pending (viewing OR
+// summary mode); see applyReviewBarState.
+let reviewBarEl: HTMLElement | null;
+let reviewBarLabelEl: HTMLElement | null;
+let reviewSubmitEl: HTMLButtonElement | null;
+let reviewClearEl: HTMLButtonElement | null;
+let reviewDismissEl: HTMLButtonElement | null;
+let reviewResumeEl: HTMLButtonElement | null;
+let hookSetupEl: HTMLElement | null;
+let hookRemoveEl: HTMLElement | null;
+let hookStatusEl: HTMLElement | null;
 
 // Absolute path of the currently-open plan (null when nothing selected).
 let openPath: AbsPath | null = null;
+
+// ---- Phase 6 — Plan Review (ExitPlanMode hook) — Option A: open the REAL plan file ----
+//
+// A plan review carries a BLOCKING PreToolUse hook; the app can only RELEASE it (decision "allow" →
+// Claude Code shows its normal terminal plan-approval prompt) or DENY it with feedback (decision
+// "deny" + assembled comments → Claude revises). There is no in-app auto-approve.
+//
+// NEW MODEL (the invariant fix): the reviewed plan is a REAL file under `~/.claude/plans/` (its
+// absolute path rides on the review payload as `planFilePath`). A review now OPENS THAT FILE through
+// the NORMAL plan-open flow, so it is SELECTED in the sidebar, its comments persist with the plan
+// (keyed on its real path — no special store), and live-reload works. The review just adds an action
+// bar + tracks that this plan has a pending blocking hook.
+//
+//   pendingReviews — every known pending review (each has a live blocking hook). Keyed by reviewId.
+//                    Holds the plan file path (what we open) + planText (degraded fallback render).
+//
+// "Viewing a review" is a DERIVED condition: openPath equals some pending review's planFilePath.
+// Browsing to another plan never touches pendingReviews — the bar simply drops to SUMMARY mode, so a
+// pending review never traps navigation.
+interface PendingReview {
+  reviewId: string;
+  planFilePath: string;
+  planText: string;
+  createdMs: number;
+}
+const pendingReviews = new Map<string, PendingReview>();
+
+// The reviewId whose planFilePath === the currently-open plan, or null when the open plan is not a
+// pending review (this is the single derivation of "viewing a review"). On ties (same path tracked
+// by >1 review — should not happen) the last-iterated (newest-inserted) wins.
+function currentReviewId(): string | null {
+  if (openPath === null) return null;
+  let match: string | null = null;
+  for (const r of pendingReviews.values()) {
+    if (r.planFilePath === openPath) match = r.reviewId;
+  }
+  return match;
+}
+
+// Test-only reader: the open plan's comment count (the review's comments are just the plan's
+// comments now). Kept under the old name so existing review assertions still read it.
+export function reviewCommentCount(): number {
+  return currentReviewId() === null ? 0 : commentCount;
+}
+
+// Test-only: clear ALL review state (pending reviews). Module state persists across tests in a
+// vitest file, so this gives each test a clean slate. Production code never calls it.
+export function __resetReviewStateForTest(): void {
+  pendingReviews.clear();
+}
 
 // ---- Sidebar filter (Fix 1) ----
 // The live filter query (raw input value) and the last full records array `list_plans`
@@ -115,6 +186,10 @@ function applyCommentCount(path: AbsPath, count: number): void {
   ++countReqSeq;
   commentCount = count;
   applyFeedbackButtonState(feedbackBtnEl, feedbackCountEl, commentCount);
+  // If the open plan IS a pending review, the bar's VIEWING label + Submit-enabled state derive from
+  // this count — re-derive so the first comment enables Submit. Pass the authoritative count (commentCount
+  // is already committed, but be explicit to mirror the override contract).
+  refreshReviewBar(count);
 }
 
 // Cold-read the open plan's comment count from the backend (the count-path that works even when
@@ -128,6 +203,7 @@ export async function refreshCommentCount(): Promise<void> {
   if (openPath === null) {
     commentCount = 0;
     applyFeedbackButtonState(feedbackBtnEl, feedbackCountEl, 0);
+    refreshReviewBar(0);
     return;
   }
   const seq = ++countReqSeq;
@@ -139,6 +215,8 @@ export async function refreshCommentCount(): Promise<void> {
     if (seq !== countReqSeq) return;
     commentCount = n;
     applyFeedbackButtonState(feedbackBtnEl, feedbackCountEl, commentCount);
+    // The open plan may BE a pending review — re-derive the bar so its VIEWING comment count is right.
+    refreshReviewBar(n);
   } catch (e) {
     console.error("get_comment_count failed", e);
   }
@@ -163,6 +241,67 @@ export function currentCommentCount(): number {
 // Null until wiring runs (e.g. under unit tests that never fire DOMContentLoaded) → both no-op.
 let feedbackOverlayClose: (() => void) | null = null;
 let feedbackOverlayRefreshIfOpen: (() => void) | null = null;
+
+// ---- Review action bar (persistent, non-occluding, resumable) ----
+//
+// The slim bar docked in the reading-pane header is shown whenever one or more reviews are pending.
+// It has two modes (pure derivation in applyReviewBarState):
+//   • VIEWING  — the OPEN plan IS a pending review's plan file: Submit (deny + feedback, enabled
+//                with >=1 comment) + Dismiss (allow, releases the hook to the terminal).
+//   • SUMMARY  — reviews pending but the user is browsing a non-reviewed plan: count label + Resume
+//                only, so a pending review never traps navigation.
+//
+// `viewing` is the DERIVED condition currentReviewId() !== null. `viewedCommentCount` is the OPEN
+// plan's comment count (review comments are now the plan's normal persisted comments).
+function refreshReviewBar(countOverride?: number): void {
+  if (!reviewBarEl) return;
+  const state = applyReviewBarState({
+    pendingCount: pendingReviews.size,
+    viewing: currentReviewId() !== null,
+    viewedCommentCount: countOverride ?? commentCount,
+  });
+  reviewBarEl.classList.toggle("hidden", !state.barVisible);
+  if (reviewBarLabelEl) reviewBarLabelEl.textContent = state.label;
+  if (reviewSubmitEl) {
+    reviewSubmitEl.classList.toggle("hidden", !state.submitVisible);
+    reviewSubmitEl.disabled = state.submitDisabled;
+  }
+  if (reviewClearEl) {
+    reviewClearEl.classList.toggle("hidden", !state.clearVisible);
+    // If the manual clear button just became hidden (mode change / count hit 0), disarm any pending
+    // two-click confirm so it can't fire later in a stale state.
+    if (!state.clearVisible) reviewClearDisarm?.();
+  }
+  if (reviewDismissEl) reviewDismissEl.classList.toggle("hidden", !state.dismissVisible);
+  if (reviewResumeEl) reviewResumeEl.classList.toggle("hidden", !state.resumeVisible);
+}
+
+// Disarm hook for the #review-clear two-click confirm (set by its wiring; null under unit tests that
+// never wire it). refreshReviewBar calls it when the button hides.
+let reviewClearDisarm: (() => void) | null = null;
+
+// Shared review-response logic (the SINGLE place that calls respond_to_review), so the bar handlers
+// never duplicate the invoke. On success, the review is removed from pendingReviews; the plan stays
+// open + selected and its comments remain saved. The bar is then refreshed (drops to summary mode if
+// other reviews remain, or hides entirely). Errors are surfaced in-DOM via #hook-status.
+//   • Submit  = "deny" + buildFeedbackPrompt(the open plan's comments) → Claude revises.
+//   • Dismiss = "allow" + a fixed reason → RELEASES the hook so Claude Code shows its normal terminal
+//               plan-approval prompt (the only way to "approve" — see the state-model note above).
+// Returns true iff the response was sent successfully (so callers — e.g. Submit — can take a
+// success-only follow-up action such as clearing the submitted plan's now-consumed comments).
+async function resolveReview(reviewId: string, decision: "allow" | "deny", reason: string): Promise<boolean> {
+  try {
+    await invoke("respond_to_review", { reviewId, decision, reason });
+  } catch (e) {
+    console.error(`respond_to_review (${decision}) failed`, e);
+    setHookStatus(hookStatusEl, `Could not send review response: ${String(e)}`, "error");
+    setTimeout(() => setHookStatus(hookStatusEl, ""), HOOK_STATUS_MS);
+    return false;
+  }
+  pendingReviews.delete(reviewId);
+  refreshReviewBar();
+  return true;
+}
 
 // ---- Sub-Plan 03: cwd resolution + read/unread wiring (sidebar only) ----
 
@@ -661,6 +800,11 @@ function rebuildTocFromPane(): void {
 // EXPORTED for testing the render-generation guard around the ToC rebuild (no behavior change).
 export async function openPlan(path: AbsPath, stem: Stem): Promise<void> {
   if (!readingPaneEl) return;
+
+  // Navigation is FREE and never touches pendingReviews. "Viewing a review" is derived from
+  // openPath (see currentReviewId), so simply opening a plan flips the bar to VIEWING (if this is a
+  // reviewed plan's file) or SUMMARY (if a review is pending elsewhere) via the refreshReviewBar()
+  // call at the end of this function — no teardown/auto-resurface logic.
   openPath = path;
 
   // Plan SWITCH: close the feedback overlay so it never shows the PRIOR plan's prompt. Done
@@ -739,6 +883,13 @@ export async function openPlan(path: AbsPath, stem: Stem): Promise<void> {
   // Persist the view: clears the unread state for this plan (backend stamps
   // viewed = max(now, mtime+1)). Belt-and-suspenders alongside the open-path fiat.
   await markViewed(path);
+
+  // openPath is now set + the plan rendered: refresh the bar so it flips to VIEWING (this plan is a
+  // pending review's file) or SUMMARY (a review is pending on a different plan) or hides (none
+  // pending). NOT guarded by renderGuard — the bar reflects pending-review state + openPath, not the
+  // rendered pane content. refreshCommentCount (fired un-awaited above) will re-refresh the bar once
+  // the authoritative count lands, so the VIEWING label shows the right comment count.
+  refreshReviewBar();
 }
 
 // Live-reload the currently-open plan, preserving the reading position with an
@@ -749,6 +900,8 @@ export async function openPlan(path: AbsPath, stem: Stem): Promise<void> {
 // EXPORTED for testing the render-generation guard around the ToC rebuild (no behavior change).
 export async function reloadOpenPlan(): Promise<void> {
   if (!readingPaneEl || !readerScrollEl || openPath === null) return;
+  // A reviewed plan is now a REAL file, so a live edit to it reloads normally (Claude revising the
+  // plan after a deny updates the file in place — the user sees the revision live).
   const path = openPath;
   // Take a render generation BEFORE the read: a newer open/reload supersedes us and our
   // post-await pane mutations (renderInto + the two applyDelta calls) are skipped, so an
@@ -784,6 +937,79 @@ export async function reloadOpenPlan(): Promise<void> {
   } catch (e) {
     console.error("reload failed (plan may have been removed)", e);
   }
+}
+
+// Filename stem from an absolute plan path (no `.md`). Reuses stemFromPath for the basename rule.
+function stemFromBasename(absPath: string): Stem {
+  return stemFromPath(asAbsPath(absPath));
+}
+
+// Degraded fallback render: the review's `planFilePath` is empty OR opening the real file failed
+// (not found / outside plans dir). Render the IPC-supplied `planText` detached into the reading pane
+// so the review is STILL actionable (Submit/Dismiss work — the bar derives from pendingReviews, not
+// openPath here). console.warn so the degradation is visible. NOTE: in this path the sidebar row is
+// NOT selected (there is no file to select) — this is the documented degraded mode, not the norm.
+async function renderReviewTextDetached(planText: string): Promise<void> {
+  if (!readingPaneEl) return;
+  console.warn("plan review: opening the real plan file failed; rendering detached plan text (degraded)");
+  const gen = renderGuard.begin();
+  if (docHeaderEl) docHeaderEl.classList.remove("hidden");
+  if (docFilenameEl) docFilenameEl.textContent = "Plan review";
+  if (docSrcEl) docSrcEl.replaceChildren();
+  renderInto(readingPaneEl, planText, "");
+  readerScrollEl?.scrollTo({ top: 0 });
+  await settle(readingPaneEl);
+  if (!renderGuard.isCurrent(gen)) return;
+  rebuildTocFromPane();
+}
+
+// Open a pending review's REAL plan file through the NORMAL plan-open flow (Option A). Refresh the
+// sidebar list FIRST so the just-written plan's `[data-path]` row exists, then openPlan(...) — which
+// selects that row, persists/loads its comments on its real path, and live-reloads. The bar then
+// derives VIEWING from openPath. Falls back to a detached planText render if planFilePath is empty or
+// the open fails (file missing / outside plans dir) so the review stays actionable. `review` MUST
+// already be tracked in pendingReviews (the caller adds it).
+async function openReviewPlanFile(review: PendingReview): Promise<void> {
+  if (!review.planFilePath) {
+    await renderReviewTextDetached(review.planText);
+    refreshReviewBar();
+    return;
+  }
+  // Refresh the sidebar so the just-written plan row exists before we select it. (openPlan applies
+  // .active by data-path; the row must be present at/after open for the selection invariant to hold.)
+  await refreshList();
+  try {
+    await openPlan(asAbsPath(review.planFilePath), stemFromBasename(review.planFilePath));
+  } catch (e) {
+    console.error("plan review: openPlan of the real file failed", e);
+    await renderReviewTextDetached(review.planText);
+  }
+  refreshReviewBar();
+}
+
+// Max age (ms) before a pending review is considered STALE: its blocking hook has already timed
+// out, so its request file describes a dead review whose Submit/Dismiss would be a silent no-op.
+// Stale entries are filtered out of launch recovery.
+const STALE_REVIEW_MS = 600_000;
+
+// Pick the NEWEST pending review (max createdMs). Tie-break MUST favor the LATER-INSERTED review on
+// equal createdMs: two reviews can arrive within the same millisecond (createdMs falls back to
+// Date.now()), and `pendingReviews` is a Map iterated in INSERTION order, so the last-inserted entry
+// is the genuinely most-recent arrival. `>=` picks the later-inserted entry, making this deterministic.
+function newestPendingReview(): PendingReview | null {
+  let newest: PendingReview | null = null;
+  for (const r of pendingReviews.values()) {
+    if (newest === null || r.createdMs >= newest.createdMs) newest = r;
+  }
+  return newest;
+}
+
+// Resume the NEWEST pending review: open its real plan file through the normal flow (re-selecting its
+// sidebar row), switching the bar to VIEWING mode. No-op if nothing is pending. The hook is untouched.
+function resumeNewestReview(): void {
+  const newest = newestPendingReview();
+  if (newest === null) return;
+  void openReviewPlanFile(newest);
 }
 
 // One serialized `plan-changed` handler body. Runs to completion before the next queued
@@ -825,6 +1051,108 @@ export function chainHandler(
   return pending.then(body).catch((e) => console.error("plan-changed handler failed", e));
 }
 
+// ---- Phase 6 — Plan Review hook install/remove (DEPENDENCY-FREE in-DOM UX) ----
+//
+// WHY THIS REPLACES window.confirm / window.alert: in Tauri v2 (Wry + WKWebView on macOS) those
+// JS dialogs have no UI delegate — window.confirm() returns false and window.alert() is a no-op.
+// So the old `if (window.confirm(...)) invoke(...)` NEVER invoked, and any error alert was
+// invisible → the button "did nothing". We replace both with an in-DOM mechanism that needs no
+// new Tauri plugin/capability: a two-click "click again to confirm" arm on the button, and a
+// transient status line (#hook-status) for success/error.
+
+// How long the button stays "armed" (confirming) before reverting (ms), and how long a status
+// message lingers before auto-clearing (ms). Module constants so the test can reason about them.
+const HOOK_CONFIRM_MS = 4000;
+const HOOK_STATUS_MS = 6000;
+
+// Set the in-DOM hook status line. `kind` selects success (accent) vs error (red); empty text
+// clears + hides it. EXPORTED so the status surface is directly unit-testable.
+export function setHookStatus(
+  statusEl: HTMLElement | null,
+  text: string,
+  kind: "success" | "error" = "success",
+): void {
+  if (!statusEl) return;
+  if (!text) {
+    statusEl.textContent = "";
+    statusEl.classList.add("hidden");
+    statusEl.classList.remove("error");
+    return;
+  }
+  statusEl.textContent = text;
+  statusEl.classList.toggle("error", kind === "error");
+  statusEl.classList.remove("hidden");
+}
+
+// Wire a hook install/remove button with a dependency-free in-DOM confirm + status flow:
+//   1st click  → arm: button enters a "Click again to confirm" state (.confirming + relabel),
+//                auto-reverting after HOOK_CONFIRM_MS so a stray click is harmless.
+//   2nd click  → invoke the command (wrapped in try/catch). On success show an in-DOM success
+//                status; on error show the command's error string in-DOM (NOT a silent alert).
+//   Outcome is ALWAYS console.log/console.error'd too (so devtools shows it).
+// The button's original label is captured from its current text so arming can restore it. Timers
+// are tracked per-button so re-arming/re-clicking doesn't leak stale reverts.
+// EXPORTED so the confirm→invoke→status flow is unit-testable without DOMContentLoaded.
+export function wireHookButton(
+  btn: HTMLElement | null,
+  statusEl: HTMLElement | null,
+  command: "install_hook" | "uninstall_hook",
+  opts: {
+    confirmLabel: string;
+    successText: string;
+    errorPrefix: string;
+    invokeFn?: (cmd: string) => Promise<unknown>;
+  },
+): void {
+  if (!btn) return;
+  const doInvoke = opts.invokeFn ?? ((cmd: string) => invoke(cmd));
+  const labelEl = btn.querySelector(".label");
+  const originalLabel = (labelEl ?? btn).textContent ?? "";
+
+  let armed = false;
+  let revertTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const setLabel = (text: string): void => {
+    if (labelEl) labelEl.textContent = text;
+    else btn.textContent = text;
+  };
+  const disarm = (): void => {
+    armed = false;
+    btn.classList.remove("confirming");
+    setLabel(originalLabel);
+    if (revertTimer !== null) {
+      clearTimeout(revertTimer);
+      revertTimer = null;
+    }
+  };
+
+  btn.addEventListener("click", () => {
+    if (!armed) {
+      // First click: arm. Clear any prior status so the confirm prompt is unambiguous.
+      armed = true;
+      btn.classList.add("confirming");
+      setLabel(opts.confirmLabel);
+      setHookStatus(statusEl, "");
+      revertTimer = setTimeout(disarm, HOOK_CONFIRM_MS);
+      return;
+    }
+    // Second click: confirmed. Disarm, then run the command and surface the outcome in-DOM.
+    disarm();
+    void (async () => {
+      try {
+        await doInvoke(command);
+        console.log(`${command} succeeded`);
+        setHookStatus(statusEl, opts.successText, "success");
+      } catch (e) {
+        console.error(`${command} failed`, e);
+        setHookStatus(statusEl, `${opts.errorPrefix}: ${String(e)}`, "error");
+      }
+      // Auto-clear the (transient) status after a few seconds.
+      setTimeout(() => setHookStatus(statusEl, ""), HOOK_STATUS_MS);
+    })();
+  });
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   planListEl = document.querySelector("#plan-list");
   planCountEl = document.querySelector("#plan-count");
@@ -844,6 +1172,16 @@ window.addEventListener("DOMContentLoaded", () => {
   feedbackBodyEl = document.querySelector("#feedback-body");
   feedbackCopyEl = document.querySelector("#feedback-copy");
   feedbackClearEl = document.querySelector("#feedback-clear");
+  // Persistent, non-occluding review action bar (reading-pane header).
+  reviewBarEl = document.querySelector("#review-bar");
+  reviewBarLabelEl = document.querySelector("#review-bar-label");
+  reviewSubmitEl = document.querySelector("#review-submit");
+  reviewClearEl = document.querySelector("#review-clear");
+  reviewDismissEl = document.querySelector("#review-dismiss");
+  reviewResumeEl = document.querySelector("#review-resume");
+  hookSetupEl = document.querySelector("#hook-setup");
+  hookRemoveEl = document.querySelector("#hook-remove");
+  hookStatusEl = document.querySelector("#hook-status");
 
   // Wire the sidebar filter (Plans tab only). Typing re-renders the filtered Plans list from
   // the in-memory records (no IPC per keystroke); the ✕ button clears the query and re-renders.
@@ -890,18 +1228,20 @@ window.addEventListener("DOMContentLoaded", () => {
   // reaches into #reading-pane for this feature. The facade fires onCommentCountChanged after a
   // save/clear mutation; main.ts refreshes the (backend-owned) count in response.
   if (readingPaneEl) {
+    // Comments are ALWAYS the open plan's normal persisted comments now (Option A): a reviewed plan
+    // is a real file, so its comments key off its real path and persist to comments.json like any
+    // other plan. There is no synthetic review store. The IO is the plain backend invoke path.
     const commentsIo: CommentsIO = {
       load: (p) => invoke<CommentRecord[]>("get_comments", { path: p }),
       save: (p, c) => invoke<CommentRecord[]>("set_comments", { path: p, comments: c }),
       clearAll: (p) => invoke<CommentRecord[]>("clear_comments", { path: p }),
     };
+    // The comment-path reader is simply the open plan's real path.
     initComments(readingPaneEl, () => openPath, commentsIo);
     // The facade hands us the MUTATED path + AUTHORITATIVE post-mutation count after an in-session
-    // save/clear. applyCommentCount applies it directly (no cold get_comment_count re-read, which
-    // would race the not-yet-landed backend write and surface a stale 0 → the button-never-appears
-    // bug) but ONLY when the mutated path is the currently-open plan — a stray foreign-plan callback
-    // (e.g. a late clear-all for the plan we just left) is ignored so it can't hide/strand the open
-    // plan's button (the cross-plan race).
+    // save/clear. Route to applyCommentCount (the Prompt-Feedback badge path, guarded to the open
+    // plan), which also re-derives the #review-bar — so if the open plan IS a review, Submit enables
+    // on the first comment.
     onCommentCountChanged((path, count) => {
       applyCommentCount(asAbsPath(path), count);
     });
@@ -919,8 +1259,9 @@ window.addEventListener("DOMContentLoaded", () => {
 
     const closeOverlay = (): void => feedbackOverlayEl?.classList.add("hidden");
 
-    // Snapshot the current plan's prompt into the body (get_comments → buildFeedbackPrompt). Shared
-    // by open (then un-hide) and the live-reload refresh-in-place (body only, leaves visibility).
+    // Snapshot the prompt into the body (records → buildFeedbackPrompt) from the open plan's
+    // persisted comments. A reviewed plan is a real file now, so its comments are read the same way
+    // as any plan. Shared by open (then un-hide) and the live-reload refresh-in-place (body only).
     const snapshotBody = async (): Promise<void> => {
       let records: CommentRecord[] = [];
       if (openPath !== null) {
@@ -948,6 +1289,15 @@ window.addEventListener("DOMContentLoaded", () => {
       }
     };
 
+    // The overlay's #feedback-copy is now ALWAYS a plain clipboard copy (review Submit/Dismiss moved
+    // to the #review-bar; Approve was removed). applyReviewButtonState() is the single pure source
+    // for its label/mode. Set once on load (it never changes).
+    if (feedbackCopyEl) {
+      const copyState = applyReviewButtonState();
+      feedbackCopyEl.textContent = copyState.copyLabel;
+      feedbackCopyEl.dataset.mode = copyState.copyMode;
+    }
+
     feedbackBtnEl.addEventListener("click", (e) => {
       e.stopPropagation();
       // Toggle: close if already open; otherwise snapshot + open.
@@ -967,7 +1317,8 @@ window.addEventListener("DOMContentLoaded", () => {
       closeOverlay();
     });
 
-    // Copy → clipboard (best-effort; jsdom/edge cases may lack navigator.clipboard).
+    // #feedback-copy → clipboard (best-effort; jsdom/edge cases may lack navigator.clipboard).
+    // Non-review behavior unchanged.
     feedbackCopyEl?.addEventListener("click", () => {
       try {
         void navigator.clipboard?.writeText(feedbackText);
@@ -976,8 +1327,88 @@ window.addEventListener("DOMContentLoaded", () => {
       }
     });
 
-    // Clear → wipe all comments via the facade (removes highlights + persists []), then hide the
-    // overlay. The facade's onCommentCountChanged fire refreshes the count → count 0 hides the button.
+    // ---- Review action bar wiring (the persistent, non-occluding, resumable affordance) ----
+    //   Submit  → deny + the assembled feedback prompt for the VIEWED review → Claude revises.
+    //   Dismiss → allow (fixed reason) → RELEASES the hook so Claude Code shows its normal terminal
+    //             plan-approval prompt (the only way to "approve"; no in-app auto-execute).
+    //   Resume  → re-open the NEWEST pending review (summary mode → viewing mode).
+    reviewSubmitEl?.addEventListener("click", () => {
+      const reviewId = currentReviewId();
+      if (reviewSubmitEl?.disabled || reviewId === null || openPath === null) return; // disabled at 0 comments
+      // Assemble the reason from the OPEN plan's persisted comments (the same gathering the overlay
+      // Copy uses), then deny. ORDER MATTERS: build the reason from the comments FIRST, send the deny,
+      // and ONLY on success CLEAR the comments (they've been consumed into the feedback). The plan
+      // stays open + selected; clearing wipes its persisted comments + in-pane highlights.
+      const planPath = openPath;
+      void (async () => {
+        let records: CommentRecord[] = [];
+        try {
+          records = await invoke<CommentRecord[]>("get_comments", { path: planPath });
+        } catch (e) {
+          console.error("get_comments failed", e);
+        }
+        const sent = await resolveReview(reviewId, "deny", buildFeedbackPrompt(records));
+        // Clear the submitted plan's comments only AFTER the deny landed (the feedback carried them).
+        // Reuse the exact #feedback-clear path: facade clearAllComments removes highlights for planPath,
+        // clears the backend (clear_comments), and fires onCommentCountChanged → the count/button/bar
+        // refresh to zero. planPath is still the open plan (we just submitted it), so its highlights
+        // visibly disappear.
+        if (sent && readingPaneEl) {
+          await clearAllComments(readingPaneEl, planPath);
+        }
+      })();
+    });
+    reviewDismissEl?.addEventListener("click", () => {
+      const reviewId = currentReviewId();
+      if (reviewId === null) return;
+      void resolveReview(
+        reviewId,
+        "allow",
+        "Dismissed in Plan Reader — approve in the terminal.",
+      );
+    });
+    reviewResumeEl?.addEventListener("click", () => resumeNewestReview());
+
+    // ---- #review-clear: discoverable MANUAL clear during review (two-click confirm) ----
+    // The overlay's #feedback-clear is not obvious mid-review, so the bar offers a "Clear comments"
+    // button (visible in viewing mode with >=1 comment). It uses the SAME dependency-free two-click
+    // "click again to confirm" pattern as the hook-setup buttons (window.confirm is inert in this
+    // WebView), then runs the EXACT #feedback-clear path: clearAllComments(pane, openPath) removes the
+    // plan's highlights, clears the backend, and fires onCommentCountChanged → the bar refreshes (the
+    // button hides at 0). Single click only ARMS (no clear); the second click clears.
+    if (reviewClearEl) {
+      const clearLabel = reviewClearEl.textContent ?? "Clear comments";
+      let armed = false;
+      let revertTimer: ReturnType<typeof setTimeout> | null = null;
+      const disarm = (): void => {
+        armed = false;
+        reviewClearEl?.classList.remove("confirming");
+        if (reviewClearEl) reviewClearEl.textContent = clearLabel;
+        if (revertTimer !== null) {
+          clearTimeout(revertTimer);
+          revertTimer = null;
+        }
+      };
+      // Expose disarm so refreshReviewBar can cancel a pending confirm when the button hides.
+      reviewClearDisarm = disarm;
+      reviewClearEl.addEventListener("click", () => {
+        if (!armed) {
+          armed = true;
+          reviewClearEl?.classList.add("confirming");
+          if (reviewClearEl) reviewClearEl.textContent = "Click again to confirm";
+          revertTimer = setTimeout(disarm, HOOK_CONFIRM_MS);
+          return;
+        }
+        disarm();
+        if (readingPaneEl && openPath !== null) {
+          void clearAllComments(readingPaneEl, openPath);
+        }
+      });
+    }
+
+    // Clear → wipe all of the open plan's comments via the facade (removes highlights + persists []).
+    // The facade's onCommentCountChanged fire refreshes the bar (re-derives Submit-disabled at 0). The
+    // overlay closes after clearing.
     feedbackClearEl?.addEventListener("click", () => {
       if (readingPaneEl && openPath !== null) {
         void clearAllComments(readingPaneEl, openPath);
@@ -985,6 +1416,23 @@ window.addEventListener("DOMContentLoaded", () => {
       closeOverlay();
     });
   }
+
+  // ---- Phase 6 — Plan Review hook install/remove buttons (titlebar domain) ----
+  // DEPENDENCY-FREE in-DOM UX (see wireHookButton): a two-click "click again to confirm" arm
+  // gates the mutation of ~/.claude/settings.json, and #hook-status surfaces success/error in
+  // the DOM. This REPLACES window.confirm/window.alert, which are inert in Tauri v2's WKWebView
+  // (confirm returns false → invoke never fired; alert is a no-op → any error was invisible).
+  // install_hook is the idempotent additive merge; uninstall_hook removes our entry.
+  wireHookButton(hookSetupEl, hookStatusEl, "install_hook", {
+    confirmLabel: "Click again to confirm",
+    successText: "Plan Reader hook installed.",
+    errorPrefix: "Could not install hook",
+  });
+  wireHookButton(hookRemoveEl, hookStatusEl, "uninstall_hook", {
+    confirmLabel: "Click again to confirm",
+    successText: "Plan Reader hook removed.",
+    errorPrefix: "Could not remove hook",
+  });
 
   if (docHeaderEl) docHeaderEl.classList.add("hidden"); // hide until a plan is opened
   if (readingPaneEl) {
@@ -1015,5 +1463,101 @@ window.addEventListener("DOMContentLoaded", () => {
     // chainHandler appends this event's body to the serialized chain with a .catch backstop,
     // so a single failed handler can't wedge the chain rejected and drop ALL future events.
     pending = chainHandler(pending, () => handlePlanChanged(changedPath));
+  });
+
+  // ---- Phase 6 — Plan Review event listeners (mirror plan-changed's serialized chain) ----
+  // Review events are serialized on their OWN chain (separate from plan-changed) so a request and
+  // a cancel can't interleave their async open/refresh. chainHandler's .catch backstop keeps
+  // a single failed handler from wedging the chain.
+  let reviewPending: Promise<void> = Promise.resolve();
+
+  // A new review request arrived (a new blocking hook). ALWAYS track it in pendingReviews (so it is
+  // resumable and counted), then decide whether to YANK the pane to it:
+  //   • If NO review is currently being viewed (currentReviewId() === null — the user is browsing a
+  //     non-reviewed plan or nothing), focus the window and OPEN THE REAL plan file via the normal
+  //     flow (selecting its sidebar row). Falls back to a detached planText render if that fails.
+  //   • If a review is ALREADY being viewed, do NOT yank — just refresh the bar (the count rises;
+  //     the user can finish the current one then Resume the rest).
+  async function handleReviewRequested(payload: ReviewRequested): Promise<void> {
+    // The event payload may not carry createdMs — stamp arrival time as a stable fallback so newest
+    // resolution still works.
+    const createdMs = (payload as { created_ms?: number }).created_ms ?? Date.now();
+    const review: PendingReview = {
+      reviewId: payload.review_id,
+      planFilePath: payload.plan_file_path,
+      planText: payload.plan_text,
+      createdMs,
+    };
+    pendingReviews.set(payload.review_id, review);
+
+    if (currentReviewId() === null) {
+      try {
+        await invoke("focus_main_window");
+      } catch (e) {
+        console.error("focus_main_window failed", e);
+      }
+      // Open the REAL plan file through the normal flow (selects the sidebar row). openReviewPlanFile
+      // refreshes the list first and falls back to a detached render if the open fails.
+      await openReviewPlanFile(review);
+      return;
+    }
+    // A review is already being viewed — do not yank. The bar's count goes up via summary/viewing.
+    refreshReviewBar();
+  }
+
+  // A pending request was cancelled (hook gave up / timed out / removed its request). Drop it from
+  // pendingReviews. The open plan stays open — only the bar changes (drops to summary/hidden if this
+  // was the reviewed plan).
+  function handleReviewCancelled(payload: ReviewCancelled): void {
+    pendingReviews.delete(payload.review_id);
+    refreshReviewBar();
+  }
+
+  void listen<ReviewRequested>("plan-review-requested", (event) => {
+    const payload = event.payload;
+    reviewPending = chainHandler(reviewPending, () => handleReviewRequested(payload));
+  });
+  void listen<ReviewCancelled>("plan-review-cancelled", (event) => {
+    const payload = event.payload;
+    reviewPending = chainHandler(reviewPending, async () => handleReviewCancelled(payload));
+  });
+
+  // ---- Phase 6 — launch recovery ----
+  // On startup, if reviews are already pending (the app launched while a hook is blocking), populate
+  // pendingReviews with all non-stale entries and open the NEWEST one's real plan file via the normal
+  // flow (no focus — the user just launched). console.warn if more than one is pending. Chained so it
+  // serializes ahead of any live request that arrives during startup.
+  reviewPending = chainHandler(reviewPending, async () => {
+    let reviews: ReviewRequest[] = [];
+    try {
+      reviews = await invoke<ReviewRequest[]>("list_pending_reviews");
+    } catch (e) {
+      console.error("list_pending_reviews failed", e);
+      return;
+    }
+    // Drop STALE entries (hook already timed out — its Submit/Dismiss would be a silent no-op).
+    const now = Date.now();
+    const fresh = reviews.filter((r) => now - r.created_ms < STALE_REVIEW_MS);
+    if (fresh.length === 0) return;
+    if (fresh.length > 1) {
+      console.warn(`launch recovery: ${fresh.length} pending reviews; auto-showing the newest`);
+    }
+    // Track every non-stale pending review so all are resumable + counted.
+    for (const r of fresh) {
+      pendingReviews.set(r.review_id, {
+        reviewId: r.review_id,
+        planFilePath: r.plan_file_path,
+        planText: r.plan_text,
+        createdMs: r.created_ms,
+      });
+    }
+    if (currentReviewId() !== null) {
+      // A live request already opened a reviewed plan during startup — leave it; just refresh.
+      refreshReviewBar();
+      return;
+    }
+    // Open the newest pending review's real plan file (newestPendingReview honors the >= tie-break).
+    const newest = newestPendingReview();
+    if (newest !== null) await openReviewPlanFile(newest);
   });
 });

@@ -26,7 +26,7 @@ macOS desktop app (Tauri v2) that browses and live-renders Claude Code plan mark
 - **cwd resolution**: a plan's originating directory is found by scanning `~/.claude/projects/<encoded-cwd>/*.jsonl` AND `<session>/subagents/agent-*.jsonl` (~40% of plans are written by subagents) for the plan-write event, then reading that record's in-file `cwd`. Never reverse-decode the encoded directory name (it is lossy). `sessions-index.json` is a sparse, optional fast-path. Unresolved → render "unknown".
 - **Read/unread**: a plan is unread when its mtime is newer than its last-viewed time; the currently-open plan continuously updates its last-viewed time so live edits to the plan you are actively watching do not mark it unread.
 - **Testing**: tests must be falsifiable — invert the behavior under test and confirm the test goes red before trusting it.
-- The app reads two **read-only** trees under `~/.claude/`: `plans/` (rendered + watched) and `projects/` (used only for cwd resolution).
+- The app reads two **read-only** trees under `~/.claude/`: `plans/` (rendered + watched) and `projects/` (used only for cwd resolution). It also writes to a self-owned control directory `~/.claude/plan-reader/**` (review IPC: requests/responses + an `app.alive` heartbeat, all atomic + containment-guarded) and performs a single idempotent additive merge into `~/.claude/settings.json` to install/remove the ExitPlanMode review hook. It still NEVER writes into `plans/`.
 
 ## Notes
 - The app is unsigned; first launch needs right-click → Open (Gatekeeper). Signing/notarization is not configured.

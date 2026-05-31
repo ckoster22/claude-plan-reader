@@ -118,6 +118,41 @@ describe("buildFeedbackPrompt — format + numbering", () => {
   });
 });
 
+describe("buildFeedbackPrompt IS the review deny-reason (contract lock)", () => {
+  // CONTRACT: main.ts's Submit handler sends `buildFeedbackPrompt(reviewComments)` VERBATIM as the
+  // `reason` of the deny response written to the hook. That reason is fed to Claude Code as the
+  // plan-rejection feedback. The handler itself is DOM + Tauri bound and not unit-testable here, so
+  // we lock down the exact output shape for representative multi-comment input: a regression in
+  // buildFeedbackPrompt (renumbering, dropping the lead line, mangling quotes/line-suffixes, or
+  // changing the indent) would silently CORRUPT the reason Claude receives. This test is the
+  // tripwire for that.
+  //
+  // FALSIFIABLE: the assertion below is the FULL exact string (toBe, not toContain). Any single
+  // character drift in buildFeedbackPrompt's format — a missing blank-line separator, a changed
+  // indent width, a renumber, a dropped line-suffix — flips this test red. Inverting any branch of
+  // buildFeedbackPrompt (e.g. skipping empty-comment records, or off-by-one in the line range)
+  // produces a different exact string and fails here.
+  it("deny reason == buildFeedbackPrompt(records) — exact string for representative comments", () => {
+    const records: R[] = [
+      { quote: "scan the projects tree", comment: "cache this per session", block_line: 41, block_end_line: 45 },
+      { quote: "auto-reloads in place", comment: "preserve my scroll position", block_line: 2, block_end_line: 3 },
+      { quote: "render mermaid", comment: "", block_line: null, block_end_line: null }, // empty comment, whole-pane
+    ];
+
+    // This is the literal string the hook will receive as `reason`. main.ts passes
+    // buildFeedbackPrompt(reviewComments) here unchanged — so locking this output locks the reason.
+    const denyReason = buildFeedbackPrompt(records);
+
+    const expected =
+      'Please revise the plan based on this feedback:\n\n' +
+      '1. Re: "scan the projects tree" (lines 42-45)\n   cache this per session\n\n' +
+      '2. Re: "auto-reloads in place" (line 3)\n   preserve my scroll position\n\n' +
+      '3. Re: "render mermaid"';
+
+    expect(denyReason).toBe(expected);
+  });
+});
+
 describe("applyFeedbackButtonState — visibility + badge gating", () => {
   let btn: HTMLElement;
   let badge: HTMLElement;

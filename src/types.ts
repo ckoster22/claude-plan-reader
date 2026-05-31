@@ -78,6 +78,41 @@ export function setCwd(map: Map<Stem, string | null>, stem: Stem, value: string 
   map.set(stem, value);
 }
 
+// ---- Plan Review (ExitPlanMode hook) wire shapes (mirror the Rust structs / event payloads) ----
+//
+// snake_case keys MIRROR THE BACKEND'S SERIALIZED JSON exactly (same convention as `PlanRecord` /
+// `CommentRecord` above): these come straight off `invoke`/event payloads, so the TS keys must
+// equal the Rust serde keys 1:1 — no camelCase conversion. See CONTRACT.md §"Plan Review
+// (ExitPlanMode hook)" for the authoritative shapes.
+
+// One parsed `requests/<review_id>.json` entry (returned by `list_pending_reviews`).
+export interface ReviewRequest {
+  schema: number;
+  review_id: string;
+  session_id: string;
+  cwd: string;
+  transcript_path: string;
+  plan_text: string;
+  // Absolute path of the reviewed plan file under `~/.claude/plans/` (Claude writes the plan
+  // file before ExitPlanMode; the hook payload carries its path). The review opens THIS real
+  // file through the normal plan-open flow so it is selected in the sidebar.
+  plan_file_path: string;
+  created_ms: number;
+}
+
+// Payload of the `plan-review-requested` event (a new pending request appeared).
+export interface ReviewRequested {
+  review_id: string;
+  plan_text: string;
+  // Absolute path of the reviewed plan file under `~/.claude/plans/` (see ReviewRequest).
+  plan_file_path: string;
+}
+
+// Payload of the `plan-review-cancelled` event (a pending request was removed before response).
+export interface ReviewCancelled {
+  review_id: string;
+}
+
 // Pure rendering context. `renderSidebar` takes its container + this ctx so it is unit-testable
 // without the module-global `planListEl`/`openPath`. `refreshList` builds the ctx FRESH each
 // call so `openPath` is read live (never a stale closure) — this keeps `.active` correct across

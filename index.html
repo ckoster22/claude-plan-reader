@@ -41,6 +41,28 @@
             <span class="label">Prompt Feedback</span>
             <span class="badge" id="feedback-count">0</span>
           </button>
+          <!-- Plan Review hook setup (ExitPlanMode hook). Real interactive <button>s in
+               the .titlebar-controls slot, so window-drag exclusion is the isDragTarget()
+               interactive-target bail in src/titlebar.ts — NOT data-tauri-drag-region.
+               #hook-setup installs the PreToolUse/ExitPlanMode hook (install_hook);
+               #hook-remove uninstalls it (uninstall_hook). Phase 6 wires the clicks and
+               toggles which is shown based on install state. -->
+          <button class="theme-toggle hook-btn" id="hook-setup" type="button"
+                  title="Install plan-review hook" aria-label="Install plan-review hook">
+            <span class="label">Install plan-review hook</span>
+          </button>
+          <button class="theme-toggle hook-btn" id="hook-remove" type="button"
+                  title="Remove plan-review hook" aria-label="Remove plan-review hook">
+            <span class="label">Remove</span>
+          </button>
+          <!-- In-DOM status line for the hook install/remove actions. Replaces window.alert
+               (a no-op in Tauri v2 WKWebView): a transient success/error message lives here.
+               main.ts toggles `.hidden` and the `.error` modifier (red) and sets textContent;
+               it auto-clears after a few seconds. Not a drag region (it is titlebar chrome but
+               carries no data-tauri-drag-region, and isDragTarget()'s interactive-control bail
+               does not apply to a <span> — so window-drag exclusion is irrelevant: a status
+               readout is not clickable). aria-live=polite announces the result to AT. -->
+          <span class="hook-status hidden" id="hook-status" role="status" aria-live="polite"></span>
           <!-- Reading-pane text-size steppers. Placed immediately BEFORE
                #theme-toggle so the theme toggle stays far-right. Like the theme
                toggle they are ordinary interactive <button>s: window-drag
@@ -112,6 +134,33 @@
             <div class="doc-header">
               <div class="doc-filename" id="doc-filename"></div>
               <div class="doc-src" id="doc-src"></div>
+            </div>
+
+            <!-- Review action bar (Plan Review). PERSISTENT, NON-OCCLUDING affordance shown whenever
+                 one or more plan reviews are pending (main.ts toggles `.hidden` via refreshReviewBar()
+                 from the pure applyReviewBarState). Docked at the top of the reading column (inside
+                 .reader-inner, in normal flow — it does NOT float over the pane like #feedback-overlay),
+                 so the user can select text + add inline comments AND act on the review at once.
+                 Two modes (see applyReviewBarState):
+                   • VIEWING  — a review is rendered in the pane: #review-submit (enabled with >=1
+                     comment → deny + feedback) and #review-dismiss (→ "allow", releases the hook so
+                     Claude Code shows its normal terminal plan-approval prompt) are shown.
+                   • SUMMARY  — reviews are pending but the user is browsing a real plan: only the
+                     count label + #review-resume (re-open the newest pending review) are shown, so a
+                     pending review never traps navigation.
+                 Approve-as-auto-execute is GONE (a PreToolUse hook cannot auto-approve a plan). -->
+            <div class="review-bar hidden" id="review-bar" role="region" aria-label="Plan review actions">
+              <span class="review-bar-label" id="review-bar-label"></span>
+              <div class="review-bar-actions">
+                <button class="rb-btn" id="review-submit" type="button" disabled
+                        title="Submit your inline comments as feedback">Submit feedback</button>
+                <button class="rb-btn" id="review-clear" type="button"
+                        title="Clear all of this plan's comments (click again to confirm)">Clear comments</button>
+                <button class="rb-btn rb-approve" id="review-dismiss" type="button"
+                        title="Release the hook so Claude Code shows its normal terminal plan-approval prompt">Dismiss → approve in terminal</button>
+                <button class="rb-btn" id="review-resume" type="button"
+                        title="Re-open the newest pending plan review">Resume ▸</button>
+              </div>
             </div>
 
             <!-- #reading-pane: 02 renders into — the markdown render target.

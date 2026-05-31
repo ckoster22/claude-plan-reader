@@ -1,8 +1,18 @@
 // Sub-Plan 01 — Tauri shell, plan list & live file-watch.
 //
-// INVARIANT: this app only ever READS `~/.claude/plans/`. It never writes into that
-// directory, so the watcher never fires on our own writes. CONTRACT.md, the cwd_spike
-// example, and all build artifacts live in the repo, not the plans dir.
+// INVARIANT: this app never writes into `~/.claude/plans/`, so the plans watcher never fires
+// on our own writes. CONTRACT.md, the cwd_spike example, and all build artifacts live in the
+// repo, not the plans dir.
+//
+// Phase 4 adds exactly TWO write surfaces under `~/.claude/` (both OUTSIDE `plans/`):
+//   (a) `~/.claude/plan-reader/**` — self-owned headless-review state (requests/, responses/,
+//       app.alive heartbeat, hook.sh). Writes are atomic (temp-write + rename) and
+//       containment-guarded (`guarded_path_in` canonicalizes the parent, rejecting any id that
+//       would escape requests/ or responses/).
+//   (b) `~/.claude/settings.json` — a SINGLE idempotent, additive merge (`merge_install_hook`
+//       / `merge_uninstall_hook`) that touches only our `ExitPlanMode` PreToolUse entry and
+//       preserves every other key/element untouched.
+// The app still NEVER writes into `plans/`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -126,9 +136,314 @@ struct CommentRecord {
     id: i64,
 }
 
+// ============================================================================
+// Phase 3 — review-request / review-response wire types + plan-reader paths.
+//
+// These are the PURE cores for the headless plan-review handshake. A hook drops
+// a `ReviewRequest` JSON file under `~/.claude/plan-reader/requests/`; the app
+// emits a `ReviewRequested` event, the user accepts/rejects, and the app writes a
+// `ReviewResponse` JSON file under `~/.claude/plan-reader/responses/`. No Tauri
+// commands or watcher wiring live here yet (that is Phase 4) — only the data
+// shapes, path helpers, id validation, and the safety-critical settings-merge.
+//
+// Serde casing: the crate's convention is snake_case field names with NO
+// `rename_all` (see `PlanRecord` / `CommentRecord`). The wire keys required here
+// (schema, review_id, session_id, transcript_path, plan_text, created_ms, …) are
+// already snake_case, so the field names serialize verbatim — no rename needed.
+// ============================================================================
+
+/// Schema version stamped into every `ReviewRequest` / `ReviewResponse` on the wire.
+const REVIEW_SCHEMA: u32 = 1;
+
+/// A plan-review request, written by the ExitPlanMode hook into `requests/<review_id>.json`
+/// and read by the app. FROZEN wire shape — exactly 8 snake_case keys (see the frozen-key
+/// test `review_request_wire_contract_is_frozen`). Field names match the wire verbatim
+/// (snake_case, no `serde(rename)` — mirrors `PlanRecord`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct ReviewRequest {
+    /// Wire schema version (`REVIEW_SCHEMA` == 1).
+    schema: u32,
+    /// Filesystem-safe id minted by the hook; also the request/response file stem.
+    review_id: String,
+    /// Originating Claude Code session id.
+    session_id: String,
+    /// Working directory the plan was authored in.
+    cwd: String,
+    /// Absolute path to the session transcript (`.jsonl`).
+    transcript_path: String,
+    /// The full plan markdown awaiting review.
+    plan_text: String,
+    /// Absolute path to the plan markdown file Claude just wrote (e.g.
+    /// `~/.claude/plans/foo.md`), sourced from the hook's `tool_input.planFilePath`.
+    /// `#[serde(default)]` so request files written by the OLD hook (which lacked this key)
+    /// deserialize to `""` instead of erroring — critical for launch recovery.
+    #[serde(default)]
+    pub plan_file_path: String,
+    /// Creation wall-clock time, millis since the UNIX epoch.
+    created_ms: u64,
+}
+
+/// A plan-review decision, written by the app into `responses/<review_id>.json` and read
+/// by the waiting hook. FROZEN wire shape — exactly 4 snake_case keys (see
+/// `review_response_wire_contract_is_frozen`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct ReviewResponse {
+    /// Wire schema version (`REVIEW_SCHEMA` == 1).
+    schema: u32,
+    /// Echoes the request's `review_id` so the hook can correlate.
+    review_id: String,
+    /// The user's verdict: exactly `"allow"` / `"deny"` (validated by `is_valid_decision`).
+    decision: String,
+    /// Free-text rationale shown back to the model/hook.
+    reason: String,
+}
+
+/// Event payload emitted to the frontend when a new review request arrives
+/// (`plan-review-requested`). Carries only what the UI needs to render the prompt.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct ReviewRequested {
+    review_id: String,
+    plan_text: String,
+    plan_file_path: String,
+}
+
+/// Event payload emitted to the frontend when a pending review is cancelled
+/// (`plan-review-cancelled`) — e.g. the request file was removed before a decision.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct ReviewCancelled {
+    review_id: String,
+}
+
 /// Absolute path to `~/.claude/plans`. Returns None only if the home dir cannot be located.
 fn plans_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("plans"))
+}
+
+/// Absolute path to `~/.claude/plan-reader` (the headless-review state root). Twin of
+/// `plans_dir()` — same home-dir resolution, same `Option<PathBuf>` return.
+fn plan_reader_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("plan-reader"))
+}
+
+/// Absolute path to `~/.claude/plan-reader/requests` (hook-written review requests).
+fn requests_dir() -> Option<PathBuf> {
+    plan_reader_dir().map(|d| d.join("requests"))
+}
+
+/// Absolute path to `~/.claude/plan-reader/responses` (app-written review decisions).
+fn responses_dir() -> Option<PathBuf> {
+    plan_reader_dir().map(|d| d.join("responses"))
+}
+
+/// Absolute path to `~/.claude/plan-reader/app.alive` (heartbeat the hook checks before
+/// blocking on a response — if the app isn't running it must not hang the model).
+fn app_alive_path() -> Option<PathBuf> {
+    plan_reader_dir().map(|d| d.join("app.alive"))
+}
+
+/// True iff `id` is a safe review-id usable as a single path segment / file stem.
+/// Rules: non-empty; every char is ASCII `[A-Za-z0-9._-]`; not `.` or `..`; contains no
+/// `/` or `\\`; does not start with `.` (so a request can never become a dotfile or escape
+/// its directory). Hand-rolled — no regex dependency exists in Cargo.toml and the rule is a
+/// fixed character class, so a full regex engine is unwarranted.
+fn valid_review_id(id: &str) -> bool {
+    if id.is_empty() || id == "." || id == ".." {
+        return false;
+    }
+    if id.starts_with('.') {
+        return false;
+    }
+    id.chars().all(|c| {
+        // `/` and `\` are excluded by the allow-list below, but spelled out for intent.
+        c != '/'
+            && c != '\\'
+            && (c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    })
+}
+
+/// Build the containment-guarded path `responses/<review_id>.json`. Returns `Err` if the id
+/// is syntactically unsafe (`valid_review_id`). Because the response file does NOT exist yet,
+/// we cannot `canonicalize` the target itself — instead we canonicalize the PARENT (the
+/// responses dir, which exists) and assert the joined path's canonicalized parent IS that
+/// dir. That rejects any id that — despite passing the syntactic check — would resolve outside
+/// `responses/` (defense in depth; `valid_review_id` already forbids separators and dots).
+fn response_path_for(review_id: &str) -> Result<PathBuf, String> {
+    guarded_path_in(responses_dir(), review_id)
+}
+
+/// Twin of `response_path_for` for `requests/<review_id>.json`.
+fn request_path_for(review_id: &str) -> Result<PathBuf, String> {
+    guarded_path_in(requests_dir(), review_id)
+}
+
+/// Shared core of `response_path_for` / `request_path_for`: validate the id, join
+/// `<dir>/<id>.json`, and assert the joined path's canonicalized parent equals the
+/// canonicalized `dir`. Canonicalizes the PARENT (which exists), never the not-yet-created
+/// target. Creates no file.
+fn guarded_path_in(dir: Option<PathBuf>, review_id: &str) -> Result<PathBuf, String> {
+    if !valid_review_id(review_id) {
+        return Err("invalid review id".to_string());
+    }
+    let dir = dir.ok_or_else(|| "could not locate home directory".to_string())?;
+    let joined = dir.join(format!("{review_id}.json"));
+    let parent = joined
+        .parent()
+        .ok_or_else(|| "joined path has no parent".to_string())?;
+    let canon_parent =
+        std::fs::canonicalize(parent).map_err(|e| format!("dir unavailable: {e}"))?;
+    let canon_dir =
+        std::fs::canonicalize(&dir).map_err(|e| format!("dir unavailable: {e}"))?;
+    if canon_parent != canon_dir {
+        return Err("path escapes the target directory".to_string());
+    }
+    Ok(joined)
+}
+
+/// The idempotency marker: any PreToolUse hook entry whose `command` string ENDS WITH this
+/// suffix is treated as "our" plan-reader hook (install updates it in place; uninstall
+/// removes it). Matching on the suffix — not an exact string — survives absolute-vs-`~`
+/// path spellings of the same install.
+const PLAN_READER_HOOK_SUFFIX: &str = "plan-reader/hook.sh";
+
+/// The matcher key under which Claude Code fires hooks for the plan-approval gate.
+const EXIT_PLAN_MODE_MATCHER: &str = "ExitPlanMode";
+
+/// PURE settings merge: ensure the user's settings install our `ExitPlanMode` PreToolUse hook
+/// pointing at `hook_command`. Takes and returns `serde_json::Value` so it is unit-testable
+/// without touching disk. Behavior:
+///   - coerce `settings` to an object (a non-object input becomes a fresh `{}`),
+///   - ensure `hooks` is an object and `hooks.PreToolUse` is an array,
+///   - find the array element whose `matcher == "ExitPlanMode"` (create + push one if absent),
+///   - ensure that element's `hooks` array contains our command entry
+///     `{ "type":"command", "command": hook_command, "timeout": 600 }`.
+///     Idempotency key: an existing entry whose `command` ENDS WITH `plan-reader/hook.sh` is
+///     "ours" — we update its `command` to `hook_command` and force `timeout` to 600 rather
+///     than appending a duplicate.
+/// EVERY other key and array element is preserved untouched (this is a SECURITY-critical
+/// invariant — an unrelated Bash permission hook must never be clobbered).
+fn merge_install_hook(settings: Value, hook_command: &str) -> Value {
+    let mut root = match settings {
+        Value::Object(map) => Value::Object(map),
+        _ => Value::Object(serde_json::Map::new()),
+    };
+    let obj = root.as_object_mut().expect("root coerced to object");
+
+    // hooks must be an object.
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(serde_json::Map::new());
+    }
+    let hooks = hooks.as_object_mut().expect("hooks coerced to object");
+
+    // hooks.PreToolUse must be an array.
+    let pretooluse = hooks
+        .entry("PreToolUse")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !pretooluse.is_array() {
+        *pretooluse = Value::Array(Vec::new());
+    }
+    let pretooluse = pretooluse.as_array_mut().expect("PreToolUse coerced to array");
+
+    // Find (or create) the ExitPlanMode matcher element.
+    let exit_idx = pretooluse.iter().position(|el| {
+        el.get("matcher").and_then(|m| m.as_str()) == Some(EXIT_PLAN_MODE_MATCHER)
+    });
+    let exit_idx = match exit_idx {
+        Some(i) => i,
+        None => {
+            let mut elem = serde_json::Map::new();
+            elem.insert(
+                "matcher".to_string(),
+                Value::String(EXIT_PLAN_MODE_MATCHER.to_string()),
+            );
+            elem.insert("hooks".to_string(), Value::Array(Vec::new()));
+            pretooluse.push(Value::Object(elem));
+            pretooluse.len() - 1
+        }
+    };
+
+    // Ensure that element's `hooks` is an array.
+    let elem = pretooluse[exit_idx]
+        .as_object_mut()
+        .expect("ExitPlanMode element is an object");
+    let elem_hooks = elem
+        .entry("hooks")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !elem_hooks.is_array() {
+        *elem_hooks = Value::Array(Vec::new());
+    }
+    let elem_hooks = elem_hooks.as_array_mut().expect("element hooks is array");
+
+    // Look for an existing "ours" entry (command ends with the suffix).
+    let ours = elem_hooks.iter_mut().find(|h| {
+        h.get("command")
+            .and_then(|c| c.as_str())
+            .map(|c| c.ends_with(PLAN_READER_HOOK_SUFFIX))
+            .unwrap_or(false)
+    });
+    match ours {
+        Some(entry) => {
+            // Update in place — no duplicate.
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("command".to_string(), Value::String(hook_command.to_string()));
+                map.insert("timeout".to_string(), Value::from(600));
+            }
+        }
+        None => {
+            let mut new_entry = serde_json::Map::new();
+            new_entry.insert("type".to_string(), Value::String("command".to_string()));
+            new_entry.insert("command".to_string(), Value::String(hook_command.to_string()));
+            new_entry.insert("timeout".to_string(), Value::from(600));
+            elem_hooks.push(Value::Object(new_entry));
+        }
+    }
+
+    root
+}
+
+/// PURE inverse of `merge_install_hook`: remove our plan-reader hook (command ends with
+/// `plan-reader/hook.sh`) from the `ExitPlanMode` PreToolUse element's `hooks` array. If that
+/// element's `hooks` array becomes empty, the element is removed from `PreToolUse`. We do NOT
+/// delete the `hooks` / `PreToolUse` keys even if `PreToolUse` becomes empty (minimal change).
+/// Everything else is preserved. Idempotent — removing twice is a no-op.
+fn merge_uninstall_hook(settings: Value) -> Value {
+    let mut root = match settings {
+        Value::Object(map) => Value::Object(map),
+        other => return other, // nothing to uninstall from a non-object
+    };
+    let obj = root.as_object_mut().expect("root is object");
+
+    let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return root; // no hooks object — nothing to do
+    };
+    let Some(pretooluse) = hooks.get_mut("PreToolUse").and_then(|p| p.as_array_mut()) else {
+        return root; // no PreToolUse array — nothing to do
+    };
+
+    if let Some(exit_idx) = pretooluse.iter().position(|el| {
+        el.get("matcher").and_then(|m| m.as_str()) == Some(EXIT_PLAN_MODE_MATCHER)
+    }) {
+        if let Some(elem_hooks) = pretooluse[exit_idx]
+            .get_mut("hooks")
+            .and_then(|h| h.as_array_mut())
+        {
+            // Drop any entry whose command ends with our suffix.
+            elem_hooks.retain(|h| {
+                !h.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|c| c.ends_with(PLAN_READER_HOOK_SUFFIX))
+                    .unwrap_or(false)
+            });
+            // If the ExitPlanMode element's hooks went empty, remove the element entirely.
+            if elem_hooks.is_empty() {
+                pretooluse.remove(exit_idx);
+            }
+        }
+    }
+
+    root
 }
 
 /// True iff `candidate` lives inside `root`. Both are expected to already be canonicalized
@@ -1486,6 +1801,473 @@ async fn resolve_cwds(
     Ok(resolved)
 }
 
+// ============================================================================
+// Phase 4 — headless plan-review commands + control-dir watcher + heartbeat.
+//
+// The hook (hook.sh) drops `requests/<id>.json`, the control-dir watcher emits
+// `plan-review-requested`, the frontend renders the prompt, the user decides,
+// and `respond_to_review` writes `responses/<id>.json` which the hook is polling.
+// `app.alive` is a heartbeat the hook stat's to decide whether to block at all.
+// ============================================================================
+
+/// True iff a control-dir filename should be IGNORED by the watcher / listers: the in-flight
+/// atomic-write temp (`.tmp-…`) and any other dotfile. Centralized so the watcher and
+/// `list_pending_reviews` apply the identical skip rule.
+fn is_ignored_control_filename(name: &str) -> bool {
+    name.starts_with('.') || name.starts_with(".tmp-")
+}
+
+/// List the pending review requests (newest-first by `created_ms`). Reads `requests_dir()`,
+/// parses each `*.json` (skipping dot/temp files and unparseable files), and returns the
+/// `ReviewRequest`s. A missing dir is not an error — it yields an empty list.
+#[tauri::command]
+fn list_pending_reviews() -> Result<Vec<ReviewRequest>, String> {
+    let Some(dir) = requests_dir() else {
+        return Ok(Vec::new());
+    };
+    let read_dir = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(Vec::new()), // dir not yet created ⇒ empty
+    };
+
+    let mut out: Vec<ReviewRequest> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let is_json = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+        if !is_json {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if is_ignored_control_filename(name) {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue, // unreadable ⇒ skip
+        };
+        match serde_json::from_slice::<ReviewRequest>(&bytes) {
+            Ok(req) => out.push(req),
+            Err(_) => continue, // unparseable (e.g. partial write) ⇒ skip
+        }
+    }
+
+    // Newest-first by created_ms.
+    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    Ok(out)
+}
+
+/// Read the plan text for a single pending review. Containment is enforced by the guarded
+/// `request_path_for` (rejects an id that escapes `requests/`); the file must exist and parse.
+#[tauri::command]
+fn read_review_plan(review_id: String) -> Result<String, String> {
+    let path = request_path_for(&review_id)?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read failed: {e}"))?;
+    let req: ReviewRequest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse failed: {e}"))?;
+    Ok(req.plan_text)
+}
+
+/// The decision vocabulary, per the wire protocol (hook + frontend + CONTRACT.md): a decision is
+/// valid iff it is EXACTLY `"allow"` or `"deny"` (case-sensitive). Pure, so it is unit-testable
+/// without the Tauri command surface.
+fn is_valid_decision(d: &str) -> bool {
+    d == "allow" || d == "deny"
+}
+
+/// Write the user's decision for a review. Rejects any decision other than `allow`/`deny`,
+/// builds a `ReviewResponse`, and atomically writes it to the guarded
+/// `responses/<review_id>.json` path (where the polling hook will find it).
+#[tauri::command]
+fn respond_to_review(review_id: String, decision: String, reason: String) -> Result<(), String> {
+    if !is_valid_decision(&decision) {
+        return Err(format!("invalid decision: {decision}"));
+    }
+    // Ensure the responses dir exists so the guarded path builder (which canonicalizes the
+    // parent) and the atomic write both succeed.
+    if let Some(dir) = responses_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    let path = response_path_for(&review_id)?;
+    let resp = ReviewResponse {
+        schema: REVIEW_SCHEMA,
+        review_id,
+        decision,
+        reason,
+    };
+    let bytes = serde_json::to_vec_pretty(&resp).map_err(|e| format!("serialize failed: {e}"))?;
+    atomic_write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    Ok(())
+}
+
+/// Best-effort: bring the main window to the foreground (show + unminimize + focus). Each
+/// step's error is ignored — surfacing a review must never fail because, e.g., the window was
+/// already visible. Returns Ok unless the window can't be found at all.
+#[tauri::command]
+fn focus_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(win) = app.get_webview_window("main") else {
+        return Err("main window not found".to_string());
+    };
+    let _ = win.show();
+    let _ = win.unminimize();
+    let _ = win.set_focus();
+    Ok(())
+}
+
+/// The hook script content, written verbatim to `~/.claude/plan-reader/hook.sh` by
+/// `install_hook`. The `$(...)`/`set` usage is INTENTIONAL shell (this is file content, not a
+/// command we run) and mirrors the existing `plan-tree-save-plan.sh`.
+const HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
+# Plan Reader: PreToolUse/ExitPlanMode hook. Writes a review request and blocks
+# until the app responds, or falls through (exit 0, no decision) on timeout /
+# app-not-running / missing jq. plan_text is passed as DATA via jq --arg.
+set -uo pipefail
+
+# Fail OPEN if jq is missing — never turn a missing tool into a stall.
+command -v jq >/dev/null 2>&1 || exit 0
+
+PLAN_READER_DIR="$HOME/.claude/plan-reader"
+REQUESTS_DIR="$PLAN_READER_DIR/requests"
+RESPONSES_DIR="$PLAN_READER_DIR/responses"
+ALIVE="$PLAN_READER_DIR/app.alive"
+
+INPUT=$(cat)
+
+PLAN=$(printf '%s' "$INPUT" | jq -r '.tool_input.plan // empty')
+[ -z "$PLAN" ] && exit 0
+
+# Fast fallthrough: app not running (no heartbeat, or stale > 10s) → don't block.
+[ -f "$ALIVE" ] || exit 0
+NOW=$(date +%s)
+MTIME=$(stat -f %m "$ALIVE" 2>/dev/null || echo 0)
+[ $(( NOW - MTIME )) -gt 10 ] && exit 0
+
+SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
+SID=$(printf '%s' "$SID" | tr -cd 'A-Za-z0-9._-')
+CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
+TRANSCRIPT=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty')
+PLANFILE=$(printf '%s' "$INPUT" | jq -r '.tool_input.planFilePath // empty')
+
+mkdir -p "$REQUESTS_DIR" "$RESPONSES_DIR"
+
+NANOS="${NOW}000000000"
+RAND=$(jot -r 1 100000 999999 2>/dev/null || echo "$RANDOM")
+REVIEW_ID="${SID}-${NANOS}-${RAND}"
+
+REQ="$REQUESTS_DIR/${REVIEW_ID}.json"
+RESP="$RESPONSES_DIR/${REVIEW_ID}.json"
+TMP="$REQUESTS_DIR/.tmp-$$-${REVIEW_ID}.json"
+
+jq -n \
+  --arg review_id "$REVIEW_ID" \
+  --arg session_id "$SID" \
+  --arg cwd "$CWD" \
+  --arg transcript_path "$TRANSCRIPT" \
+  --arg plan_text "$PLAN" \
+  --arg plan_file_path "$PLANFILE" \
+  --argjson schema 1 \
+  --argjson created_ms "${NOW}000" \
+  '{schema:$schema, review_id:$review_id, session_id:$session_id, cwd:$cwd, transcript_path:$transcript_path, plan_text:$plan_text, plan_file_path:$plan_file_path, created_ms:$created_ms}' \
+  > "$TMP"
+mv -f "$TMP" "$REQ"
+
+cleanup() { rm -f "$REQ" "$TMP" 2>/dev/null || true; }
+trap cleanup EXIT
+
+DEADLINE=$(( NOW + 570 ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  if [ -f "$RESP" ]; then
+    DECISION=$(jq -r '.decision // empty' "$RESP" 2>/dev/null || echo "")
+    REASON=$(jq -r '.reason // empty' "$RESP" 2>/dev/null || echo "")
+    rm -f "$RESP" 2>/dev/null || true
+    if [ "$DECISION" = "allow" ] || [ "$DECISION" = "deny" ]; then
+      jq -n --arg d "$DECISION" --arg r "$REASON" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
+      exit 0
+    fi
+  fi
+  # Re-check the heartbeat INSIDE the loop: if the app quit mid-review, app.alive stops
+  # being touched (or is removed → stat fails → MTIME=0 → huge age), so fall through within
+  # ~10s rather than blocking up to the full deadline.
+  MTIME=$(stat -f %m "$ALIVE" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - MTIME )) -gt 10 ] && exit 0
+  sleep 1
+done
+exit 0
+"#;
+
+/// Install the headless-review hook: write `hook.sh` (mode 0755) and merge the `ExitPlanMode`
+/// PreToolUse entry into `~/.claude/settings.json` (idempotent additive merge — never clobbers
+/// an unrelated hook). The hook's absolute path is what gets written into settings.
+#[tauri::command]
+fn install_hook(app: tauri::AppHandle) -> Result<(), String> {
+    // We don't need `app` directly here, but the command takes it for symmetry / future use.
+    let _ = app;
+
+    // 1. Ensure the plan-reader dir tree exists.
+    let base = plan_reader_dir().ok_or_else(|| "could not locate home directory".to_string())?;
+    std::fs::create_dir_all(&base).map_err(|e| format!("mkdir failed: {e}"))?;
+    if let Some(d) = requests_dir() {
+        std::fs::create_dir_all(&d).map_err(|e| format!("mkdir requests failed: {e}"))?;
+    }
+    if let Some(d) = responses_dir() {
+        std::fs::create_dir_all(&d).map_err(|e| format!("mkdir responses failed: {e}"))?;
+    }
+
+    // 2. Write hook.sh, then chmod 0755.
+    let hook_path = base.join("hook.sh");
+    std::fs::write(&hook_path, HOOK_SCRIPT).map_err(|e| format!("write hook.sh failed: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)
+            .map_err(|e| format!("chmod hook.sh failed: {e}"))?;
+    }
+
+    // 3. Resolve the absolute hook path string we just wrote.
+    let abs_hook = hook_path.to_string_lossy().to_string();
+
+    // 4. Merge into ~/.claude/settings.json (default to {} when missing).
+    let settings_path = dirs::home_dir()
+        .ok_or_else(|| "could not locate home directory".to_string())?
+        .join(".claude")
+        .join("settings.json");
+    let current = read_settings_value(&settings_path)?;
+    let merged = merge_install_hook(current, &abs_hook);
+    let bytes =
+        serde_json::to_vec_pretty(&merged).map_err(|e| format!("serialize settings failed: {e}"))?;
+    // Back up the existing (parseable) settings before overwriting, for a recovery path.
+    backup_settings(&settings_path);
+    atomic_write(&settings_path, &bytes).map_err(|e| format!("write settings failed: {e}"))?;
+    Ok(())
+}
+
+/// Uninstall the headless-review hook from `~/.claude/settings.json` (idempotent removal). The
+/// `hook.sh` file is intentionally LEFT on disk — harmless and avoids racing a running hook.
+#[tauri::command]
+fn uninstall_hook() -> Result<(), String> {
+    let settings_path = dirs::home_dir()
+        .ok_or_else(|| "could not locate home directory".to_string())?
+        .join(".claude")
+        .join("settings.json");
+    let current = read_settings_value(&settings_path)?;
+    let merged = merge_uninstall_hook(current);
+    let bytes =
+        serde_json::to_vec_pretty(&merged).map_err(|e| format!("serialize settings failed: {e}"))?;
+    // Back up the existing (parseable) settings before overwriting, for a recovery path.
+    backup_settings(&settings_path);
+    atomic_write(&settings_path, &bytes).map_err(|e| format!("write settings failed: {e}"))?;
+    Ok(())
+}
+
+/// Read `settings.json` into a `serde_json::Value`, distinguishing the two failure modes so a
+/// momentarily-corrupt file can NEVER be clobbered:
+///   - file ABSENT ⇒ `Ok({})` (a fresh, empty settings object — nothing to preserve);
+///   - file present + reads but FAILS to parse ⇒ `Err(...)` so install/uninstall refuse to write
+///     (mirrors the non-destructive degrade of `load_cwd_cache`/`load_read_state`, which never
+///     rewrite a corrupt file);
+///   - file parses ⇒ `Ok(value)`.
+fn read_settings_value(path: &Path) -> Result<Value, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
+            "~/.claude/settings.json is not valid JSON — refusing to modify it to avoid \
+             clobbering your config"
+                .to_string()
+        }),
+        Err(_) => Ok(Value::Object(serde_json::Map::new())), // absent ⇒ fresh object
+    }
+}
+
+/// Best-effort backup of an existing, parseable settings file to
+/// `~/.claude/settings.json.plan-reader.bak` before we rewrite it. A backup-write failure is
+/// logged and ignored — it must never abort the install/uninstall (the merge itself is the
+/// safety-critical step). No-op when the source file does not exist.
+fn backup_settings(settings_path: &Path) {
+    if !settings_path.exists() {
+        return;
+    }
+    let backup_path = settings_path.with_file_name("settings.json.plan-reader.bak");
+    if let Err(e) = std::fs::copy(settings_path, &backup_path) {
+        eprintln!("[settings] backup to {} failed: {e}", backup_path.display());
+    }
+}
+
+/// Max age (seconds) before a control file (a `requests/`/`responses/` entry) is considered an
+/// orphan and pruned. A live review never lives this long (the hook deadline is 570s and the
+/// app responds far sooner), so anything older is from a SIGKILLed/timed-out hook.
+const CONTROL_FILE_MAX_AGE_SECS: u64 = 600;
+
+/// Best-effort prune of orphaned control files. Deletes any entry in `requests_dir()` /
+/// `responses_dir()` whose mtime is older than `CONTROL_FILE_MAX_AGE_SECS`. This intentionally
+/// includes `.tmp-…` and other dotfiles — stale temps are exactly the orphans we want to age
+/// out. `app.alive` lives in `plan_reader_dir()` (not requests/responses), so it is never
+/// touched. Every error is swallowed (panic-safe): a failed prune just leaves the file for the
+/// next tick.
+fn prune_stale_control_files() {
+    let now = SystemTime::now();
+    for dir in [requests_dir(), responses_dir()].into_iter().flatten() {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue; // dir not yet created ⇒ nothing to prune
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(mtime) = meta.modified() else { continue };
+            let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+            if age.as_secs() > CONTROL_FILE_MAX_AGE_SECS {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Spawn the heartbeat thread: touch `app.alive` every 5s so the hook knows the app is live.
+/// Also opportunistically prunes orphaned control files (cheap — once per loop tick). Panic-safe
+/// — directory creation and every write error are ignored (a missed heartbeat just makes the
+/// hook fall through, which is the safe failure mode).
+fn spawn_heartbeat() {
+    std::thread::spawn(|| {
+        if let Some(dir) = plan_reader_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        loop {
+            if let Some(path) = app_alive_path() {
+                let _ = std::fs::write(&path, b"");
+            }
+            prune_stale_control_files();
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
+/// Newtype wrapper so the control-dir debouncer can live in Tauri managed state alongside the
+/// plans-dir debouncer. `app.manage` is keyed by TYPE; both debouncers share the same concrete
+/// `Debouncer` type, so without distinct wrapper types the second `manage` would silently
+/// collide with the first. This wrapper gives the control debouncer its own type key.
+struct ControlWatcher<T>(#[allow(dead_code)] T);
+
+/// Start the debounced watcher on the CONTROL dir (`requests/`, non-recursive). Emits
+/// `plan-review-requested` on a created/modified `requests/<id>.json`, and
+/// `plan-review-cancelled` on a removed one. SEPARATE from `start_watcher` — the plans-dir
+/// watcher and its `plan-changed` path are untouched. Returns the live debouncer to keep alive.
+fn start_control_watcher(app: tauri::AppHandle) -> Option<impl Sized> {
+    let dir = requests_dir()?;
+
+    let app_for_handler = app.clone();
+    let mut debouncer = match new_debouncer(
+        Duration::from_millis(400),
+        None,
+        move |result: DebounceEventResult| {
+            let events = match result {
+                Ok(events) => events,
+                Err(errs) => {
+                    for e in errs {
+                        eprintln!("[control-watcher] debounce error: {e:?}");
+                    }
+                    return;
+                }
+            };
+
+            for ev in events {
+                let kind = ev.kind;
+                let is_remove = matches!(kind, EventKind::Remove(_));
+                let is_upsert = matches!(
+                    kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any
+                );
+                if !is_remove && !is_upsert {
+                    continue;
+                }
+                for p in ev.paths.iter() {
+                    // *.json only.
+                    let is_json = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("json"))
+                        .unwrap_or(false);
+                    if !is_json {
+                        continue;
+                    }
+                    // Skip dotfiles / in-flight atomic-write temps.
+                    let name = match p.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if is_ignored_control_filename(name) {
+                        continue;
+                    }
+                    // review_id is the file stem; validate before trusting it.
+                    let review_id = match p.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    if !valid_review_id(&review_id) {
+                        continue;
+                    }
+
+                    if is_remove {
+                        let payload = ReviewCancelled {
+                            review_id: review_id.clone(),
+                        };
+                        if let Err(e) = app_for_handler.emit("plan-review-cancelled", payload) {
+                            eprintln!("[control-watcher] emit cancelled failed: {e:?}");
+                        }
+                        continue;
+                    }
+
+                    // Upsert: read + parse the request. On parse failure, no-op — the atomic
+                    // rename's settled event (a later modify/create) will arrive with full JSON.
+                    let bytes = match std::fs::read(p) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let req: ReviewRequest = match serde_json::from_slice(&bytes) {
+                        Ok(r) => r,
+                        Err(_) => continue, // partial / unparseable ⇒ wait for the settled event
+                    };
+                    let payload = ReviewRequested {
+                        review_id: review_id.clone(),
+                        plan_text: req.plan_text,
+                        plan_file_path: req.plan_file_path,
+                    };
+                    if let Err(e) = app_for_handler.emit("plan-review-requested", payload) {
+                        eprintln!("[control-watcher] emit requested failed: {e:?}");
+                    }
+                }
+            }
+        },
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[control-watcher] failed to create debouncer: {e:?}");
+            return None;
+        }
+    };
+
+    match debouncer.watch(&dir, RecursiveMode::NonRecursive) {
+        Ok(()) => {
+            println!("[control-watcher] watching {}", dir.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "[control-watcher] could not watch {} (dir may not exist yet): {e:?}",
+                dir.display()
+            );
+        }
+    }
+
+    Some(debouncer)
+}
+
 /// Build the initial `AppState`: locate + create the data dir, load both persisted files
 /// (degrading on any failure), and seed the read-state baseline on first launch. Pure-ish:
 /// takes the resolved data dir Option so `setup()` can wire it from `app.path()`.
@@ -1654,10 +2436,36 @@ pub fn run() {
             };
             app.manage(Mutex::new(init_app_state(data_dir)));
 
+            // Phase 4: ensure the control dirs exist so the guarded path builders (which
+            // canonicalize the parent) and the control-dir watcher can operate. Best-effort —
+            // failures degrade (the commands re-create on demand; the watcher logs + no-ops).
+            if let Some(d) = requests_dir() {
+                let _ = std::fs::create_dir_all(&d);
+            }
+            if let Some(d) = responses_dir() {
+                let _ = std::fs::create_dir_all(&d);
+            }
+
+            // Phase 4: prune orphaned control files left by SIGKILLed/timed-out hooks ONCE at
+            // startup (before any launch recovery), then again on every heartbeat tick.
+            prune_stale_control_files();
+
+            // Phase 4: heartbeat thread — touches app.alive every 5s so the hook knows we are
+            // live (a missed beat just makes the hook fall through, the safe failure mode).
+            spawn_heartbeat();
+
             // Keep the debouncer alive for the lifetime of the app by stashing it in
             // managed state. Dropping it would stop the watch thread.
             if let Some(debouncer) = start_watcher(app.handle().clone()) {
                 app.manage(Mutex::new(debouncer));
+            }
+
+            // Phase 4: SECOND debouncer on the control dir (requests/). Wrapped in the
+            // `ControlWatcher` newtype so it gets a distinct type key in managed state (both
+            // debouncers share the same concrete type — a bare `Mutex<Debouncer>` would
+            // collide with the plans watcher above). Kept alive the same way: stashed in state.
+            if let Some(debouncer) = start_control_watcher(app.handle().clone()) {
+                app.manage(Mutex::new(ControlWatcher(debouncer)));
             }
             Ok(())
         })
@@ -1672,7 +2480,13 @@ pub fn run() {
             get_comments,
             get_comment_count,
             set_comments,
-            clear_comments
+            clear_comments,
+            list_pending_reviews,
+            read_review_plan,
+            respond_to_review,
+            focus_main_window,
+            install_hook,
+            uninstall_hook
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3180,6 +3994,401 @@ mod tests {
             Some(&serde_json::Value::Null),
             "block_end_line must be present as JSON null when None (never omitted)"
         );
+    }
+
+    // ====================================================================
+    // Phase 3 — review wire types, path helpers, id validation, settings merge.
+    // ====================================================================
+
+    fn sample_review_request() -> ReviewRequest {
+        ReviewRequest {
+            schema: REVIEW_SCHEMA,
+            review_id: "05ff0135-1e19-4617-b843-4c24acb5dd64-1717100000000000000-ab12".to_string(),
+            session_id: "session-abc".to_string(),
+            cwd: "/Users/charliekoster/Documents/repos/claude-plan-reader".to_string(),
+            transcript_path: "/Users/charliekoster/.claude/projects/x/session.jsonl".to_string(),
+            plan_text: "# Plan\n\nDo the thing.".to_string(),
+            plan_file_path: "/Users/charliekoster/.claude/plans/do-the-thing.md".to_string(),
+            created_ms: 1_717_100_000_000,
+        }
+    }
+
+    fn sample_review_response() -> ReviewResponse {
+        ReviewResponse {
+            schema: REVIEW_SCHEMA,
+            review_id: "05ff0135-1e19-4617-b843-4c24acb5dd64-1717100000000000000-ab12".to_string(),
+            decision: "allow".to_string(),
+            reason: "Looks good; ship it.".to_string(),
+        }
+    }
+
+    /// Serialize → deserialize → equal. Falsifiable: change a field after the round-trip and
+    /// the `assert_eq!` goes red.
+    #[test]
+    fn review_request_round_trips() {
+        let req = sample_review_request();
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: ReviewRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, back, "ReviewRequest must survive a serde round-trip unchanged");
+    }
+
+    /// A request JSON written by the OLD hook (no `plan_file_path` key) must still deserialize,
+    /// defaulting the missing field to `""` — this is the launch-recovery path against
+    /// pre-existing request files. Falsifiable: remove `#[serde(default)]` on `plan_file_path`
+    /// and this `from_str` errors instead of yielding `""`.
+    #[test]
+    fn review_request_without_plan_file_path_defaults_to_empty() {
+        let legacy = r##"{
+            "schema": 1,
+            "review_id": "rid-1",
+            "session_id": "sid",
+            "cwd": "/c",
+            "transcript_path": "/t",
+            "plan_text": "# Plan",
+            "created_ms": 1717100000000
+        }"##;
+        let req: ReviewRequest =
+            serde_json::from_str(legacy).expect("legacy request (no plan_file_path) must parse");
+        assert_eq!(
+            req.plan_file_path, "",
+            "missing plan_file_path must default to empty string"
+        );
+    }
+
+    /// `is_valid_decision` accepts EXACTLY `"allow"`/`"deny"` and rejects everything else
+    /// (the stale `"accept"`/`"reject"` vocabulary, empty, wrong case, and arbitrary text).
+    /// Falsifiable: if `is_valid_decision` also accepted `"accept"`, the `!` assertion on
+    /// `"accept"` would go red.
+    #[test]
+    fn decision_validation_accepts_only_allow_deny() {
+        assert!(is_valid_decision("allow"), "\"allow\" must be valid");
+        assert!(is_valid_decision("deny"), "\"deny\" must be valid");
+        assert!(!is_valid_decision("accept"), "\"accept\" must be rejected (stale vocab)");
+        assert!(!is_valid_decision("reject"), "\"reject\" must be rejected (stale vocab)");
+        assert!(!is_valid_decision(""), "empty must be rejected");
+        assert!(!is_valid_decision("ALLOW"), "decision is case-sensitive");
+        assert!(!is_valid_decision("yes"), "arbitrary text must be rejected");
+    }
+
+    #[test]
+    fn review_response_round_trips() {
+        let resp = sample_review_response();
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: ReviewResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(resp, back, "ReviewResponse must survive a serde round-trip unchanged");
+    }
+
+    /// Locks the `ReviewRequest` wire shape to exactly 8 snake_case keys against the ACTUAL
+    /// serialized JSON. Twin of `planrecord_wire_contract_is_frozen`.
+    #[test]
+    fn review_request_wire_contract_is_frozen() {
+        use std::collections::BTreeSet;
+        let expected_keys: BTreeSet<&str> = [
+            "schema",
+            "review_id",
+            "session_id",
+            "cwd",
+            "transcript_path",
+            "plan_text",
+            "plan_file_path",
+            "created_ms",
+        ]
+        .into_iter()
+        .collect();
+
+        let value = serde_json::to_value(sample_review_request()).unwrap();
+        let obj = value.as_object().expect("ReviewRequest serializes to an object");
+        let actual_keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "ReviewRequest top-level JSON keys drifted from the frozen 8-key contract"
+        );
+        // Value types of the always-present fields.
+        assert!(obj["schema"].is_u64(), "schema must be a JSON integer");
+        assert_eq!(obj["schema"], Value::from(1), "schema must serialize as 1");
+        assert!(obj["review_id"].is_string());
+        assert!(obj["session_id"].is_string());
+        assert!(obj["cwd"].is_string());
+        assert!(obj["transcript_path"].is_string());
+        assert!(obj["plan_text"].is_string());
+        assert!(obj["plan_file_path"].is_string());
+        assert!(obj["created_ms"].is_u64(), "created_ms must be a JSON integer");
+    }
+
+    /// Locks the `ReviewResponse` wire shape to exactly 4 snake_case keys.
+    #[test]
+    fn review_response_wire_contract_is_frozen() {
+        use std::collections::BTreeSet;
+        let expected_keys: BTreeSet<&str> =
+            ["schema", "review_id", "decision", "reason"].into_iter().collect();
+
+        let value = serde_json::to_value(sample_review_response()).unwrap();
+        let obj = value.as_object().expect("ReviewResponse serializes to an object");
+        let actual_keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "ReviewResponse top-level JSON keys drifted from the frozen 4-key contract"
+        );
+        assert!(obj["schema"].is_u64());
+        assert_eq!(obj["schema"], Value::from(1), "schema must serialize as 1");
+        assert!(obj["review_id"].is_string());
+        assert!(obj["decision"].is_string());
+        assert!(obj["reason"].is_string());
+    }
+
+    /// `valid_review_id` accepts a realistic id and REJECTS traversal / separator / dotfile /
+    /// empty forms. Falsifiable: each rejected case asserts `!valid_review_id(...)`, so if the
+    /// guard let one through the test goes red.
+    #[test]
+    fn valid_review_id_accepts_and_rejects() {
+        // Realistic minted id.
+        assert!(valid_review_id(
+            "05ff0135-1e19-4617-b843-4c24acb5dd64-1717100000000000000-ab12"
+        ));
+        // Plain alphanumerics + allowed punctuation.
+        assert!(valid_review_id("abc_DEF-123.json2"));
+
+        // Rejections.
+        assert!(!valid_review_id(".."), "`..` must be rejected");
+        assert!(!valid_review_id("."), "`.` must be rejected");
+        assert!(!valid_review_id("../escape"), "parent traversal must be rejected");
+        assert!(!valid_review_id("a/b"), "forward slash must be rejected");
+        assert!(!valid_review_id("a\\b"), "backslash must be rejected");
+        assert!(!valid_review_id(""), "empty string must be rejected");
+        assert!(!valid_review_id(".hidden"), "leading-dot (dotfile) must be rejected");
+        // Out-of-class chars.
+        assert!(!valid_review_id("a b"), "space must be rejected");
+        assert!(!valid_review_id("a*b"), "glob char must be rejected");
+    }
+
+    /// `response_path_for`: Err on traversal / separator ids; Ok for a valid id with the
+    /// path's parent equal to `responses_dir()`. Asserts NO file is created (pure builder).
+    #[test]
+    fn response_path_for_is_a_guarded_pure_builder() {
+        // Rejections (these short-circuit at `valid_review_id`, before any canonicalize).
+        assert!(response_path_for("../escape").is_err(), "traversal id must be Err");
+        assert!(response_path_for("a/b").is_err(), "slash id must be Err");
+
+        // Valid id. `responses_dir()` must canonicalize, so create it for the duration.
+        let dir = responses_dir().expect("home dir resolvable");
+        let preexisting = dir.exists();
+        std::fs::create_dir_all(&dir).expect("create responses dir for test");
+
+        let id = "valid-review-id-123";
+        let path = response_path_for(id).expect("valid id yields Ok");
+
+        // Parent is the responses dir.
+        assert_eq!(
+            path.parent().expect("has parent"),
+            dir.as_path(),
+            "built path's parent must be responses_dir()"
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("valid-review-id-123.json"),
+            "built path must be <id>.json"
+        );
+        // The pure builder must NOT create the target file.
+        assert!(!path.exists(), "response_path_for must not create the file");
+
+        // request_path_for twin: parent is requests_dir().
+        let rdir = requests_dir().expect("home dir resolvable");
+        std::fs::create_dir_all(&rdir).expect("create requests dir for test");
+        let rpath = request_path_for(id).expect("valid id yields Ok");
+        assert_eq!(rpath.parent().expect("has parent"), rdir.as_path());
+        assert!(!rpath.exists(), "request_path_for must not create the file");
+
+        // Cleanup: only remove dirs we created (leave a pre-existing real dir alone).
+        if !preexisting {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The user's real settings shape — the merge fixture. Kept as a fn so each test gets a
+    /// fresh, unmutated copy.
+    fn settings_fixture() -> Value {
+        serde_json::json!({
+            "permissions": { "defaultMode": "auto" },
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [ { "type": "command", "command": "python3 /Users/charliekoster/.claude/hooks/claude_permission_hook.py", "timeout": 5000 } ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": "~/.claude/scripts/plan-tree-save-plan.sh", "timeout": 5000 } ] }
+                ]
+            },
+            "worktree": { "bgIsolation": "none" },
+            "statusLine": { "type": "command", "command": "echo hi" },
+            "effortLevel": "medium",
+            "promptSuggestionEnabled": false,
+            "voice": { "enabled": true, "mode": "hold" },
+            "theme": "dark-daltonized",
+            "skipAutoPermissionPrompt": true,
+            "voiceEnabled": true
+        })
+    }
+
+    const TEST_HOOK_CMD: &str = "/Users/charliekoster/.claude/plan-reader/hook.sh";
+
+    /// Locate the ExitPlanMode element within hooks.PreToolUse, if present.
+    fn find_exit_plan_mode(settings: &Value) -> Option<&Value> {
+        settings["hooks"]["PreToolUse"]
+            .as_array()?
+            .iter()
+            .find(|el| el.get("matcher").and_then(|m| m.as_str()) == Some("ExitPlanMode"))
+    }
+
+    /// merge_install_hook must (a) preserve the Bash security hook, (b) preserve the
+    /// PostToolUse/ExitPlanMode entry, (c) leave every unrelated top-level key byte-equal, and
+    /// (d) add a new ExitPlanMode PreToolUse entry with our command + timeout 600.
+    #[test]
+    fn merge_install_preserves_everything_and_adds_our_hook() {
+        let input = settings_fixture();
+        let merged = merge_install_hook(input.clone(), TEST_HOOK_CMD);
+
+        // (a) The Bash PreToolUse entry is still present and UNCHANGED.
+        let bash = merged["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array")
+            .iter()
+            .find(|el| el.get("matcher").and_then(|m| m.as_str()) == Some("Bash"))
+            .expect("Bash matcher must survive the merge (security hook)");
+        assert_eq!(
+            bash, &input["hooks"]["PreToolUse"][0],
+            "the Bash security hook must be byte-equal after merge"
+        );
+
+        // (b) PostToolUse/ExitPlanMode is unchanged.
+        assert_eq!(
+            merged["hooks"]["PostToolUse"], input["hooks"]["PostToolUse"],
+            "PostToolUse must be untouched by a PreToolUse merge"
+        );
+
+        // (c) Every unrelated top-level key is byte-equal to the input.
+        for key in [
+            "worktree",
+            "statusLine",
+            "effortLevel",
+            "promptSuggestionEnabled",
+            "voice",
+            "theme",
+            "skipAutoPermissionPrompt",
+            "voiceEnabled",
+            "permissions",
+        ] {
+            assert_eq!(
+                merged[key], input[key],
+                "top-level key {key:?} must be preserved byte-equal"
+            );
+        }
+
+        // (d) A new ExitPlanMode entry under PreToolUse with our command + timeout 600.
+        let exit = find_exit_plan_mode(&merged).expect("ExitPlanMode now in PreToolUse");
+        let our_entry = exit["hooks"]
+            .as_array()
+            .expect("ExitPlanMode hooks array")
+            .iter()
+            .find(|h| h.get("command").and_then(|c| c.as_str()) == Some(TEST_HOOK_CMD))
+            .expect("our command must be present");
+        assert_eq!(our_entry["type"], Value::from("command"));
+        assert_eq!(our_entry["command"], Value::from(TEST_HOOK_CMD));
+        assert_eq!(our_entry["timeout"], Value::from(600), "timeout must be 600");
+    }
+
+    /// Applying merge_install_hook twice equals applying it once — no duplicate entry.
+    #[test]
+    fn merge_install_is_idempotent() {
+        let once = merge_install_hook(settings_fixture(), TEST_HOOK_CMD);
+        let twice = merge_install_hook(once.clone(), TEST_HOOK_CMD);
+        assert_eq!(once, twice, "install must be idempotent");
+
+        // And there is exactly ONE ExitPlanMode entry with our command.
+        let exit = find_exit_plan_mode(&twice).expect("ExitPlanMode present");
+        let count = exit["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|h| h.get("command").and_then(|c| c.as_str()) == Some(TEST_HOOK_CMD))
+            .count();
+        assert_eq!(count, 1, "no duplicate plan-reader hook entry");
+    }
+
+    /// When PreToolUse ALREADY has an ExitPlanMode matcher (with a different command), install
+    /// APPENDS our entry to that matcher's hooks and preserves the existing command.
+    #[test]
+    fn merge_install_appends_to_existing_exit_plan_mode_matcher() {
+        let mut fixture = settings_fixture();
+        // Add an ExitPlanMode matcher to PreToolUse with some OTHER command.
+        let other = serde_json::json!({
+            "matcher": "ExitPlanMode",
+            "hooks": [ { "type": "command", "command": "/some/other/exit-hook.sh", "timeout": 30 } ]
+        });
+        fixture["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(other);
+
+        let merged = merge_install_hook(fixture, TEST_HOOK_CMD);
+        let exit = find_exit_plan_mode(&merged).expect("ExitPlanMode present");
+        let cmds: Vec<&str> = exit["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+            .collect();
+        assert!(
+            cmds.contains(&"/some/other/exit-hook.sh"),
+            "the pre-existing ExitPlanMode command must be preserved"
+        );
+        assert!(
+            cmds.contains(&TEST_HOOK_CMD),
+            "our command must be appended to the existing matcher"
+        );
+        // There must be exactly ONE ExitPlanMode matcher element (appended, not duplicated).
+        let exit_count = merged["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|el| el.get("matcher").and_then(|m| m.as_str()) == Some("ExitPlanMode"))
+            .count();
+        assert_eq!(exit_count, 1, "must append into the existing matcher, not add a second");
+    }
+
+    /// uninstall after install restores the hooks for our concern: our entry gone, Bash +
+    /// PostToolUse intact. Since install ADDED a brand-new ExitPlanMode element whose only
+    /// entry was ours, uninstall removes that element entirely — yielding the original hooks.
+    #[test]
+    fn uninstall_after_install_restores_original_hooks() {
+        let original = settings_fixture();
+        let installed = merge_install_hook(original.clone(), TEST_HOOK_CMD);
+        let uninstalled = merge_uninstall_hook(installed);
+
+        // Our entry is gone (no ExitPlanMode element under PreToolUse anymore).
+        assert!(
+            find_exit_plan_mode(&uninstalled).is_none(),
+            "the installed ExitPlanMode PreToolUse element must be removed on uninstall"
+        );
+
+        // Bash + the whole hooks block match the original for our concern.
+        assert_eq!(
+            uninstalled["hooks"]["PreToolUse"], original["hooks"]["PreToolUse"],
+            "PreToolUse must return to its original state (Bash intact, our element gone)"
+        );
+        assert_eq!(
+            uninstalled["hooks"]["PostToolUse"], original["hooks"]["PostToolUse"],
+            "PostToolUse must be untouched"
+        );
+        // Whole document equals the original.
+        assert_eq!(uninstalled, original, "uninstall must fully restore the original settings");
+    }
+
+    /// Uninstall is idempotent — applying it a second time is a no-op.
+    #[test]
+    fn merge_uninstall_is_idempotent() {
+        let installed = merge_install_hook(settings_fixture(), TEST_HOOK_CMD);
+        let once = merge_uninstall_hook(installed);
+        let twice = merge_uninstall_hook(once.clone());
+        assert_eq!(once, twice, "uninstall must be idempotent (removing twice = no-op)");
     }
 
     /// `#[serde(default)]` must rescue OLD saved files that predate `block_end_line`: a comments

@@ -892,6 +892,17 @@ source of truth for the count** (read via `get_comment_count` / `get_comments`, 
 | `#feedback-copy` | inside `#feedback-overlay` | Copy button → `navigator.clipboard.writeText(prompt)` (best-effort) |
 | `#feedback-clear` | inside `#feedback-overlay` | clear-all button → facade `clearAllComments` then hide the overlay |
 
+> **Amendment 2026-05-30 — feedback overlay is now review-aware; see §"Plan Review
+> (ExitPlanMode hook)" below.** When a plan in `#reading-pane` has a **pending hook review**
+> (see the new section), the overlay grows an additional **`#feedback-approve`** button (hidden
+> unless a review is pending for the open plan) and `#feedback-copy`'s label/behavior become
+> review-aware: in review mode the **deny** path forwards `buildFeedbackPrompt(comments)` to
+> Claude as the review `reason` (delivered as an ExitPlanMode tool error so Claude revises in
+> place), rather than only copying the prompt to the clipboard. The selector rows above are
+> retained verbatim; this note records the additive behavior change. No other row in this
+> section is affected, and `#feedback-clear` / `buildFeedbackPrompt` are unchanged (the deny
+> reason **reuses `buildFeedbackPrompt` unchanged** — see the DESIGN NOTE in the new section).
+
 ### Pure prompt builder (`src/feedback.ts`)
 
 `buildFeedbackPrompt(records: Pick<CommentRecord, "quote" | "comment" | "block_line" | "block_end_line">[]): string`
@@ -960,3 +971,278 @@ literal) are themselves pinned against the `index.html` source by `src/contract.
 titlebar.ts's exported `TEXT_SIZE_KEY` / `TEXT_SIZE_LADDER`, and the `#text-dec` / `#text-inc` ids and
 the `--reading-font-size` variable are asserted present — so if the inline script drifts from the module
 source of truth, those assertions go red (mirroring how `plan-reader-theme` is pinned).
+
+## Plan Review (ExitPlanMode hook) (additive, non-breaking)
+
+Added 2026-05-30. A new surface lets a `PreToolUse`/`ExitPlanMode` hook hand a plan to the
+running app for **in-app review** (approve, or deny-with-feedback so Claude revises in place),
+turning the highlight-and-comment overlay into a live plan-revision loop. None of the §1/§2/§3
+or prior additive surfaces are altered; `PlanRecord` is **UNCHANGED**. The feedback overlay
+becomes review-aware (see the dated amendment in §"Sub-Plan 03 additions (Prompt Feedback
+button + overlay)").
+
+### File-write invariant preserved — new control directory
+
+The app's write surface is still tightly bounded. It writes **ONLY** under a new control
+directory **`~/.claude/plan-reader/`** plus a **single idempotent merge** into
+`~/.claude/settings.json` (the hook registration). **It never writes into `~/.claude/plans/`**
+— the plans tree stays read-only (rendered + watched), exactly as before. The control directory
+holds:
+
+| path | role |
+|------|------|
+| `~/.claude/plan-reader/requests/` | hook → app IPC inbox; one `<review_id>.json` per pending review |
+| `~/.claude/plan-reader/responses/` | app → hook IPC outbox; one `<review_id>.json` per decision |
+| `~/.claude/plan-reader/app.alive` | heartbeat file; mtime is refreshed by the running app so the hook can detect whether the app is live (and fall back to allow if not) |
+
+### IPC file shapes
+
+**Request** (hook writes `requests/<review_id>.json`):
+
+```jsonc
+{ "schema": 1,
+  "review_id": "<opaque token>",   // see below — NEVER split
+  "session_id": "<claude session id>",
+  "cwd": "<originating working directory>",
+  "transcript_path": "<path to the session transcript>",
+  "plan_text": "<full plan markdown>",
+  "created_ms": <i64> }
+```
+
+**Response** (app writes `responses/<review_id>.json`):
+
+```jsonc
+{ "schema": 1,
+  "review_id": "<opaque token>",
+  "decision": "allow" | "deny",
+  "reason": "<text>" }            // on deny, = buildFeedbackPrompt(comments) — see DESIGN NOTE
+```
+
+- **`review_id` is an OPAQUE token** — format `<session_id>-<unix_nanos>-<rand>`, but it is
+  **never split or parsed back into parts**; treat it as one atom. It is validated against
+  `^[A-Za-z0-9._-]+$` (rejecting `..`, `/`, and a leading dot) **at every path-building
+  boundary** before it is joined into a `requests/`/`responses/` filename — the guard against
+  path traversal out of the control directory.
+- `schema` is pinned at `1` on both files for forward-compat.
+
+### New Tauri commands (registered in `invoke_handler`)
+
+| command | signature | role |
+|---------|-----------|------|
+| `list_pending_reviews` | `() -> Vec<ReviewRequest>` | the pending-review inbox (parsed `requests/*.json`) |
+| `read_review_plan` | `(review_id: String) -> Result<String, String>` | returns the request's `plan_text` |
+| `respond_to_review` | `(review_id: String, decision: String, reason: String) -> Result<(), String>` | writes `responses/<review_id>.json` (`decision` ∈ `"allow"\|"deny"`) |
+| `pending_review_for_path` | `(path: String) -> Option<String>` | maps an open plan path → its pending `review_id` (drives the review-aware overlay) |
+| `install_hook` | `() -> Result<(), String>` | the single idempotent merge into `~/.claude/settings.json` registering the `PreToolUse`/`ExitPlanMode` hook |
+| `uninstall_hook` | `() -> Result<(), String>` | removes that hook registration from `~/.claude/settings.json` |
+| `focus_main_window` | `()` | best-effort `show` + `unminimize` + `set_focus` of the `main` window (so a review request can foreground the app) |
+
+`review_id` arriving over `read_review_plan` / `respond_to_review` is re-validated against the
+same `^[A-Za-z0-9._-]+$` allow-list before any path is built.
+
+### New Tauri events (emitted by the backend watcher over `~/.claude/plan-reader/requests/`)
+
+| event | payload | meaning |
+|-------|---------|---------|
+| `plan-review-requested` | `{ review_id: string, plan_text: string }` | a new `requests/<review_id>.json` appeared — a plan awaits review |
+| `plan-review-cancelled` | `{ review_id: string }` | a pending request file was removed before the app responded (the hook gave up / timed out) |
+
+### New capabilities (`src-tauri/capabilities/default.json`)
+
+`focus_main_window` requires three window permissions **not** in `core:default`, added to the
+`permissions` array: **`core:window:allow-set-focus`**, **`core:window:allow-show`**,
+**`core:window:allow-unminimize`**. (Mirrors the `core:window:allow-start-dragging` /
+`core:window:allow-toggle-maximize` precedent — these are individually opt-in.)
+
+### New DOM selectors
+
+| selector | where | role |
+|----------|-------|------|
+| `#feedback-approve` | inside `#feedback-overlay` (sibling of `#feedback-copy`/`#feedback-clear`) | **hidden unless a review is pending** for the open plan; approving sends `respond_to_review(review_id, "allow", "")`. NO `data-tauri-drag-region`. |
+| `#hook-setup` | titlebar control in `.titlebar-controls` | installs the ExitPlanMode hook (`install_hook`); includes a remove/uninstall affordance (`uninstall_hook`). Drag-immunity via the `isDragTarget()` interactive-target bail (it is an interactive control), NOT `data-tauri-drag-region`. |
+
+### Empirical notes (verified Phase 0, against a live Claude Code session)
+
+- **Plan text source.** At `PreToolUse`/`ExitPlanMode` the hook payload carries
+  `tool_input.plan` (full markdown), `session_id`, `cwd`, `transcript_path`, `hook_event_name`,
+  `tool_name`, `tool_use_id`, and `tool_input.planFilePath`. There is **NO `tool_response`**
+  (the tool has not run yet), so the plan text **MUST** be taken from **`tool_input.plan`** —
+  never from a tool result.
+- **Decision protocol (stdout JSON).** The hook returns its decision on **stdout** as:
+  ```jsonc
+  { "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "deny" | "allow",
+      "permissionDecisionReason": "<text>" } }
+  ```
+  A **`deny`** causes ExitPlanMode to **fail**: the reason text is delivered back to Claude as a
+  **tool error**, Claude **remains in plan mode** and revises the plan. An **`allow`** lets the
+  plan be presented/approved normally.
+- **DESIGN NOTE — deny reason must read as the user's feedback, not meta-instructions.** Because
+  the deny `reason` is surfaced to Claude as a tool error, and Claude scrutinizes instruction-like
+  content for **prompt-injection**, the reason must read as the **user's plan-revision feedback**
+  (e.g. *"Please revise the plan based on this feedback: …"*), **never** as meta-instructions
+  directed at the model. In production the reason is exactly `buildFeedbackPrompt(comments)`
+  output — **reused unchanged** — which already phrases the comments as user feedback, satisfying
+  this constraint.
+
+### Amendment 2026-05-30 (Phase 4) — `pending_review_for_path` NOT implemented
+
+The previously-planned `pending_review_for_path` command was **dropped** and is **not**
+implemented. It has no consumer: the frontend (Phase 6) tracks the active review by its
+`review_id` in memory, so a path→review lookup is unnecessary. The Phase 4 review command
+surface is therefore: `list_pending_reviews`, `read_review_plan`, `respond_to_review`,
+`focus_main_window`, `install_hook`, `uninstall_hook`, plus the events
+`plan-review-requested` ({review_id, plan_text}) and `plan-review-cancelled` ({review_id}).
+
+### Amendment 2026-05-30 — hook install/remove UX is in-DOM (no `window.confirm`/`alert`)
+
+The `#hook-setup` / `#hook-remove` click handlers no longer use `window.confirm` / `window.alert`:
+in Tauri v2 (Wry + WKWebView on macOS) `window.confirm()` returns `false` (so `invoke` never
+fired — the button appeared to do nothing) and `window.alert()` is a no-op (so any error was
+invisible). They now use a dependency-free in-DOM flow (no `@tauri-apps/plugin-dialog`):
+
+| selector | where | role |
+|----------|-------|------|
+| `#hook-status` | titlebar control in `.titlebar-controls` (a `<span role="status" aria-live="polite">`, sibling of `#hook-remove`) | transient in-DOM status readout for install/remove. `main.ts` sets `textContent`, toggles `.hidden`, and adds `.error` (red) for failures; auto-clears after a few seconds. Carries no `data-tauri-drag-region` (a non-interactive `<span>` — not clickable, drag-immunity irrelevant). |
+
+Each hook button uses a two-click **"click again to confirm"** arm before mutating
+`~/.claude/settings.json`: the first click adds `.confirming` to the button and relabels it
+(auto-reverting after a few seconds); the second click runs the command. Success and error are
+surfaced via `#hook-status` (and always `console.log`/`console.error`'d); a thrown command error
+shows its returned string (e.g. *"settings.json is not valid JSON — refusing to modify"*) in-DOM.
+
+### Amendment 2026-05-30 — review Submit/Approve live on a persistent `#review-bar` (not solely the overlay)
+
+The plan-review feedback overlay (`#feedback-overlay`) is `position: fixed` and floats over the
+reading pane, and it closes on outside-click. That made commenting and acting on a review mutually
+exclusive: to add an inline comment the user had to click into the pane (closing the overlay), and
+once closed there was no reliable affordance to Submit/Approve (those controls lived only inside the
+overlay; the `#feedback-btn` toggle is hidden at 0 comments).
+
+A **persistent, non-occluding review action bar** now owns the review actions:
+
+| selector | where | role |
+|----------|-------|------|
+| `#review-bar` | inside `.reader-inner`, in normal flow between `.doc-header` and `#reading-pane` (NOT floating over the pane) | shown (`.hidden` removed) iff a review is active; hidden otherwise. `main.ts` `refreshReviewBar()` is the sole writer of its `.hidden`. |
+| `#review-bar-label` | inside `#review-bar` | reads `Reviewing plan — N comments` (N from the authoritative review comment count). |
+| `#review-submit` | inside `#review-bar` | **Submit feedback** → `respond_to_review(reviewId, "deny", buildFeedbackPrompt(reviewComments))` then teardown. Disabled while there are 0 review comments; enabled on the FIRST comment (authoritative-count plumbing from `onCommentCountChanged`). |
+| `#review-approve` | inside `#review-bar` | **Approve plan** → `respond_to_review(reviewId, "allow", "Plan approved in Plan Reader.")` then teardown. Always enabled while a review is active. |
+| `#review-preview` | inside `#review-bar` | opens the existing `#feedback-overlay` read-only to PREVIEW the assembled feedback prompt. |
+
+Because the bar is in normal flow at the top of the reading column, the reading pane stays fully
+interactive for inline commenting while a review is active. The `#review-bar` Submit/Approve buttons
+and the overlay's `#feedback-copy` (submit-mode) / `#feedback-approve` buttons call the **same**
+shared `respond_to_review` handlers in `main.ts` (no duplicated invoke logic). A review request and
+launch-recovery NO LONGER auto-open the occluding overlay — they render the plan via `openReview`,
+show `#review-bar`, and leave the overlay as preview-only. Non-review behavior (the `#feedback-btn`
+clipboard / overlay flow when no review is active) is unchanged.
+
+### Amendment 2026-05-30 — feedback-only review UX: Approve removed, Dismiss releases the hook, pending reviews are resumable and decoupled from the display
+
+This supersedes the relevant parts of the two amendments above. Two product decisions drive it:
+
+**(1) Feedback-only — Approve-as-auto-execute is GONE.** A PreToolUse hook cannot auto-approve a
+plan (decision `"allow"` only lets `ExitPlanMode` proceed to Claude Code's *normal terminal*
+plan-approval prompt; true auto-approve needs a `PermissionRequest` hook, currently broken upstream).
+So the in-app "Approve plan" concept is removed. It is replaced by **Dismiss**, which sends decision
+`"allow"` to **release the blocking hook** so Claude Code shows its normal terminal prompt where the
+user approves. **Submit feedback** is unchanged in spirit: decision `"deny"` + the assembled
+`buildFeedbackPrompt(...)` comments, so Claude revises. The `#feedback-approve` button (formerly an
+`#feedback-overlay` child) is **removed**; the overlay's `#feedback-copy` is now ALWAYS a plain
+clipboard copy (no submit-mode), and the overlay is no longer review-aware.
+
+**(2) Browse freely; a pending review never traps navigation.** "A review is pending" (a live
+blocking hook) is now DECOUPLED from "what is rendered in the reading pane." Opening a real plan
+while a review is pending shows that plan, leaves the review in the pending set, and does NOT resolve
+it. The old `surfaceNextPendingReview()` re-poll on teardown — which re-opened the *same* still-
+pending review on every sidebar click — is **deleted**.
+
+State model (`main.ts`): `pendingReviews: Map<reviewId, {reviewId, planText, createdMs}>` (all known
+pending reviews, each with a blocking hook); `reviewComments: Map<reviewId, CommentRecord[]>`
+(per-review in-memory comments, isolated by id, NEVER persisted to comments.json); `viewedReviewId:
+string | null` (which review is rendered, or null for a real plan / nothing). The `REVIEW_PATH`
+comment-store sentinel now maps to `reviewComments.get(viewedReviewId)`.
+
+The `#review-bar` now has **two modes** (pure derivation in `src/review.ts` `applyReviewBarState`):
+
+| selector | where | role |
+|----------|-------|------|
+| `#review-bar` | inside `.reader-inner`, normal flow between `.doc-header` and `#reading-pane` | visible iff one or more reviews are pending; hidden when none. `refreshReviewBar()` is the sole writer of its `.hidden`. |
+| `#review-bar-label` | inside `#review-bar` | **viewing** mode: `Reviewing plan — N comment(s)`. **summary** mode: `N plan(s) awaiting review`. |
+| `#review-submit` | inside `#review-bar` | shown only in **viewing** mode → `respond_to_review(viewedReviewId, "deny", buildFeedbackPrompt(thatReview's comments))`. Disabled at 0 comments; enabled on the FIRST (authoritative-count plumbing). |
+| `#review-dismiss` | inside `#review-bar` | shown only in **viewing** mode → `respond_to_review(viewedReviewId, "allow", "Dismissed in Plan Reader — approve in the terminal.")`. Releases the hook to the terminal. |
+| `#review-resume` | inside `#review-bar` | shown only in **summary** mode → re-opens the NEWEST pending review (max `createdMs`) via `openReview`, switching the bar back to viewing mode. |
+
+**viewing** mode = `viewedReviewId !== null` (a review is rendered): Submit + Dismiss shown, Resume
+hidden. **summary** mode = reviews pending but a real plan (or nothing) is shown: count label +
+Resume only. **hidden** = `pendingReviews.size === 0`.
+
+Wiring: `openPlan` sets `viewedReviewId = null` (re-keys comments to the real path) and refreshes the
+bar — it never resolves or re-opens a review (the navigation-unstick fix). On `plan-review-requested`:
+the review is added to `pendingReviews`; if nothing is being viewed it is auto-shown (focus +
+`openReview`), otherwise the bar count just rises (no yank). On `plan-review-cancelled`: the review is
+removed from both maps and unviewed if it was the viewed one. Launch recovery populates all non-stale
+pending reviews and auto-shows the newest (`console.warn` if more than one). On any resolve, the
+review is removed from both maps; the bar drops to summary mode if others remain, or hides. Removed
+symbols: `activeReview`, `ActiveReview`, `surfaceNextPendingReview`, `#feedback-approve`,
+`#review-approve`, `#review-preview`.
+
+### Amendment 2026-05-30 — Option A: a review OPENS + SELECTS the real plan file (no detached IPC render)
+
+This supersedes the parts of the amendment above that describe a detached `openReview(reviewId, planText)`
+render with an in-memory per-review comment store. **The reviewed plan is a real file under
+`~/.claude/plans/`** (Claude writes it before `ExitPlanMode`), so a review now opens that file through
+the **normal plan-open flow**, fixing an invariant violation (reading-pane content with no selected
+sidebar row).
+
+**Wire additions (backend + frontend, additive):** `ReviewRequest` and the `plan-review-requested`
+event payload now both carry **`plan_file_path: string`** — the absolute path of the reviewed plan
+file under `~/.claude/plans/`. The request JSON gains `"plan_file_path": "<abs path>"` (sourced from
+the hook's `tool_input.planFilePath`). The event payload is now `{ review_id, plan_text, plan_file_path }`.
+`src/types.ts` `ReviewRequest` / `ReviewRequested` mirror this.
+
+**State model (`main.ts`):** `pendingReviews: Map<reviewId, {reviewId, planFilePath, planText, createdMs}>`.
+The in-memory review-comment subsystem is **DELETED** (`REVIEW_PATH`, `reviewPathFor`, `reviewIdFromPath`,
+`reviewComments`, `viewedReviewComments`, `viewedReviewId`, the `CommentsIO` review branch, `openReview`).
+Review comments are now just the opened plan's **normal persisted comments** (keyed on its real path —
+no special store). "Viewing a review" is **derived**: `currentReviewId(): string | null` returns the
+reviewId whose `planFilePath === openPath`, else null. `CommentsIO` is the plain backend
+get/set/clear; the comment-path reader is simply `() => openPath`.
+
+**Bar derivation (`applyReviewBarState`, unchanged signature):** wiring computes
+`viewing = currentReviewId() !== null` and `viewedCommentCount` = the open plan's comment count.
+Submit → `respond_to_review(currentReviewId(), "deny", buildFeedbackPrompt(open plan's comments))`,
+removes the review from `pendingReviews` (plan stays open + selected, comments stay saved). Dismiss →
+`respond_to_review(currentReviewId(), "allow", "Dismissed in Plan Reader — approve in the terminal.")`,
+removes from pending. Resume → opens the newest pending review's `planFilePath` via the normal flow
+(re-selecting its row).
+
+**Behavior:** on `plan-review-requested`, the review is added to `pendingReviews`; if no review is
+currently being viewed, the app `focus_main_window`s, **refreshes the sidebar list** (so the just-
+written plan's `[data-path]` row exists), then `openPlan(planFilePath, <stem>)` — which selects the
+row. Live-reload works normally on a reviewed plan (a real file). `openPlan` no longer has any review
+teardown — navigation is free and never touches `pendingReviews`; the bar flips viewing↔summary purely
+by `openPath`. **Fallback (degraded):** if `plan_file_path` is empty OR the open fails (file missing /
+outside plans dir), the handler `console.warn`s and renders the IPC-supplied `planText` detached (no
+sidebar selection) so the review stays actionable.
+
+### Amendment 2026-05-30 — Submit clears the submitted plan's comments; new `#review-clear` manual clear
+
+Two additive changes to the `#review-bar` review flow (no prior section is rewritten):
+
+**Submit consumes (clears) comments.** When `#review-submit` succeeds, the submitted plan's comments
+have been consumed into the deny feedback, so they are now CLEARED. Strict order: (1) read the open
+plan's comments and build the reason via `buildFeedbackPrompt`, (2) `respond_to_review(reviewId,
+"deny", reason)`, (3) **only on success** clear the comments via the same path `#feedback-clear` uses —
+`clearAllComments(readingPaneEl, openPath)` (facade) → backend `clear_comments(openPath)` + in-pane
+highlight removal + `onCommentCountChanged` (count/button/bar refresh to 0). The reason still carries
+the comments (built before the clear). **Dismiss does NOT clear** (no feedback was sent).
+
+| Selector | Location | Contract |
+|----------|----------|----------|
+| `#review-clear` | inside `#review-bar` (`.review-bar-actions`, between `#review-submit` and `#review-dismiss`) | shown only in **viewing** mode AND when the open plan has **≥1 comment** (`ReviewBarState.clearVisible`). Discoverable MANUAL clear during review. Uses the dependency-free **two-click "Click again to confirm"** pattern (`window.confirm` is inert in Tauri v2 WKWebView): 1st click arms (`.confirming`, relabel, auto-revert after `HOOK_CONFIRM_MS`); 2nd click runs the `#feedback-clear` path `clearAllComments(readingPaneEl, openPath)`. `refreshReviewBar` disarms it when it hides. |
+
+`applyReviewBarState` gains an additive `clearVisible: boolean` field (`true` only in viewing mode with
+`viewedCommentCount > 0`; `false` in summary/hidden and at 0 comments). `refreshReviewBar` is the sole
+writer of `#review-clear`'s `.hidden`.

@@ -302,13 +302,16 @@ describe("contract — Sub-Plan 03 Prompt Feedback selectors present in index.ht
 
   it("neither the feedback button nor overlay carries data-tauri-drag-region", () => {
     // Slice the button markup and the overlay markup and assert the drag attribute is absent in
-    // each (the titlebar wrapper carries it, so a global check would be wrong).
+    // each (the titlebar wrapper carries it, so a global check would be wrong). HTML comments are
+    // stripped first: the controls slot's explanatory comments NAME the attribute in prose ("NOT
+    // data-tauri-drag-region"), which is documentation, not a real attribute on any element.
+    const stripComments = (s: string): string => s.replace(/<!--[\s\S]*?-->/g, "");
     const btnStart = INDEX_HTML.indexOf('id="feedback-btn"');
     const btnEnd = INDEX_HTML.indexOf('id="theme-toggle"');
-    expect(INDEX_HTML.slice(btnStart, btnEnd)).not.toContain("data-tauri-drag-region");
+    expect(stripComments(INDEX_HTML.slice(btnStart, btnEnd))).not.toContain("data-tauri-drag-region");
     const ovStart = INDEX_HTML.indexOf('id="feedback-overlay"');
     const ovEnd = INDEX_HTML.indexOf('id="feedback-clear"');
-    expect(INDEX_HTML.slice(ovStart, ovEnd)).not.toContain("data-tauri-drag-region");
+    expect(stripComments(INDEX_HTML.slice(ovStart, ovEnd))).not.toContain("data-tauri-drag-region");
   });
 
   it("the facade clearAllComments surface is documented in CONTRACT.md", () => {

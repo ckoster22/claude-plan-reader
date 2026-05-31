@@ -102,6 +102,34 @@ body {
 }
 .theme-toggle:hover { border-color: var(--accent); }
 
+/* Plan-review hook controls (#hook-setup / #hook-remove). Text buttons in the
+   .titlebar-controls slot: reuse .theme-toggle's border/colors but override its fixed
+   28px square so the text label fits. Real <button>s ⇒ drag-immune via isDragTarget().
+   Phase 6 toggles which is shown based on install state. */
+.theme-toggle.hook-btn {
+  width: auto; padding: 0 10px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600;
+}
+.theme-toggle.hook-btn.hidden { display: none; }
+/* A hook button in its "click again to confirm" armed state — accent-tinted so the
+   second-click confirmation step is visible (replaces the no-op window.confirm). */
+.theme-toggle.hook-btn.confirming {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+
+/* In-DOM status readout for the hook install/remove actions (replaces window.alert,
+   a no-op in Tauri v2 WKWebView). A transient one-line message; main.ts sets the text,
+   toggles `.hidden`, and adds `.error` (red) for failures, then auto-clears. */
+.hook-status {
+  display: inline-flex; align-items: center;
+  max-width: 280px; padding: 0 8px; height: 28px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hook-status.error { color: #d9534f; }
+.hook-status.hidden { display: none; }
+
 /* ---- Prompt Feedback button (Sub-Plan 03) ----
    Accent-tinted pill in the .titlebar-controls slot, FIRST child (left of the
    theme toggle). Hidden until >=1 comment exists (main.ts toggles `.hidden` via
@@ -155,6 +183,9 @@ body {
   font-family: var(--ui); font-size: 11px; font-weight: 600; cursor: pointer;
 }
 .feedback-overlay .fo-actions button:hover { border-color: var(--accent); color: var(--accent); }
+/* A hidden .fo-actions button (no generic .hidden exists; each component scopes its own — see
+   #feedback-btn/#sel-popover). Kept generic so any future overlay control can hide via `.hidden`. */
+.feedback-overlay .fo-actions button.hidden { display: none; }
 .feedback-overlay .fo-body {
   margin: 0; padding: 12px 14px; overflow-y: auto;
   font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
@@ -356,6 +387,42 @@ body {
   display: flex; align-items: center; gap: 6px;
 }
 .doc-src .folder { color: var(--accent); }
+
+/* ---- Review action bar (Plan Review) ----
+   Persistent, NON-OCCLUDING affordance docked at the top of the reading column (normal flow inside
+   .reader-inner — it does NOT float over the pane like #feedback-overlay), so inline commenting in
+   the pane stays fully usable while a review is active. Accent-tinted to read as an active mode.
+   Themed entirely via existing tokens, so the dark theme re-themes it for free. */
+.review-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 10px 0 4px; padding: 8px 12px;
+  background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 9px;
+}
+.review-bar.hidden { display: none; }
+.review-bar-label {
+  font-family: var(--ui); font-size: 12px; font-weight: 600; color: var(--accent);
+}
+.review-bar-actions { display: flex; gap: 6px; }
+.review-bar-actions .rb-btn {
+  border: 1px solid var(--border); background: var(--bg-window); color: var(--text);
+  border-radius: 7px; height: 26px; padding: 0 12px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.review-bar-actions .rb-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.review-bar-actions .rb-btn:disabled { opacity: .5; cursor: default; }
+/* Individual bar buttons hide per the bar's mode (viewing shows Submit/Dismiss; summary shows
+   Resume). main.ts (refreshReviewBar via applyReviewBarState) is the sole writer of these. */
+.review-bar-actions .rb-btn.hidden { display: none; }
+/* #review-clear in its "click again to confirm" armed state — accent-tinted so the second-click
+   confirmation step is visible (window.confirm is a no-op in Tauri v2 WKWebView; same pattern as
+   the hook buttons' .confirming above). */
+.review-bar-actions .rb-btn.confirming {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+.review-bar-actions .rb-approve {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.review-bar-actions .rb-approve:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 
 /* rich markdown typography (used for real in Sub-Plan 02) */
 .md { font-size: var(--reading-font-size); line-height: 1.62; color: var(--text); }
