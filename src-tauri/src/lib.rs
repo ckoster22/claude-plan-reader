@@ -1876,8 +1876,8 @@ mod tests {
 
     #[test]
     fn subagent_transcript_resolves_from_its_own_file() {
-        let hex = "acea1c41bbc02c040";
-        let stem = format!("merry-baking-hammock-agent-{hex}");
+        let hex = "0000000000000002";
+        let stem = format!("gentle-waving-maple-agent-{hex}");
         let root = unique_dir("resC");
         // No top-level <session>.jsonl exists for this stem — only the subagent file does.
         // The subagent file carries its OWN cwd and a Write match for the stem.
@@ -1886,7 +1886,7 @@ mod tests {
             "someproj",
             "parent-session",
             hex,
-            &[write_tool_line("/Users/me/.hermes", &stem)],
+            &[write_tool_line("/Users/me/.example-project", &stem)],
         );
 
         let root2 = projects_for(&root);
@@ -1894,7 +1894,7 @@ mod tests {
         let out = resolve_stems(&[stem.clone()], &transcripts);
         assert_eq!(
             out.get(&stem).cloned().flatten(),
-            Some("/Users/me/.hermes".to_string()),
+            Some("/Users/me/.example-project".to_string()),
             "a subagent plan must resolve from its own subagents/agent-<hex>.jsonl"
         );
 
