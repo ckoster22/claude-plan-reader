@@ -275,11 +275,11 @@ encoded dir name is not.
 
 ### Verified invariants (the spike asserts all four)
 
-- **(a)** All real sample stems resolve to a `cwd` (incl. `dynamic-forging-yao`,
-  `async-popping-acorn`, `velvet-floating-hellman` via authoritative `plan_mode`
+- **(a)** All real sample stems resolve to a `cwd` (incl. `quiet-rolling-cedar`,
+  `calm-spinning-birch`, `amber-drifting-pine` via authoritative `plan_mode`
   attachment, and the subagent plan via the `Write` `file_path` fallback).
 - **(b) Subagent transcripts are self-sufficient.** The `*-agent-<hex>.md` sample
-  (`merry-baking-hammock-agent-acea1c41bbc02c040`) resolves **inside its own
+  (`gentle-waving-maple-agent-0000000000000002`) resolves **inside its own
   `…/subagents/agent-<hex>.jsonl`**, which carries its own top-level `cwd`. The parent
   `<session>.jsonl` may not exist on disk. So **descending into `subagents/` is
   necessary, and 03 MUST NOT depend on walking up to a parent session.** The agent file's
@@ -295,18 +295,18 @@ encoded dir name is not.
 ```
 Scanned 2870 transcript files (231 top-level sessions, 2639 subagent transcripts).
 
-  RESOLVED  dynamic-forging-yao
-            cwd        = /Users/charliekoster/Documents/repos/scratch/nuke
+  RESOLVED  quiet-rolling-cedar
+            cwd        = /Users/u/repos/scratch/alpha
             provenance = Some(PlanModeAttachment)   isSubAgent = Some(false)
-  RESOLVED  async-popping-acorn
-            cwd        = /Users/charliekoster/Documents/repos/scratch
+  RESOLVED  calm-spinning-birch
+            cwd        = /Users/u/repos/scratch
             provenance = Some(PlanModeAttachment)   isSubAgent = Some(false)
-  RESOLVED  velvet-floating-hellman
-            cwd        = /Users/charliekoster/Documents/repos/plan-tree-scratch/helicopter
+  RESOLVED  amber-drifting-pine
+            cwd        = /Users/u/repos/plan-tree-scratch/beta
             provenance = Some(PlanModeAttachment)   isSubAgent = Some(false)
-  RESOLVED  merry-baking-hammock-agent-acea1c41bbc02c040
-            cwd        = /Users/charliekoster/.hermes
-            provenance = Some(WriteFilePath)   source = …/subagents/agent-acea1c41bbc02c040.jsonl
+  RESOLVED  gentle-waving-maple-agent-0000000000000002
+            cwd        = /Users/u/.example-project
+            provenance = Some(WriteFilePath)   source = …/subagents/agent-0000000000000002.jsonl
             [invariant b] resolved inside subagents/ transcript (self-sufficient)
 
   totally-fake-nonexistent-plan-zzz-9999 -> None (PASS)

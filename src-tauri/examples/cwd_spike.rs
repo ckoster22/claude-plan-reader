@@ -235,10 +235,10 @@ fn main() {
 
     // Real sample stems — INCLUDING at least one *-agent-<hex> subagent plan.
     let real_samples = [
-        "dynamic-forging-yao",                            // regular, Write + plan_mode
-        "async-popping-acorn",                            // regular
-        "velvet-floating-hellman",                        // regular
-        "merry-baking-hammock-agent-acea1c41bbc02c040",   // SUBAGENT plan (parent may be absent)
+        "quiet-rolling-cedar",                            // regular, Write + plan_mode
+        "calm-spinning-birch",                            // regular
+        "amber-drifting-pine",                            // regular
+        "gentle-waving-maple-agent-0000000000000002",     // SUBAGENT plan (parent may be absent)
     ];
     // Falsifiability: a deliberately fake stem MUST resolve to None.
     let fake_stem = "totally-fake-nonexistent-plan-zzz-9999";

@@ -3249,8 +3249,8 @@ mod tests {
 
     #[test]
     fn subagent_transcript_resolves_from_its_own_file() {
-        let hex = "acea1c41bbc02c040";
-        let stem = format!("merry-baking-hammock-agent-{hex}");
+        let hex = "0000000000000002";
+        let stem = format!("gentle-waving-maple-agent-{hex}");
         let root = unique_dir("resC");
         // No top-level <session>.jsonl exists for this stem — only the subagent file does.
         // The subagent file carries its OWN cwd and a Write match for the stem.
@@ -3259,7 +3259,7 @@ mod tests {
             "someproj",
             "parent-session",
             hex,
-            &[write_tool_line("/Users/me/.hermes", &stem)],
+            &[write_tool_line("/Users/me/.example-project", &stem)],
         );
 
         let root2 = projects_for(&root);
@@ -3267,7 +3267,7 @@ mod tests {
         let out = resolve_stems(&[stem.clone()], &transcripts);
         assert_eq!(
             out.get(&stem).cloned().flatten(),
-            Some("/Users/me/.hermes".to_string()),
+            Some("/Users/me/.example-project".to_string()),
             "a subagent plan must resolve from its own subagents/agent-<hex>.jsonl"
         );
 
@@ -4060,10 +4060,10 @@ mod tests {
             schema: REVIEW_SCHEMA,
             review_id: "05ff0135-1e19-4617-b843-4c24acb5dd64-1717100000000000000-ab12".to_string(),
             session_id: "session-abc".to_string(),
-            cwd: "/Users/charliekoster/Documents/repos/claude-plan-reader".to_string(),
-            transcript_path: "/Users/charliekoster/.claude/projects/x/session.jsonl".to_string(),
+            cwd: "/Users/me/Documents/repos/claude-plan-reader".to_string(),
+            transcript_path: "/Users/me/.claude/projects/x/session.jsonl".to_string(),
             plan_text: "# Plan\n\nDo the thing.".to_string(),
-            plan_file_path: "/Users/charliekoster/.claude/plans/do-the-thing.md".to_string(),
+            plan_file_path: "/Users/me/.claude/plans/do-the-thing.md".to_string(),
             created_ms: 1_717_100_000_000,
         }
     }
@@ -4266,7 +4266,7 @@ mod tests {
             "permissions": { "defaultMode": "auto" },
             "hooks": {
                 "PreToolUse": [
-                    { "matcher": "Bash", "hooks": [ { "type": "command", "command": "python3 /Users/charliekoster/.claude/hooks/claude_permission_hook.py", "timeout": 5000 } ] }
+                    { "matcher": "Bash", "hooks": [ { "type": "command", "command": "python3 /Users/me/.claude/hooks/claude_permission_hook.py", "timeout": 5000 } ] }
                 ],
                 "PostToolUse": [
                     { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": "~/.claude/scripts/plan-tree-save-plan.sh", "timeout": 5000 } ] }
@@ -4283,7 +4283,7 @@ mod tests {
         })
     }
 
-    const TEST_HOOK_CMD: &str = "/Users/charliekoster/.claude/plan-reader/hook.sh";
+    const TEST_HOOK_CMD: &str = "/Users/me/.claude/plan-reader/hook.sh";
 
     /// Locate the ExitPlanMode element within hooks.PreToolUse, if present.
     fn find_exit_plan_mode(settings: &Value) -> Option<&Value> {

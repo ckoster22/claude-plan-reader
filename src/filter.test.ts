@@ -40,10 +40,10 @@ describe("matchesQuery — OR over title / cwd / h1s", () => {
       absolute_path: "/p/x.md",
       filename_stem: "x",
       flavor: "standalone",
-      cwd: "~/repos/docusketch/imaging",
+      cwd: "~/repos/acme/widgets",
     });
-    expect(matchesQuery(r, "imaging")).toBe(true);
-    expect(matchesQuery(r, "estimating")).toBe(false);
+    expect(matchesQuery(r, "widgets")).toBe(true);
+    expect(matchesQuery(r, "gadgets")).toBe(false);
   });
 
   it("matches on an H1 HEADING (heading-only haystack)", () => {
@@ -99,14 +99,14 @@ describe("filterRecords — basic filtering", () => {
         filename_stem: "opaque-stem",
         flavor: "standalone",
         cwd: "~/repos/a",
-        h1s: ["Insurance estimate mapper"],
+        h1s: ["Widget config mapper"],
       }),
     ];
-    const out = filterRecords(recs, "estimate");
+    const out = filterRecords(recs, "config");
     expect(out).toHaveLength(1);
     // Falsifiability: with the h1s dropped, the heading-only query filters the row OUT.
     const recsNoH1 = [{ ...recs[0], h1s: [] as string[] }];
-    expect(filterRecords(recsNoH1, "estimate")).toHaveLength(0);
+    expect(filterRecords(recsNoH1, "config")).toHaveLength(0);
   });
 });
 
