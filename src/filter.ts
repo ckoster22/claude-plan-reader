@@ -27,10 +27,71 @@ export function matchesQuery(record: PlanRecord, query: string): boolean {
   return false;
 }
 
-// Filter the mtime-ordered record stream: keep each record iff it matches the query. An empty
-// query keeps every record (matchesQuery returns true for all).
+// Filter the pre-ordered record stream, PRESERVING the master→sub nesting so a matched sub is
+// never orphaned. The flat `records` array is the display-ordered stream from `list_plans`:
+// each master (flavor "master" with child_count >= 1) is IMMEDIATELY followed by its subs
+// (flavor "sub"), then standalones / 0-child masters render flat (see CONTRACT.md
+// §"Pre-ordering guarantee"). We walk it as groups:
+//   - a master group = the master record + the run of "sub" records that follow it;
+//   - any other record (standalone, or a 0-child master) is its own single-record group.
+// Inclusion rules:
+//   - standalone/flat: included iff it matches.
+//   - master group: if the MASTER matches ⇒ keep the master AND all its subs (the block renders
+//     intact, "subs may follow"). Else if ANY sub matches ⇒ keep the master (so the matched sub
+//     keeps its parent — never an orphan) plus the matching subs AND every ANCESTOR prefix row of
+//     each match (dotted trees: a matching "02.01.03" retains "02" and "02.01" too — the sidebar's
+//     prefix-stack walk would otherwise log the survivor as a LOUD orphan and render it flat).
+//     Else ⇒ drop the whole group.
+// An empty query keeps every record (matchesQuery returns true for all).
 export function filterRecords(records: PlanRecord[], query: string): PlanRecord[] {
-  return records.filter((r) => matchesQuery(r, query));
+  const out: PlanRecord[] = [];
+  let i = 0;
+  while (i < records.length) {
+    const rec = records[i];
+    const isExpandableMaster = rec.flavor === "master" && (rec.child_count ?? 0) >= 1;
+
+    if (!isExpandableMaster) {
+      // Standalone or 0-child (flat) master: a single-record group.
+      if (matchesQuery(rec, query)) out.push(rec);
+      i += 1;
+      continue;
+    }
+
+    // Master group: gather the contiguous run of subs following this master.
+    const subs: PlanRecord[] = [];
+    let j = i + 1;
+    while (j < records.length && records[j].flavor === "sub") {
+      subs.push(records[j]);
+      j += 1;
+    }
+
+    const masterMatches = matchesQuery(rec, query);
+    if (masterMatches) {
+      // Master matches ⇒ keep the whole block intact.
+      out.push(rec, ...subs);
+    } else {
+      const matchedSubs = subs.filter((s) => matchesQuery(s, query));
+      if (matchedSubs.length > 0) {
+        // A sub matched ⇒ keep its master (no orphan) + the matching subs + ANCESTOR RETENTION:
+        // every sub whose dotted nn_path is a PROPER PREFIX of a match's nn_path (its parent
+        // chain), so a filtered dotted tree never orphans — the sidebar nests the survivor under
+        // its real ancestors instead of flat-rendering it loudly. Original order is preserved by
+        // re-filtering `subs` (never by pushing matches out of sequence).
+        const keep = new Set<PlanRecord>(matchedSubs);
+        for (const m of matchedSubs) {
+          if (!m.nn_path) continue; // a legacy sub with no dotted id has no representable ancestors
+          for (const s of subs) {
+            if (s.nn_path && m.nn_path.startsWith(`${s.nn_path}.`)) keep.add(s);
+          }
+        }
+        out.push(rec, ...subs.filter((s) => keep.has(s)));
+      }
+      // else: neither master nor any sub matched ⇒ drop the group entirely.
+    }
+
+    i = j;
+  }
+  return out;
 }
 
 // Set `el`'s content to `text`, wrapping the FIRST case-insensitive occurrence of `query` in a

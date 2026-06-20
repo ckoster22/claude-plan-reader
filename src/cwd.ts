@@ -1,4 +1,4 @@
-// Pure display helper for the resolved cwd subtitle.
+// Sub-Plan 03 — pure display helper for the resolved cwd subtitle.
 //
 // The resolved cwd comes back from the backend as an ABSOLUTE path. For display we collapse
 // a leading `$HOME` into `~` (the CSS `.plan-src` rule then left-truncates, keeping the tail
@@ -19,6 +19,26 @@ export function collapseHome(path: string, home: string): string {
   if (path === h) return "~";
   if (path.startsWith(h + "/")) {
     return "~" + path.slice(h.length);
+  }
+  return path;
+}
+
+/**
+ * The exact inverse of `collapseHome`: replace a leading `~` segment of `path` with `home`, so a
+ * display-collapsed cwd round-trips back to the ABSOLUTE path the Rust backend expects. Only a bare
+ * `~` or a `~/`-prefixed path is expanded (the boundary mirrors `collapseHome`); any other path —
+ * including one already absolute, or a `~user`-style prefix we never emit — is returned unchanged.
+ * Returns `path` unchanged when `home` is empty (no home to expand into).
+ *
+ * Load-bearing for the resume read path: `resolvedCwdFor` runs a record's cwd through this before
+ * handing it to `read_plan_tree_file`, which does NOT expand `~` (a `~`-path would `is_dir()`-fail).
+ */
+export function expandHome(path: string, home: string): string {
+  if (!home) return path;
+  const h = home.endsWith("/") ? home.slice(0, -1) : home;
+  if (path === "~") return h;
+  if (path.startsWith("~/")) {
+    return h + path.slice(1);
   }
   return path;
 }

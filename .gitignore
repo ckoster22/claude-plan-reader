@@ -22,5 +22,11 @@ dist-ssr
 *.sln
 *.sw?
 
-# Rust / Tauri build artifacts
-src-tauri/target
+# session scratch / local backups (not for version control)
+.plan-tree*
+
+# bun sidecar build temp artifacts
+*.bun-build
+
+# agent scratch / memory dir at repo root
+.claude/

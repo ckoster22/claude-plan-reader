@@ -22,7 +22,7 @@ import "highlight.js/styles/github-dark.css";
 export { extractToc } from "./toc";
 export type { TocEntry } from "./toc";
 
-// Highlight/comment surface. main.ts talks only to this facade for the comment
+// Sub-Plan 02 — highlight/comment surface. main.ts talks only to this facade for the comment
 // feature; all popover/highlight/anchoring logic lives behind it in `./comments`. renderInto
 // stays a pure transform (NO highlight logic added here).
 export { applyComments, initComments, onCommentCountChanged, loadCommentsFor, clearAllComments } from "./comments";

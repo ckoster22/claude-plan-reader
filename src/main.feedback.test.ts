@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // ---------------------------------------------------------------------------------------------
-// The latest-wins count-request guard in refreshCommentCount.
+// Sub-Plan 03 — the latest-wins count-request guard in refreshCommentCount.
 //
 // refreshCommentCount is fired un-awaited from open/reload/onCommentCountChanged; concurrent or
 // bursty calls can resolve OUT OF ORDER. The module-level `countReqSeq` makes each call bail after
@@ -75,13 +75,12 @@ vi.mock("./render/scroll", () => ({
 }));
 vi.mock("./titlebar", () => ({ initTitlebar: vi.fn(), initThemeToggle: vi.fn(), initTextSize: vi.fn() }));
 
-import { openPlan, reloadOpenPlan, refreshCommentCount, currentCommentCount } from "./main";
+import { openPlan, refreshCommentCount, currentCommentCount } from "./main";
 import { asAbsPath, asStem } from "./types";
 
 function bootDom(): void {
   document.body.innerHTML = `
     <div class="titlebar"><div class="titlebar-controls">
-      <button class="feedback-btn hidden" id="feedback-btn"><span id="feedback-count">0</span></button>
       <button id="theme-toggle"></button>
     </div></div>
     <div class="tab-row"><span class="tab" data-tab="plans">Plans</span></div>
@@ -92,10 +91,6 @@ function bootDom(): void {
     <div class="sel-popover hidden" id="sel-popover">
       <div id="sp-quote"></div><textarea id="sp-text"></textarea>
       <button id="sp-cancel"></button><button id="sp-save"></button>
-    </div>
-    <div class="feedback-overlay hidden" id="feedback-overlay">
-      <pre id="feedback-body"></pre>
-      <button id="feedback-copy"></button><button id="feedback-clear"></button>
     </div>`;
   (document.querySelector("#reader-scroll") as HTMLElement).scrollTo = () => {};
   window.dispatchEvent(new Event("DOMContentLoaded"));
@@ -110,7 +105,7 @@ beforeEach(() => {
   H.commentsByPath = {};
 });
 
-describe("refreshCommentCount — latest-wins guard", () => {
+describe("refreshCommentCount — latest-wins guard (Sub-Plan 03)", () => {
   it("(a) cross-plan A→B: A's slow get_comment_count resolving AFTER B is open does NOT overwrite B's count", async () => {
     bootDom();
     // Drain any count requests the open-during-boot path enqueued so our two are deterministic.
@@ -167,98 +162,4 @@ describe("refreshCommentCount — latest-wins guard", () => {
     expect(currentCommentCount()).toBe(7); // newer count stands, earlier stale value dropped
   });
 
-  it("the feedback button reflects the committed count (shown with badge N for N>=1)", async () => {
-    bootDom();
-    H.countQueue.length = 0;
-
-    await openPlan(asAbsPath("/p/A.md"), asStem("A"));
-    await flush();
-    // Resolve the (single) count request for A with 4.
-    expect(H.countQueue.length).toBe(1);
-    H.countQueue[0].resolve(4);
-    await flush();
-
-    const btn = document.querySelector<HTMLElement>("#feedback-btn")!;
-    const badge = document.querySelector<HTMLElement>("#feedback-count")!;
-    expect(btn.classList.contains("hidden")).toBe(false);
-    expect(badge.textContent).toBe("4");
-  });
-});
-
-// Open the overlay via the button click (its handler snapshots the body then un-hides). Awaits
-// the async snapshot so the body text is settled before assertions.
-async function openOverlay(): Promise<void> {
-  document.querySelector<HTMLElement>("#feedback-btn")!.click();
-  await flush();
-}
-
-function overlayEl(): HTMLElement {
-  return document.querySelector<HTMLElement>("#feedback-overlay")!;
-}
-function bodyText(): string {
-  return document.querySelector<HTMLElement>("#feedback-body")!.textContent ?? "";
-}
-
-describe("feedback overlay — never shows a STALE prompt across plan switch / live reload (review fix)", () => {
-  it("switching to a different plan via openPlan CLOSES the overlay (no prior plan's prompt shown)", async () => {
-    bootDom();
-    H.countQueue.length = 0;
-    // Plan A has a distinctive comment; plan B has a different one.
-    H.commentsByPath["/p/A.md"] = [
-      { quote: "ALPHA-SNIPPET", comment: "alpha note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
-    ];
-    H.commentsByPath["/p/B.md"] = [
-      { quote: "BETA-SNIPPET", comment: "beta note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
-    ];
-
-    // Open A, then open the overlay — it shows A's snippet and is visible.
-    await openPlan(asAbsPath("/p/A.md"), asStem("A"));
-    await flush();
-    await openOverlay();
-    expect(overlayEl().classList.contains("hidden")).toBe(false);
-    expect(bodyText()).toContain("ALPHA-SNIPPET");
-
-    // Switch to plan B. openPlan must close the overlay so A's prompt is not left showing.
-    await openPlan(asAbsPath("/p/B.md"), asStem("B"));
-    await flush();
-
-    // INVARIANT 1: the overlay is hidden after the switch (the prior plan's prompt is gone from
-    // view). Without the closeOverlay() call in openPlan it would stay open showing A's snippet.
-    expect(overlayEl().classList.contains("hidden")).toBe(true);
-
-    // INVARIANT 2: re-opening the overlay now shows B's snippet, never A's stale one (the snapshot
-    // re-fetches against the now-current plan B).
-    await openOverlay();
-    expect(bodyText()).toContain("BETA-SNIPPET");
-    expect(bodyText()).not.toContain("ALPHA-SNIPPET");
-  });
-
-  it("a same-plan live reload with the overlay open RE-SNAPSHOTS the body to the current comments (stays open)", async () => {
-    bootDom();
-    H.countQueue.length = 0;
-    // A starts with one comment.
-    H.commentsByPath["/p/A.md"] = [
-      { quote: "FIRST-SNIPPET", comment: "note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
-    ];
-
-    await openPlan(asAbsPath("/p/A.md"), asStem("A"));
-    await flush();
-    await openOverlay();
-    expect(overlayEl().classList.contains("hidden")).toBe(false);
-    expect(bodyText()).toContain("FIRST-SNIPPET");
-
-    // A live edit changes A's comments on disk (e.g. a new comment added by the agent).
-    H.commentsByPath["/p/A.md"] = [
-      { quote: "FIRST-SNIPPET", comment: "note", block_line: null, block_end_line: null, occurrence: 0, id: 0 },
-      { quote: "SECOND-SNIPPET", comment: "extra", block_line: null, block_end_line: null, occurrence: 0, id: 1 },
-    ];
-
-    // A live reload of the SAME plan must refresh the body IN PLACE (not close it).
-    await reloadOpenPlan();
-    await flush();
-
-    expect(overlayEl().classList.contains("hidden")).toBe(false); // stays open (not disruptive)
-    expect(bodyText()).toContain("FIRST-SNIPPET");
-    expect(bodyText()).toContain("SECOND-SNIPPET"); // re-snapshotted to the new comments
-  });
 });

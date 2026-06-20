@@ -510,9 +510,9 @@ describe("loadCommentsFor", () => {
 });
 
 // ============================================================================================
-// facade clearAllComments (remove every highlight + wipe the cache, fire onChange)
+// Sub-Plan 03 — facade clearAllComments (remove every highlight + wipe the cache, fire onChange)
 // ============================================================================================
-describe("clearAllComments — wipes all highlights + cache + fires onChange", () => {
+describe("clearAllComments — wipes all highlights + cache + fires onChange (Sub-Plan 03)", () => {
   it("after clearAllComments the pane has zero .cmt-hl spans, the cache is [], and onChange fired", async () => {
     // A pane with TWO committed comments in two separate blocks. The clear-all sweep must remove
     // EVERY highlight (iterating the cached record ids), not just one — so two distinct comments is

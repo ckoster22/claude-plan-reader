@@ -1,4 +1,4 @@
-// Highlight + comment with quoted-text anchoring + persistence.
+// Sub-Plan 02 — highlight + comment with quoted-text anchoring + persistence.
 //
 // This module is the ENTIRE highlight/comment/popover domain. It lives BEHIND the render
 // facade (src/render/index.ts re-exports its public surface) so main.ts never reaches into
@@ -458,7 +458,7 @@ export function initComments(
     }
   }
 
-  // ---- Clear ALL comments for a plan (the feedback overlay's "Clear" action) ----
+  // ---- Clear ALL comments for a plan (Sub-Plan 03 feedback overlay's "Clear" action) ----
   // Remove EVERY highlight span by iterating the CACHED record ids and calling clearHighlight for
   // each — this MUST happen BEFORE clearing the cache, because io.clearAll returns [] (the ids are
   // only known from the cache). Then clearAll on the backend, adopt the returned [] into the cache,
