@@ -183,12 +183,23 @@ const prototypePreToolUseHook = createPrototypePreToolUseHook(
 // export surface (test seam) is preserved by re-exporting the same locals.
 import { buildUserContent, injectTokens, toImageBlock } from "./user-content";
 export { buildUserContent, injectTokens, toImageBlock };
-export type { InboundImage, ContentBlock } from "./user-content";
+// `import type` (NOT a pure `export type ... from`) so `InboundImage`/`ContentBlock`
+// are REAL local type bindings usable below; re-exported separately to preserve the
+// public test-seam surface.
+import type { InboundImage, ContentBlock } from "./user-content";
+export type { InboundImage, ContentBlock };
 
 function liftUserMessage(text: string, images?: InboundImage[]): SDKUserMessage {
+  // `buildUserContent` returns the generic `string | ContentBlock[]` shape (each
+  // block matches the SDK's RESPONSE `ContentBlock`); `SDKUserMessage.message.content`
+  // wants the INPUT `string | ContentBlockParam[]`. The runtime image objects ARE
+  // valid `ImageBlockParam`s (type:"image" + base64 source) — only `media_type` is a
+  // plain `string` rather than the SDK's literal union, so we annotate at this seam
+  // (no runtime change) to the SDK input content type.
+  const content = buildUserContent(text, images) as SDKUserMessage["message"]["content"];
   return {
     type: "user",
-    message: { role: "user", content: buildUserContent(text, images) },
+    message: { role: "user", content },
     parent_tool_use_id: null,
   };
 }
