@@ -4053,3 +4053,52 @@ live AND post-end-resume success branches. The composer first turn — which sen
 (NOT the wrapper) + the display URLs as a user bubble, **GATED on images-present**: a text-only
 composer start echoes NO first-turn bubble (unchanged behavior). Both echoes fire only on a
 successful send (no orphan bubble on failure).
+
+## Addendum 2026-06-20 — doc-audit reconciliation (additive; nothing above is changed or removed)
+
+This addendum records a full re-audit of the documented surface against the code on the
+`agent-sdk` branch. **No prior section was rewritten, reordered, or deleted.** Every command and
+event documented above still exists and is still registered. Two items existed in the code but were
+never documented in a prior section; they are added here.
+
+### Command present in code but previously undocumented: `diag_log`
+
+```
+diag_log(msg: String)
+```
+
+Registered in `tauri::generate_handler![…]` (`src-tauri/src/lib.rs`). A fire-and-forget diagnostic
+sink: it takes a single `msg` string and writes `[fe:diag] <msg>` to the backend's stderr
+(`eprintln!`). No return value, no state, no event. The frontend calls it via
+`invoke("diag_log", { msg })` to surface front-end diagnostics in the dev terminal (used by
+`src/conversation/diag.ts`). It reads/writes no files and touches no managed state.
+
+### DOM selector present in code but previously undocumented: `#conversation-attach-row`
+
+The multimodal-image addendum above documents `#conversation-attach`, `#conversation-attachments`,
+`#conversation-file-input`, and `#conversation-attach-error`, but not their wrapper:
+
+| Selector | Role |
+|----------|------|
+| `#conversation-attach-row` | `<div class="conv-attach-row">` in `index.html` — the row container that groups the in-conversation attach button + chip strip beneath the message composer. Purely structural (layout container for the already-documented attach controls). |
+
+### Verified-still-current inventory (no change required)
+
+For the record, the following were confirmed present and correctly documented:
+
+- **Commands** (40, all registered in `invoke_handler`): `list_plans`, `read_plan_contents`,
+  `read_image_as_data_url`, `diag_log` (see above), `set_open_plan`, `mark_viewed`, `resolve_cwds`,
+  `read_plan_transcript`, `set_tree_collapsed`, `get_comments`, `get_comment_count`, `set_comments`,
+  `clear_comments`, `list_pending_reviews`, `read_review_plan`, `respond_to_review`,
+  `write_agent_plan`, `plan_tree::write_plan_tree_file`, `plan_tree::read_plan_tree_file`,
+  `plan_tree::delete_plan_tree_file`, `plan_tree::reset_plan_tree_dir`,
+  `plan_tree::ensure_prototype_dir`, `plan_tree::open_prototype`, `plan_tree::ensure_baseline_dir`,
+  `plan_tree::freeze_baseline`, `plan_tree::open_baseline`, `focus_main_window`, `install_hook`,
+  `uninstall_hook`, `hook_status`, and the eight Agent-SDK driver commands
+  (`agent::start_agent_session`, `agent::send_agent_message`, `agent::resolve_tool_permission`,
+  `agent::set_agent_permission_mode`, `agent::cancel_agent_run`, `agent::end_agent_session`,
+  `agent::agent_auth_status`, `agent::set_agent_oauth_token`).
+- **Events** (8): `plan-changed` (plans-dir watcher), `plan-review-requested` /
+  `plan-review-cancelled` (control-dir watcher over `~/.claude/plan-reader/requests/`),
+  `agent-stream`, `agent-error`, `agent-exit`, `tool-permission-requested`, `agent-auth-required`
+  (Agent-SDK driver, `src-tauri/src/agent.rs`).

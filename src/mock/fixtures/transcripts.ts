@@ -30,9 +30,9 @@ import { NODES_TITLES, NESTED_TREE_ID } from "./nested";
 
 // The real cwd + session id captured from the source transcript's first records (the file these
 // lines were sliced from: projects/<encoded>/248792f6-5bc1-4d4c-b10a-03f3ceb806f6.jsonl).
-const CHOMPY_CWD = "/Users/charliekoster/Documents/repos/scratch/chompy-asteroids";
+const CHOMPY_CWD = "/Users/user/Documents/repos/scratch/chompy-asteroids";
 const CHOMPY_SESSION_ID = "248792f6-5bc1-4d4c-b10a-03f3ceb806f6";
-const CHOMPY_PATH = `/Users/charliekoster/.claude/projects/-Users-charliekoster-Documents-repos-scratch-${NESTED_TREE_ID.split("-")[0]}/${CHOMPY_SESSION_ID}.jsonl`;
+const CHOMPY_PATH = `/Users/user/.claude/projects/-Users-user-Documents-repos-scratch-${NESTED_TREE_ID.split("-")[0]}/${CHOMPY_SESSION_ID}.jsonl`;
 
 // Split the raw fixture into non-empty jsonl line strings (the exact shape parseTranscript wants:
 // raw CLI transcript record strings, one JSON object per line). A trailing newline yields no empty tail.

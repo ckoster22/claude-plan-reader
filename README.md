@@ -1,8 +1,8 @@
-# Claude Plan Reader (multiplan branch)
+# Claude Plan Reader (agent-sdk branch)
 
 A macOS desktop app that browses and live-renders [Claude Code](https://claude.com/claude-code) plan markdown files from `~/.claude/plans/`, with native rendering of nested master ▸ sub-plan trees.
 
-> **Branch note.** This is the **`multiplan`** branch — it includes the nested plan-tree sidebar (see [Plan trees](#plan-trees) below). The **[`main`](https://github.com/ckoster22/claude-plan-reader/tree/main)** branch has that feature removed for a simpler shareable build. Pick whichever you need.
+> **Branch note.** This is the **`agent-sdk`** branch — beyond the plan reader/sidebar it also *drives* Claude Code itself: a New-plan composer starts a live agent session (via a bundled `agent-driver` sidecar built on the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)) that runs the recursive multiplan orchestrator — recon → sizer → decomposition/plan gates → execute → roll-up — with an in-app review surface and an ExitPlanMode review hook (see [Driving agent sessions](#driving-agent-sessions) below). The **[`multiplan`](https://github.com/ckoster22/claude-plan-reader/tree/multiplan)** branch is the read-only reader with the nested plan-tree sidebar but no agent driver; the **[`main`](https://github.com/ckoster22/claude-plan-reader/tree/main)** branch drops the tree feature for a simpler shareable build. Pick whichever you need.
 
 When Claude Code writes a plan to disk (via `ExitPlanMode`), it lands as a markdown file in `~/.claude/plans/`. Plans can contain code blocks, mermaid diagrams, images, and links — and they're *living documents* the model edits between sessions. This app gives them a real reading surface.
 
@@ -32,6 +32,12 @@ nn: 01           # only when flavor: sub
 
 A master row with `child_count > 0` gets a disclosure twirl, an "N sub-plans" label, and indented children that share its `tree_id`. Collapse state is persisted in app data as `collapse-state.json` and survives restarts. Plans without the marker render as flat standalone rows. The frontmatter grammar above is what the `/multiplan` skill in Claude Code writes — but the app cares only about the marker shape, so any plan files matching it render as a tree.
 
+## Driving agent sessions
+
+This branch is also a Claude Code *driver*, not just a reader. Clicking **New plan** opens a composer (pick a working directory + type a request), which starts a live agent session through a bundled `agent-driver` sidecar process (Node, built on the Claude Agent SDK). The session runs the **recursive multiplan orchestrator**: every plan node — the root included — runs the same algorithm (recon → sizer → split-into-children or stay-a-leaf), holds each decomposition/plan at a **gate** for your approval, executes approved leaves, runs a no-tools **parent review** between siblings, and writes roll-up summaries. Per-node planning state lives in `<cwd>/.plan-tree/`; the agent's own plans are written into `~/.claude/plans/` (frontmatter-tagged for the tree sidebar). A persistent review bar handles ExitPlanMode plan review, visual-prototype review, and forced-acceptance review; an installable ExitPlanMode hook routes CLI plans through the same surface.
+
+`docs/flow-visualizer.html` is a standalone, animated diagram of this recursive node algorithm and the session lifecycle — open it in any browser.
+
 ## Requirements
 
 - **macOS** (Apple Silicon or Intel). Packaged for macOS only.
@@ -46,10 +52,12 @@ Tauri's other system prerequisites come in via the `@tauri-apps/cli` npm dep; yo
 ```sh
 git clone https://github.com/ckoster22/claude-plan-reader.git
 cd claude-plan-reader
-git checkout multiplan
+git checkout agent-sdk
 npm install
 npm run tauri dev
 ```
+
+`npm run tauri dev` / `tauri build` automatically run `npm run build:sidecar` first (`beforeDevCommand` / `beforeBuildCommand`), which bundles the `agent-driver` sidecar into `src-tauri/binaries/` so live agent sessions work; you don't need to build it by hand.
 
 The first cold launch downloads and builds Rust dependencies — budget several minutes. Subsequent launches are fast.
 
@@ -76,6 +84,8 @@ bash scripts/install.sh
 | `cd src-tauri && cargo test --lib`   | Rust backend unit tests.                       |
 | `npm run tauri dev`                  | Run the app with hot reload.                   |
 | `npm run tauri build`                | Build a distributable `.app` / `.dmg`.         |
+| `npm run build:sidecar`              | Build the `agent-driver` sidecar binary (run automatically by `tauri dev`/`build`). |
+| `npm run mock`                       | Token-free visual harness in a browser (`http://localhost:1421`). |
 
 The DOM selector contract and the Tauri command/event surface (including the nested-hierarchy `PlanRecord` fields and the `set_tree_collapsed` command) are documented in [`CONTRACT.md`](CONTRACT.md).
 
