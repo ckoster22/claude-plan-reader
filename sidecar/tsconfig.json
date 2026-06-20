@@ -1,0 +1,21 @@
+{
+  // Standalone typecheck for the Agent SDK sidecar. The root tsconfig
+  // (`"include": ["src"]`) does NOT cover this dir, so the frontend `npx tsc
+  // --noEmit` pass is unaffected by the SDK types. Run separately with:
+  //   npx tsc -p sidecar/tsconfig.json --noEmit
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // `with { type: "file" }` import attributes are an ESNext feature; bundler
+    // resolution + skipLibCheck keep the deep Anthropic beta `.d.ts` tree quiet.
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["index.ts", "permissions.ts", "env-overrides.ts"]
+}

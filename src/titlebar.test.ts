@@ -1,0 +1,453 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import {
+  wireTitlebar,
+  initThemeToggle,
+  THEME_KEY,
+  nextTextSize,
+  TEXT_SIZE_LADDER,
+  initTextSize,
+  TEXT_SIZE_KEY,
+  DEFAULT_TEXT_SIZE,
+} from "./titlebar";
+
+// Window-drag regression guard.
+//
+// The custom macOS native-overlay titlebar (titleBarStyle:"Overlay") relies on
+// `data-tauri-drag-region` to move the window. Tauri v2 only initiates a drag
+// when the mousedown event's TARGET is the element carrying that attribute — it
+// does NOT walk up the ancestor chain. The titlebar now hosts a genuinely
+// interactive control (the theme toggle) inside `.titlebar-controls`. Because
+// that control lives INSIDE `.titlebar[data-tauri-drag-region]`, a plain
+// `closest("[data-tauri-drag-region]")` walk would (wrongly) match the ancestor
+// `.titlebar` and start a window drag — which can swallow the control's click.
+//
+// The fix is in JS: `isDragTarget` bails first when the mousedown target is, or
+// is inside, an interactive control (button/a/input/select/textarea/[data-no-drag]).
+// These tests reproduce the real chrome + the relevant CSS and assert that
+// contract. They are falsifiable: removing the interactive-target bail makes a
+// primary mousedown on the toggle wrongly call `startDragging`.
+
+// The relevant slice of src/styles.css (kept in sync with the real titlebar
+// rules). Inlined so jsdom can resolve computed styles without filesystem I/O,
+// matching the in-DOM convention used by the other DOM-touching tests.
+const TITLEBAR_CSS = `
+  .titlebar {
+    height: 44px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 14px 0 78px;
+  }
+  .titlebar-controls { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .theme-toggle { pointer-events: auto; width: 28px; height: 28px; }
+`;
+
+function mountChrome() {
+  document.head.innerHTML = "";
+  document.body.innerHTML = "";
+  const style = document.createElement("style");
+  style.textContent = TITLEBAR_CSS;
+  document.head.appendChild(style);
+
+  // Mirror index.html's titlebar subtree exactly.
+  const titlebar = document.createElement("div");
+  titlebar.className = "titlebar";
+  titlebar.setAttribute("data-tauri-drag-region", "");
+  titlebar.innerHTML = `
+    <div class="titlebar-controls">
+      <button class="theme-toggle" id="theme-toggle" type="button"
+              title="Toggle dark / light theme" aria-label="Toggle dark / light theme">
+        <span class="ico" id="theme-icon">&#9789;</span>
+      </button>
+    </div>`;
+  document.body.appendChild(titlebar);
+  return titlebar;
+}
+
+beforeEach(() => {
+  document.head.innerHTML = "";
+  document.body.innerHTML = "";
+  document.documentElement.removeAttribute("data-theme");
+});
+
+describe("titlebar drag-region contract", () => {
+  it("the titlebar carries data-tauri-drag-region and is pointer-interactive", () => {
+    const titlebar = mountChrome();
+    expect(titlebar.hasAttribute("data-tauri-drag-region")).toBe(true);
+    expect(getComputedStyle(titlebar).pointerEvents).not.toBe("none");
+  });
+
+  it("the theme toggle stays pointer-interactive and is NOT itself a drag region", () => {
+    mountChrome();
+    const toggle = document.querySelector<HTMLElement>("#theme-toggle")!;
+    // Interactive controls in the slot keep pointer-events:auto (so they can be
+    // clicked) — they are NOT made pointer-transparent.
+    expect(getComputedStyle(toggle).pointerEvents).toBe("auto");
+    // The control must NOT carry the drag attribute itself (drag exclusion is
+    // handled by isDragTarget's interactive-target bail, not the attribute).
+    expect(toggle.hasAttribute("data-tauri-drag-region")).toBe(false);
+  });
+});
+
+// Explicit JS wiring guard.
+//
+// `data-tauri-drag-region` alone proved insufficient: the underlying
+// `startDragging` window command is gated behind the
+// `core:window:allow-start-dragging` capability, and without it the attribute
+// silently no-ops. As a robustness layer (and to restore native
+// double-click-to-zoom), wireTitlebar() attaches explicit handlers:
+//   - mousedown (primary button, target inside a drag region) -> startDragging
+//   - dblclick (target inside a drag region) -> toggleMaximize
+// Interactive controls (the theme toggle) must be left alone so they keep their
+// own click behavior — and so the OS traffic lights are untouched.
+describe("titlebar JS wiring (drag + zoom)", () => {
+  function fakeWindow() {
+    return {
+      startDragging: vi.fn().mockResolvedValue(undefined),
+      toggleMaximize: vi.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  it("primary-button mousedown on the drag region (bar whitespace) starts a window drag", () => {
+    const titlebar = mountChrome();
+    const win = fakeWindow();
+    wireTitlebar(titlebar, win);
+
+    // mousedown directly on .titlebar (the bar whitespace) is a genuine drag.
+    titlebar.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, buttons: 1 }));
+    expect(win.startDragging).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-primary-button mousedown does NOT start a drag", () => {
+    const titlebar = mountChrome();
+    const win = fakeWindow();
+    wireTitlebar(titlebar, win);
+
+    // Right button (buttons bitmask = 2) must not hijack into a drag.
+    titlebar.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, buttons: 2 }));
+    expect(win.startDragging).not.toHaveBeenCalled();
+  });
+
+  it("primary-button mousedown on the #theme-toggle does NOT start a drag (drag attribute intact)", () => {
+    const titlebar = mountChrome();
+    const win = fakeWindow();
+    wireTitlebar(titlebar, win);
+
+    // The toggle lives INSIDE .titlebar[data-tauri-drag-region] — we do NOT
+    // strip the attribute. closest() would match .titlebar regardless, so the
+    // ONLY thing keeping this from starting a drag is isDragTarget's
+    // interactive-target bail. This is the meaningful falsifiable guard.
+    const toggle = document.querySelector<HTMLElement>("#theme-toggle")!;
+    toggle.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, buttons: 1 }));
+    expect(win.startDragging).not.toHaveBeenCalled();
+  });
+
+  it("primary-button mousedown on a child INSIDE the toggle (the icon) also does NOT start a drag", () => {
+    const titlebar = mountChrome();
+    const win = fakeWindow();
+    wireTitlebar(titlebar, win);
+
+    // closest("button, …") must catch a descendant of the button too.
+    const icon = document.querySelector<HTMLElement>("#theme-icon")!;
+    icon.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, buttons: 1 }));
+    expect(win.startDragging).not.toHaveBeenCalled();
+  });
+
+  it("double-click on the drag region toggles maximize (native zoom)", () => {
+    const titlebar = mountChrome();
+    const win = fakeWindow();
+    wireTitlebar(titlebar, win);
+
+    titlebar.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    expect(win.toggleMaximize).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Theme-toggle behavior.
+//
+// initThemeToggle is pure & dependency-injected: a fake `root` element + fake
+// `storage` let us assert the token-swap (data-theme), persistence, and icon
+// updates without touching real localStorage or the live document element.
+// Sun = &#9788; (decodes to ☼, shown in dark mode), moon = &#9789; (decodes to
+// ☽, shown in light mode) — the prototype's exact entity mapping.
+const ICON_SUN = "☼";
+const ICON_MOON = "☽";
+
+describe("initThemeToggle behavior", () => {
+  function setup(initialDark = false) {
+    const root = document.createElement("html");
+    if (initialDark) root.dataset.theme = "dark";
+    const button = document.createElement("button");
+    const icon = document.createElement("span");
+    button.appendChild(icon);
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: vi.fn((k: string, v: string) => {
+        store.set(k, v);
+      }),
+    };
+    return { root, button, icon, storage, store };
+  }
+
+  // The icon glyph is set via innerHTML with an HTML entity; jsdom decodes it,
+  // so we compare the decoded character.
+  const iconChar = (el: Element) => el.textContent;
+
+  it("no-op when button is null (does not throw)", () => {
+    const { root, storage } = setup();
+    expect(() => initThemeToggle(null, root, storage)).not.toThrow();
+  });
+
+  it("paints the MOON icon at init when the root is light (no data-theme)", () => {
+    const { root, button, icon, storage } = setup(false);
+    initThemeToggle(button, root, storage, icon);
+    expect(iconChar(icon)).toBe(ICON_MOON);
+  });
+
+  it("paints the SUN icon at init when the root is pre-set to dark (mirrors the inline-script read path)", () => {
+    const { root, button, icon, storage } = setup(true);
+    initThemeToggle(button, root, storage, icon);
+    expect(iconChar(icon)).toBe(ICON_SUN);
+  });
+
+  it("clicking from light flips root to dark, persists 'dark', and paints the sun", () => {
+    const { root, button, icon, storage } = setup(false);
+    initThemeToggle(button, root, storage, icon);
+
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    // token-swap
+    expect(root.dataset.theme).toBe("dark");
+    // persistence
+    expect(storage.setItem).toHaveBeenCalledWith(THEME_KEY, "dark");
+    // icon update
+    expect(iconChar(icon)).toBe(ICON_SUN);
+  });
+
+  it("clicking from dark flips root to light (attribute removed), persists 'light', and paints the moon", () => {
+    const { root, button, icon, storage } = setup(true);
+    initThemeToggle(button, root, storage, icon);
+
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    // token-swap: dark → light removes the attribute entirely (light is default)
+    expect(root.dataset.theme).toBeUndefined();
+    expect(root.hasAttribute("data-theme")).toBe(false);
+    // persistence
+    expect(storage.setItem).toHaveBeenCalledWith(THEME_KEY, "light");
+    // icon update
+    expect(iconChar(icon)).toBe(ICON_MOON);
+  });
+
+  it("two clicks round-trip: light → dark → light, with both writes persisted", () => {
+    const { root, button, icon, storage } = setup(false);
+    initThemeToggle(button, root, storage, icon);
+
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(root.dataset.theme).toBe("dark");
+
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(root.hasAttribute("data-theme")).toBe(false);
+    expect(iconChar(icon)).toBe(ICON_MOON);
+
+    expect(storage.setItem).toHaveBeenNthCalledWith(1, THEME_KEY, "dark");
+    expect(storage.setItem).toHaveBeenNthCalledWith(2, THEME_KEY, "light");
+  });
+});
+
+// Reading-pane text-size ladder.
+//
+// nextTextSize is the pure core of the A−/A+ steppers: it must move EXACTLY one
+// rung per call along [13,14,15,17,19,21], clamp at both ends, and NEVER return a
+// value outside the ladder (even for off-ladder input). The test is falsifiable:
+// breaking the clamp (e.g. not bounding the index) makes the boundary assertions
+// go red.
+describe("nextTextSize steps and clamps", () => {
+  it("test_nextTextSize_steps_and_clamps", () => {
+    const ladder = [...TEXT_SIZE_LADDER];
+
+    // Moves exactly one rung UP per call across the whole ladder.
+    for (let i = 0; i < ladder.length - 1; i++) {
+      expect(nextTextSize(ladder[i], 1)).toBe(ladder[i + 1]);
+    }
+    // Moves exactly one rung DOWN per call across the whole ladder.
+    for (let i = ladder.length - 1; i > 0; i--) {
+      expect(nextTextSize(ladder[i], -1)).toBe(ladder[i - 1]);
+    }
+
+    // Clamps at the ceiling (21, dir +1) and the floor (13, dir -1).
+    const max = ladder[ladder.length - 1];
+    const min = ladder[0];
+    expect(nextTextSize(max, 1)).toBe(max);
+    expect(nextTextSize(min, -1)).toBe(min);
+
+    // Never returns an off-ladder value — including for off-ladder / out-of-range
+    // input (snaps to nearest rung, then steps, then clamps).
+    const probes: Array<[number, 1 | -1]> = [
+      [0, -1], [0, 1], [100, 1], [100, -1],
+      [16, 1], [16, -1], [13.4, -1], [20, 1], [-5, -1],
+    ];
+    for (const [px, dir] of probes) {
+      expect(ladder).toContain(nextTextSize(px, dir));
+    }
+    // Spot-check the snap-then-step semantics: 16 is between 15 and 17; nearest
+    // rung is 15 (or 17 — both equidistant, first-wins picks 15), so +1 → 17.
+    expect(nextTextSize(16, 1)).toBe(17);
+    // 13.4 snaps to 13, then -1 clamps at the floor 13.
+    expect(nextTextSize(13.4, -1)).toBe(13);
+    // Way above the ceiling snaps to 21, then +1 clamps at 21.
+    expect(nextTextSize(100, 1)).toBe(21);
+  });
+});
+
+// initTextSize behavior (the wiring around nextTextSize). Mirrors the
+// initThemeToggle tests: pure + dependency-injected, so jsdom can pass fake
+// buttons + a fake root element + fake storage.
+//
+// INVARIANT (asserted independent of the current implementation):
+//   - A+ click RAISES --reading-font-size by exactly one ladder rung and persists it.
+//   - A− click LOWERS --reading-font-size by exactly one ladder rung and persists it.
+//   - At the ladder ceiling A+ is a no-op (no overshoot, nothing persisted); same
+//     for A− at the floor.
+//   - The persisted value (from a prior session) is RE-APPLIED to the var at init.
+//
+// These are falsifiable: if the click listeners are wired to the wrong handler
+// (e.g. dec→step(+1)) or the var is set on the wrong element / not at all, the
+// font-size assertions go red.
+describe("initTextSize behavior", () => {
+  function setup(persisted?: number) {
+    const root = document.createElement("html");
+    const decButton = document.createElement("button");
+    const incButton = document.createElement("button");
+    // The reading-pane element the var feeds. The native fix sets font-size DIRECTLY
+    // on it (WKWebView repaint quirk — see initTextSize); we assert both writes below.
+    const target = document.createElement("div");
+    const store = new Map<string, string>();
+    if (persisted !== undefined) store.set(TEXT_SIZE_KEY, String(persisted));
+    const storage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: vi.fn((k: string, v: string) => {
+        store.set(k, v);
+      }),
+    };
+    return { root, decButton, incButton, target, storage, store };
+  }
+
+  const fontPx = (root: HTMLElement) =>
+    root.style.getPropertyValue("--reading-font-size");
+
+  const click = (b: Element) =>
+    b.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+  it("applies the default size to --reading-font-size at init when nothing is persisted", () => {
+    const { root, decButton, incButton, storage, target } = setup();
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe(`${DEFAULT_TEXT_SIZE}px`);
+  });
+
+  it("re-applies the PERSISTED size to --reading-font-size at init", () => {
+    const { root, decButton, incButton, storage, target } = setup(19);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe("19px");
+  });
+
+  it("clicking A+ RAISES the var by exactly one ladder rung and persists it", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe("15px");
+
+    click(incButton);
+
+    // 15 → next rung up is 17.
+    expect(fontPx(root)).toBe("17px");
+    expect(storage.setItem).toHaveBeenCalledWith(TEXT_SIZE_KEY, "17");
+  });
+
+  it("clicking A− LOWERS the var by exactly one ladder rung and persists it", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(decButton);
+
+    // 15 → next rung down is 14.
+    expect(fontPx(root)).toBe("14px");
+    expect(storage.setItem).toHaveBeenCalledWith(TEXT_SIZE_KEY, "14");
+  });
+
+  it("A+ at the ceiling is a no-op: the var stays at the max and nothing is persisted", () => {
+    const max = TEXT_SIZE_LADDER[TEXT_SIZE_LADDER.length - 1];
+    const { root, decButton, incButton, storage, target } = setup(max);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(incButton);
+
+    expect(fontPx(root)).toBe(`${max}px`);
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  it("A− at the floor is a no-op: the var stays at the min and nothing is persisted", () => {
+    const min = TEXT_SIZE_LADDER[0];
+    const { root, decButton, incButton, storage, target } = setup(min);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(decButton);
+
+    expect(fontPx(root)).toBe(`${min}px`);
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  it("round-trips: A+ then A− returns to the starting rung", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(incButton); // 15 → 17
+    expect(fontPx(root)).toBe("17px");
+    click(decButton); // 17 → 15
+    expect(fontPx(root)).toBe("15px");
+  });
+
+  // WKWebView repaint-quirk regression guard. The native bug: changing only the :root
+  // custom property updates computed style but does NOT repaint glyphs in WebKit. The fix
+  // ALSO writes font-size directly onto the consuming reading-pane element (which DOES
+  // invalidate paint). These assert that direct write at init and on each step.
+  //
+  // FALSIFIABLE: comment out `if (target) target.style.fontSize = size + "px";` in
+  // initTextSize and these go red (the var-only assertions above still pass — which is
+  // exactly why they could not catch the native bug). jsdom/Blink cannot prove the visual
+  // repaint; this only proves the inline write is performed.
+  const inlinePx = (el: HTMLElement) => el.style.fontSize;
+
+  it("writes the persisted size DIRECTLY onto the target element's inline font-size at init", () => {
+    const { root, decButton, incButton, storage, target } = setup(19);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(inlinePx(target)).toBe("19px");
+  });
+
+  it("clicking A+ writes the new rung to BOTH the root var AND the target's inline font-size", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe("15px");
+    expect(inlinePx(target)).toBe("15px");
+
+    click(incButton);
+
+    expect(fontPx(root)).toBe("17px");
+    expect(inlinePx(target)).toBe("17px");
+  });
+
+  it("clicking A− writes the new rung to BOTH the root var AND the target's inline font-size", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(decButton);
+
+    expect(fontPx(root)).toBe("14px");
+    expect(inlinePx(target)).toBe("14px");
+  });
+
+  it("is a safe no-op when target is null (still updates the root var)", () => {
+    const { root, decButton, incButton, storage } = setup(15);
+    initTextSize(decButton, incButton, root, storage, null);
+    click(incButton);
+    expect(fontPx(root)).toBe("17px");
+  });
+});

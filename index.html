@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Plan Renderer</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script>
+      // Apply persisted theme before first paint. Key shared with src/titlebar.ts (THEME_KEY).
+      try { var t = localStorage.getItem("plan-reader-theme");
+            if (t === "dark") document.documentElement.dataset.theme = "dark"; } catch (e) {}
+      // Apply persisted reading-pane text size before first paint (no flash).
+      // Key + ladder shared with src/titlebar.ts (TEXT_SIZE_KEY / the [13,14,15,17,19,21]
+      // ladder). Validate against the ladder; default to 15 if missing/invalid.
+      try { var s = parseInt(localStorage.getItem("plan-reader-text-size"), 10);
+            if ([13, 14, 15, 17, 19, 21].indexOf(s) === -1) s = 15;
+            document.documentElement.style.setProperty("--reading-font-size", s + "px"); } catch (e) {}
+    </script>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="window" role="application" aria-label="Claude Plan Renderer">
+      <!-- title bar — macOS native-overlay style: the REAL OS traffic lights sit
+           over the top-left of this bar (see titleBarStyle:"Overlay" in
+           tauri.conf.json). The bar itself is the drag region. The
+           .titlebar-controls slot holds genuinely interactive controls (the
+           theme toggle; later sub-plans append their button + overlay as later
+           siblings here). Those controls keep pointer-events:auto and are
+           carved out of window-drag by isDragTarget() in src/titlebar.ts, which
+           bails on interactive targets — NOT by omitting the drag attribute. -->
+      <div class="titlebar" data-tauri-drag-region>
+        <div class="titlebar-controls">
+          <!-- Model & effort preset picker (Phase 2). A compact segmented control whose
+               three <button class="model-preset"> options mirror MODEL_PRESETS in
+               src/model-picker.ts (opus-4-8 / fable-5 / sonnet-4-6). Appended as the FIRST
+               child of .titlebar-controls so it sits LEFT of #text-dec / #theme-toggle.
+               The chosen preset is persisted to plan-reader-model-preset (initModelPicker,
+               src/model-picker.ts) and read at session start by the orchestrator; it applies
+               to the NEXT plan started. Like the other titlebar controls these are ordinary
+               interactive <button>s — window-drag exclusion is isDragTarget()'s
+               interactive-target bail in src/titlebar.ts, NOT a drag attribute or
+               pointer-events hack. -->
+          <div class="titlebar-model-picker"
+               title="Model & effort — applies to the next plan you start"
+               aria-label="Model & effort — applies to the next plan you start">
+            <button class="model-preset" type="button" data-preset="opus-4-8" aria-pressed="false"
+                    title="Opus 4.8" aria-label="Opus 4.8">Opus 4.8</button>
+            <button class="model-preset" type="button" data-preset="fable-5" aria-pressed="false"
+                    title="Fable 5 · low effort" aria-label="Fable 5, low effort">Fable 5</button>
+            <button class="model-preset" type="button" data-preset="sonnet-4-6" aria-pressed="false"
+                    title="Sonnet 4.6 · medium effort" aria-label="Sonnet 4.6, medium effort">Sonnet 4.6</button>
+          </div>
+          <!-- Opus effort selector (sibling of .titlebar-model-picker, NOT a child — the
+               picker has overflow:hidden + a fixed 28px height that would clip these five
+               buttons and their focus outlines). Revealed ONLY when Opus 4.8 is the active
+               preset; `hidden` (removed from layout) for fable-5 / sonnet-4-6. Each
+               <button class="effort-level"> mirrors EFFORT_LEVELS in src/model-picker.ts
+               (low / medium / high / xhigh / max). The chosen level is a single GLOBAL
+               setting persisted to plan-reader-opus-effort (initModelPicker) and read at
+               session start by the orchestrator; it applies to the NEXT Opus plan started
+               and is retained across model switches. Like the other titlebar controls these
+               are ordinary interactive <button>s — window-drag exclusion is isDragTarget()'s
+               interactive-target bail in src/titlebar.ts, NOT a drag attribute. -->
+          <div class="titlebar-effort" hidden role="group" aria-label="Opus effort level">
+            <button class="effort-level" type="button" data-effort="low"    aria-pressed="false">low</button>
+            <button class="effort-level" type="button" data-effort="medium" aria-pressed="false">medium</button>
+            <button class="effort-level" type="button" data-effort="high"   aria-pressed="false">high</button>
+            <button class="effort-level" type="button" data-effort="xhigh"  aria-pressed="false">xhigh</button>
+            <button class="effort-level" type="button" data-effort="max"    aria-pressed="false">max</button>
+          </div>
+          <!-- New-plan launcher (Sub-Plan 02). Interactive control in the .titlebar-controls
+               slot: window-drag exclusion is the isDragTarget() bail in src/titlebar.ts (the
+               <button> is not data-tauri-drag-region). #new-plan-btn opens the composer modal.
+               The SDK status pill (#sdk-status) lives in the LEFT sidebar head now — the app is
+               single-session, so the pill represents the one current run there, not the header. -->
+          <button class="conv-new-plan" id="new-plan-btn" type="button"
+                  title="Start a new in-app agent plan" aria-label="Start a new in-app agent plan">
+            <span class="ico" aria-hidden="true">+</span>
+            <span class="label">New plan</span>
+          </button>
+          <!-- In-DOM status line for review-response / save-for-review actions. Replaces window.alert
+               (a no-op in Tauri v2 WKWebView): a transient success/error message lives here.
+               main.ts toggles `.hidden` and the `.error` modifier (red) and sets textContent;
+               it auto-clears after a few seconds. Not a drag region (it is titlebar chrome but
+               carries no data-tauri-drag-region, and isDragTarget()'s interactive-control bail
+               does not apply to a <span> — so window-drag exclusion is irrelevant: a status
+               readout is not clickable). aria-live=polite announces the result to AT.
+               The former titlebar Install/Remove plan-review hook buttons were removed (the app
+               now drives Claude in-process); the install_hook/uninstall_hook/hook_status Tauri
+               commands remain backend-only. -->
+
+          <span class="hook-status hidden" id="hook-status" role="status" aria-live="polite"></span>
+          <!-- Reading-pane text-size steppers. Placed immediately BEFORE
+               #theme-toggle so the theme toggle stays far-right. Like the theme
+               toggle they are ordinary interactive <button>s: window-drag
+               exclusion is handled by isDragTarget()'s interactive-target bail in
+               src/titlebar.ts; they are excluded from the window drag region via
+               that bail, not via the drag attribute or pointer-events. They
+               step the shared --reading-font-size var through a fixed ladder
+               (initTextSize, src/titlebar.ts) and persist to plan-reader-text-size. -->
+          <button class="theme-toggle" id="text-dec" type="button"
+                  title="Decrease text size" aria-label="Decrease text size">
+            <span class="ico" aria-hidden="true">A&#8722;</span>
+          </button>
+          <button class="theme-toggle" id="text-inc" type="button"
+                  title="Increase text size" aria-label="Increase text size">
+            <span class="ico" aria-hidden="true">A+</span>
+          </button>
+          <button class="theme-toggle" id="theme-toggle" type="button"
+                  title="Toggle dark / light theme" aria-label="Toggle dark / light theme">
+            <span class="ico" id="theme-icon">&#9789;</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="body">
+        <!-- sidebar -->
+        <aside class="sidebar">
+          <!-- Tabbed left panel: Plans (default) + Contents (ToC of open plan).
+               initTabs() in main.ts toggles .active on a .tab and its matching
+               .tab-pane. The sidebar↔reading-pane boundary stays disjoint: the
+               ToC is built from a plain TocEntry[] produced by the render
+               facade (extractToc), never by querying #reading-pane here. -->
+          <div class="tab-row" role="tablist">
+            <span class="tab active" data-tab="plans" role="tab">Plans</span>
+            <span class="tab" data-tab="contents" role="tab">Contents</span>
+          </div>
+
+          <!-- Plans pane (default-active). #plan-count stays in this head — a
+               frozen contract selector; do not relocate it. -->
+          <div class="tab-pane active" id="tab-plans">
+            <div class="sidebar-head">
+              <h2>Recent Plans</h2>
+              <span class="count" id="plan-count">0 files</span>
+            </div>
+            <!-- SDK status pill (moved here from the titlebar). The app is single-session, so this
+                 reflects the ONE current run: ready / building / auth required / error (data-status
+                 drives the dot color via tokens). Same id="sdk-status" so StatusController and the
+                 main.ts `pill:` querySelector keep working unchanged. -->
+            <div class="sidebar-status">
+              <span class="conv-status" id="sdk-status" data-status="ready" role="status"
+                    aria-live="polite">SDK ready</span>
+            </div>
+            <!-- Live sidebar filter (Fix 1). Keeps the frozen .search container class; now an
+                 interactive control: search icon + #plan-filter input + clear (✕) button.
+                 Filters the Plans tab only (never #toc-list). -->
+            <div class="search">
+              <span class="ico" aria-hidden="true">🔍</span>
+              <input id="plan-filter" type="text" placeholder="Filter plans…" autocomplete="off" aria-label="Filter plans" />
+              <button class="clear" type="button" title="Clear filter" aria-label="Clear filter">✕</button>
+            </div>
+            <!-- #plan-list: 03 mutates — sidebar rows rendered/updated here -->
+            <div class="plan-list" id="plan-list"></div>
+          </div>
+
+          <!-- Contents pane — table of contents for the currently-open plan.
+               #toc-list is built by buildToc() in main.ts from extractToc's
+               read-only walk of the rendered pane. -->
+          <div class="tab-pane" id="tab-contents">
+            <div class="toc-head"><h2>Contents</h2></div>
+            <div class="toc-list" id="toc-list"></div>
+          </div>
+        </aside>
+
+        <!-- reading pane -->
+        <!-- #reader-scroll: scroll-preservation anchor (02 refines) -->
+        <main class="reader" id="reader-scroll">
+          <div class="reader-inner">
+            <!-- Reading-pane tab row [Plan | Conversation] (Sub-Plan 02). Mirrors the
+                 sidebar .tab/.tab-pane pattern so the generic initTabs() drives it. This is a
+                 SECOND tab row; main.ts scopes its queries to this row so the sidebar
+                 contract tests (which pin data-tab="plans"/id="tab-plans") are unaffected.
+                 The center "Table of Contents" tab from the prototype is intentionally
+                 dropped — CONTENTS lives in the sidebar. -->
+            <div class="tab-row reader-tab-row" role="tablist">
+              <span class="tab active" data-tab="plan" role="tab">Plan</span>
+              <span class="tab" data-tab="conversation" role="tab">Conversation</span>
+            </div>
+
+            <!-- Plan pane (default-active). Wraps the EXISTING .doc-header / .review-bar /
+                 #reading-pane, ids+classes intact; #reading-pane stays an empty self-closed
+                 div. #sel-popover is NOT moved here — it remains a
+                 sibling under .window AFTER #reading-pane (see below the </main>). -->
+            <div class="tab-pane active" id="tab-plan">
+            <div class="doc-header">
+              <div class="doc-filename" id="doc-filename"></div>
+              <div class="doc-src" id="doc-src"></div>
+            </div>
+
+            <!-- Resume banner (Phase 5). Orthogonal to the review bar: shown when the OPEN plan
+                 belongs to a non-terminal `.plan-tree/` whose `tree_id` matches the open plan and no
+                 orchestration is already active (main.ts detectResumable + #resume-plan-btn handler).
+                 Two states, written solely by main.ts (renderResumeBanner):
+                   • resumable → #resume-plan-btn labeled "Resume — <phaseLabel>" → orchestrator.resume()
+                   • blocked   → static muted text "<phaseLabel> — resuming from here isn't supported yet"
+                 Hidden (`.hidden`) when the open plan is not a resumable/blocked tree. Both this banner
+                 and the review bar may show at once — they are independent surfaces.
+                 PHASE 3c — a HAZARDOUS resumable verdict (requiresConfirm; leaf/executing, "edits may
+                 be partially applied") does NOT resume on the first #resume-plan-btn click: it reveals
+                 the inline #resume-confirm row (#resume-hazard text + Confirm/Cancel). resume() fires
+                 ONLY from #resume-confirm-btn; #resume-cancel-btn collapses back to the one-click
+                 button. Non-hazardous verdicts never show #resume-confirm. -->
+            <div class="resume-banner hidden" id="resume-banner" role="region"
+                 aria-label="Resume plan">
+              <span class="resume-banner-msg" id="resume-banner-msg"></span>
+              <button class="rb-btn rb-approve hidden" id="resume-plan-btn" type="button"
+                      title="Resume this plan from where it stopped">Resume</button>
+              <span class="resume-confirm hidden" id="resume-confirm" role="group"
+                    aria-label="Confirm hazardous resume">
+                <span class="resume-hazard" id="resume-hazard"></span>
+                <button class="rb-btn rb-approve" id="resume-confirm-btn" type="button"
+                        title="Confirm and continue — edits may be partially applied">Confirm</button>
+                <button class="rb-btn" id="resume-cancel-btn" type="button"
+                        title="Cancel — do not resume">Cancel</button>
+              </span>
+            </div>
+
+            <!-- Review action bar (Plan Review). PERSISTENT, NON-OCCLUDING affordance shown whenever
+                 one or more plan reviews are pending (main.ts toggles `.hidden` via refreshReviewBar()
+                 from the pure applyReviewBarState). Docked at the top of the reading column (inside
+                 .reader-inner, in normal flow — it does NOT float over the pane),
+                 so the user can select text + add inline comments AND act on the review at once.
+                 Two modes (see applyReviewBarState):
+                   • VIEWING  — a review is rendered in the pane: #review-submit (enabled with >=1
+                     comment → deny + feedback) is shown.
+                   • SUMMARY  — reviews are pending but the user is browsing a real plan: only the
+                     count label + #review-resume (re-open the newest pending review) are shown, so a
+                     pending review never traps navigation.
+                 Approve-as-auto-execute is GONE (a PreToolUse hook cannot auto-approve a plan). -->
+            <div class="review-bar hidden" id="review-bar" role="region" aria-label="Plan review actions">
+              <span class="review-bar-label" id="review-bar-label"></span>
+              <div class="review-bar-actions">
+                <!-- Visual-prototype review (Phase 4d) — PROTOTYPE mode only; both ship hidden.
+                     #prototype-feedback holds the refine feedback ("Request changes" — the
+                     relabeled #review-submit — requires non-empty text → refinePrototype(text));
+                     #prototype-open is shown solely for kind "html" and opens the prototype in the
+                     default browser via the open_prototype Tauri command (cwd + path containment-
+                     guarded to <cwd>/.plan-tree/prototype/ on the Rust side).
+                     refreshReviewBar()/applyPrototypeBar() are the sole writers of their .hidden. -->
+                <textarea class="proto-feedback hidden" id="prototype-feedback" rows="5"
+                          placeholder="Describe what to change in the visual…"
+                          aria-label="Prototype change feedback"></textarea>
+                <!-- Working-reference classification (Phase 3) — PROTOTYPE mode only; ships hidden.
+                     UNCHECKED (default) = "just a sketch" → approve is today's behavior (nothing
+                     frozen). CHECKED = "working reference" → on approve the driver freezes
+                     .plan-tree/prototype/ into .plan-tree/baseline/ and records it on the ledger.
+                     The baseline is a FLOOR on the outcome dimensions captured in INTENT.md, never a
+                     behavioral match-target. applyPrototypeBar() is the sole writer of its .hidden. -->
+                <label class="proto-workingref hidden" id="prototype-working-ref-label"
+                       title="Freeze this prototype as a working reference — a FLOOR on the outcome dimensions in INTENT.md, not a match-target. Leave unchecked to treat it as just a sketch.">
+                  <input type="checkbox" id="prototype-working-ref" />
+                  Working reference (hold the build to it)
+                </label>
+                <button class="rb-btn hidden" id="prototype-open" type="button"
+                        title="Open the HTML prototype in your default browser">Open in browser</button>
+                <!-- Forced-acceptance REFINE (Phase 6) — ACCEPTANCE mode only; both ship hidden. The
+                     THIRD gate action: re-plan a chosen top-level sub-plan. #review-refine-target is the
+                     sub-plan picker (populated from the snapshot by applyAcceptanceBar); #review-refine
+                     routes the picked target into refineAcceptance(target) — the driver resets that
+                     sub-plan + its right-siblings and re-runs them; the acceptance gate re-arms on
+                     re-completion. applyAcceptanceBar()/refreshReviewBar() are the sole writers of their
+                     .hidden. -->
+                <select class="rb-select hidden" id="review-refine-target"
+                        aria-label="Sub-plan to refine"></select>
+                <button class="rb-btn hidden" id="review-refine" type="button"
+                        title="Re-plan the selected sub-plan: reset it (and its right-siblings) and re-run them">Refine sub-plan</button>
+                <button class="rb-btn" id="review-submit" type="button" disabled
+                        title="Submit your inline comments as feedback">Submit feedback</button>
+                <button class="rb-btn" id="review-clear" type="button"
+                        title="Clear all of this plan's comments (click again to confirm)">Clear comments</button>
+                <!-- Sub-Plan 03 — in-process review ONLY: approve the plan and begin execution in the
+                     same Agent SDK session (single click → resolve_tool_permission(allow) +
+                     set_agent_permission_mode(acceptEdits) + flip to the Conversation tab). Hidden by
+                     default; refreshReviewBar() shows it solely when VIEWING an in-process review
+                     (state.approveVisible). -->
+                <button class="rb-btn rb-approve hidden" id="review-approve" type="button"
+                        title="Approve this plan and begin building in this session">Approve &amp; Build</button>
+                <button class="rb-btn" id="review-resume" type="button"
+                        title="Re-open the newest pending plan review">Resume ▸</button>
+              </div>
+            </div>
+
+            <!-- #reading-pane: 02 renders into — the markdown render target.
+                 Sub-Plan 01 shows raw text only (white-space: pre-wrap). -->
+            <div class="md" id="reading-pane"></div>
+            </div><!-- /#tab-plan -->
+
+            <!-- Conversation pane (Sub-Plan 02). The live agent-run stream renders here via the
+                 conversation domain (src/conversation/). #conversation-stream is the render
+                 container; the cancel control gracefully interrupts the current turn
+                 (cancel_agent_run). Starts inactive (global .tab-pane{display:none}). -->
+            <div class="tab-pane" id="tab-conversation">
+              <!-- Session controls (the 3-state machine: none | active | idle). Enabled/disabled is
+                   derived PURELY from SessionState in initConversation's applySessionState — never set
+                   ad hoc. Pause interrupts the current turn only (session stays alive → idle); Resume
+                   pushes a "Continue." turn (→ active); Stop interrupts AND ends the session (→ none).
+                   #conversation-cancel is the Stop button (kept under its legacy id so existing wiring
+                   compiles). -->
+              <div class="conv-toolbar">
+                <button class="conv-pause" id="conversation-pause" type="button"
+                        title="Pause: interrupt the current turn (the session stays alive)">Pause</button>
+                <button class="conv-resume" id="conversation-resume" type="button"
+                        title="Resume: continue the paused session">Resume</button>
+                <button class="conv-cancel" id="conversation-cancel" type="button"
+                        title="Stop: interrupt the current turn and end the session">Stop</button>
+              </div>
+              <!-- Stream + right-margin minimap gutter. The minimap (`#conversation-minimap`) is a
+                   render-only sibling of the scroll container: JS positions `.conv-minimap-block`
+                   tiers (user/assistant/meta) and the `.conv-minimap-viewport` indicator by inline
+                   top/height. `.conv-stream` is `position: relative` so child offsetTop resolves
+                   against the scroll container (see CONTRACT.md). -->
+              <div class="conv-stream-wrap">
+                <div class="conv-stream" id="conversation-stream"></div>
+                <div class="conv-minimap" id="conversation-minimap" aria-hidden="true"></div>
+              </div>
+              <!-- Free-text message composer (human-in-the-loop). Sends an additional user turn into
+                   the live session via send_agent_message. Enabled whenever a session is alive
+                   (active OR idle), disabled when none — derived from SessionState in
+                   applySessionState alongside the other controls. Enter sends; Shift+Enter newlines.
+                   This is SEPARATE from answering an AskUserQuestion card (that goes through
+                   resolve_tool_permission). -->
+              <div class="conv-input-row" id="conversation-input">
+                <textarea class="conv-input-field" id="conversation-input-field" rows="2"
+                          placeholder="Send a message to the agent…"
+                          aria-label="Send a message to the agent"></textarea>
+                <button class="conv-btn conv-input-send" id="conversation-send" type="button"
+                        title="Send a message to the running session">Send</button>
+              </div>
+              <!-- Image attachments for the in-conversation follow-up input (multimodal). Chips render
+                   into #conversation-attachments; #conversation-attach proxies a click to the hidden
+                   #conversation-file-input; pasted/dropped images bind on #conversation-input-field.
+                   Attach-time rejections show in #conversation-attach-error. -->
+              <div class="conv-attach-row" id="conversation-attach-row">
+                <div class="conv-attach-strip" id="conversation-attachments"></div>
+                <button class="conv-btn conv-attach-btn" id="conversation-attach" type="button"
+                        title="Attach image(s)" aria-label="Attach images">Attach image…</button>
+                <input type="file" id="conversation-file-input"
+                       accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+                <div class="conv-error hidden" id="conversation-attach-error" role="alert"
+                     aria-live="polite"></div>
+              </div>
+            </div><!-- /#tab-conversation -->
+          </div>
+        </main>
+      </div>
+
+      <!-- Selection popover (Sub-Plan 02). Placed OUTSIDE #reading-pane (a child of
+           .window) so renderInto's pane-only innerHTML wipe never removes it. No
+           data-tauri-drag-region (it is not part of the titlebar). The single applier
+           renderPopover() in src/render/comments.ts is the sole writer of `.hidden` /
+           #sp-quote / #sp-text. -->
+      <div class="sel-popover hidden" id="sel-popover">
+        <div class="sp-quote" id="sp-quote"></div>
+        <textarea id="sp-text" placeholder="Add a comment for Claude Code…"></textarea>
+        <div class="sp-foot">
+          <button id="sp-cancel" type="button">Cancel</button>
+          <button class="save" id="sp-save" type="button">Add comment</button>
+        </div>
+      </div>
+
+      <!-- Lightweight non-blocking toast (Phase 5). A `.hidden` notice docked bottom-center, used
+           for transient, non-modal messages (currently: the `resume_fallback` agent-stream frame —
+           "Couldn't resume the previous conversation — re-running the current step fresh."). main.ts
+           (showToast) is the sole writer of `.hidden` / its text; it auto-dismisses on a timer.
+           Sibling under .window so renderInto's pane-only wipe never removes it. -->
+      <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+
+      <!-- New-plan composer modal (Sub-Plan 02). A .hidden overlay (sibling under .window so it
+           inherits no titlebar drag region and survives the reading-pane wipe). Holds: a request
+           <textarea>, a working-directory row (read-only #composer-dir field + #composer-choose-dir
+           native folder picker), a Plan/Build segmented toggle, Start/Cancel, and a .hidden
+           auth-onboarding block (instructions + paste field -> set_agent_oauth_token). All colors
+           resolve through --conv-* / existing tokens so dark mode re-themes it. -->
+      <div class="conv-modal hidden" id="composer-modal" role="dialog" aria-modal="true"
+           aria-label="New plan composer">
+        <div class="conv-modal-card">
+          <div class="conv-modal-head"><h3>New plan</h3></div>
+
+          <!-- Auth onboarding — hidden unless there is no stored OAuth token. -->
+          <div class="conv-auth hidden" id="composer-auth">
+            <p class="conv-auth-msg">
+              No Claude subscription token found. Run <code>claude setup-token</code> in a
+              terminal, then paste the token below.
+            </p>
+            <div class="conv-auth-row">
+              <input class="conv-auth-input" id="composer-token" type="password"
+                     placeholder="Paste CLAUDE_CODE_OAUTH_TOKEN…" autocomplete="off"
+                     aria-label="OAuth token" />
+              <button class="conv-btn" id="composer-token-submit" type="button">Save token</button>
+            </div>
+          </div>
+
+          <label class="conv-field-label" for="composer-request">Request</label>
+          <textarea class="conv-request" id="composer-request" rows="4"
+                    placeholder="Describe what you want the agent to do…"
+                    aria-label="Plan request"></textarea>
+
+          <!-- Image attachments (multimodal input). Chips render into #composer-attachments;
+               #composer-attach proxies a click to the hidden #composer-file-input; pasted/dropped
+               images bind on the request textarea. Attach-time rejections reuse #composer-error. -->
+          <div class="conv-attach-row">
+            <div class="conv-attach-strip" id="composer-attachments"></div>
+            <button class="conv-btn conv-attach-btn" id="composer-attach" type="button"
+                    title="Attach image(s)" aria-label="Attach images">Attach image…</button>
+            <input type="file" id="composer-file-input"
+                   accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+          </div>
+
+          <label class="conv-field-label">Working directory</label>
+          <div class="conv-dir-row">
+            <input class="conv-dir-field" id="composer-dir" type="text" readonly
+                   placeholder="Choose a folder…" aria-label="Working directory" />
+            <button class="conv-btn" id="composer-choose-dir" type="button">Choose…</button>
+          </div>
+
+          <!-- Starting mode is fixed to "plan" for now (Build removed). Sessions always begin in plan
+               mode; the ONLY path to acceptEdits is the post-review #review-approve handler in main.ts
+               (set_agent_permission_mode). The composer no longer offers a Plan/Build toggle. -->
+
+          <!-- Inline failure line — hidden by default. Start surfaces empty-field validation
+               AND start_agent_session/send_agent_message rejections here (the modal stays open)
+               instead of silently no-oping. Reuses the .conv-error token vocabulary. -->
+          <div class="conv-error hidden" id="composer-error" role="alert" aria-live="polite"></div>
+
+          <div class="conv-modal-foot">
+            <button class="conv-btn" id="composer-cancel" type="button">Cancel</button>
+            <button class="conv-btn conv-btn-primary" id="composer-start" type="button">Start</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

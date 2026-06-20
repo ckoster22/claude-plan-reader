@@ -1,0 +1,1388 @@
+:root {
+  --bg-window: #ffffff;
+  --bg-sidebar: #f2f1ee;
+  --bg-titlebar: #e8e7e3;
+  --border: #d9d8d4;
+  --text: #1d1d1f;
+  --text-dim: #6e6e73;
+  --text-faint: #97969b;
+  --accent: #c2410c;       /* Claude terracotta */
+  --accent-soft: #fde8df;
+  --sel: #e6e5e1;
+  --code-bg: #f6f6f4;
+  --link: #0a66c2;
+  --live: #2ea043;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  /* Comment highlight tokens (Sub-Plan 02). Sourced from the prototype. */
+  --hl: #ffe08a;
+  --hl-active: #ffd24d;
+  /* Conversation domain (Sub-Plan 02). New colors that are NOT already tokenized get a
+     --conv-* variable declared in BOTH :root and the dark block (tokens-only — no hardcoded
+     hex in any .conv-* rule). Light variant. */
+  --conv-bubble-bg: #f4f3f0;     /* assistant-text bubble + composer card surface */
+  --conv-build-bg: #eaf6ec;      /* green "Build mode — approved" banner background */
+  --conv-build-text: #1f7a33;    /* build banner text */
+  --conv-danger: #c0392b;        /* permission-denied / fatal-error accent (red) */
+  --conv-danger-soft: #fbeae8;   /* permission-denied / error row background */
+  --conv-overlay: rgba(0, 0, 0, 0.38); /* composer modal scrim */
+  --conv-on-accent: #ffffff;     /* text/icon on an --accent fill (terracotta) */
+  --conv-shadow: rgba(0, 0, 0, 0.28); /* composer card drop shadow */
+  --conv-tool-run-bg: #fff6f1;   /* running tool-row accent wash (Dense Chat) */
+  /* Reading-pane base text size. Theme-independent (one declaration here, NOT
+     duplicated in the dark block). Every .md font-size is `em`-relative to this
+     so the whole reading pane scales as one system. Stepped by the A−/A+
+     titlebar controls (initTextSize, src/titlebar.ts) and read before first
+     paint by the inline anti-FOUC script in index.html. */
+  --reading-font-size: 15px;
+}
+/* Dark variant — redefines the SAME token names so every existing var(--…)
+   reference re-themes automatically (no selector/markup duplication). Opted in
+   by the inline anti-FOUC script + the theme toggle setting
+   document.documentElement[data-theme="dark"]. Values lifted from the prototype. */
+:root[data-theme="dark"] {
+  --bg-window: #1c1c1e;
+  --bg-sidebar: #242426;
+  --bg-titlebar: #2c2c2e;
+  --border: #3a3a3d;
+  --text: #ececf0;
+  --text-dim: #a0a0a6;
+  --text-faint: #6e6e76;
+  --accent: #ff7a45;
+  --accent-soft: #3a241a;
+  --sel: #34343a;
+  --code-bg: #2a2a2d;
+  --link: #5aa2ff;
+  --live: #3fb950;
+  /* Comment highlight tokens (Sub-Plan 02), dark variant. Sourced from the prototype. */
+  --hl: #6b5a1f;
+  --hl-active: #8a7320;
+  /* Conversation domain (Sub-Plan 02), dark variant — same token names re-themed. */
+  --conv-bubble-bg: #2a2a2d;
+  --conv-build-bg: #1c3322;
+  --conv-build-text: #4cc466;
+  --conv-danger: #ff7a6b;
+  --conv-danger-soft: #3a1f1c;
+  --conv-overlay: rgba(0, 0, 0, 0.55);
+  --conv-on-accent: #ffffff;
+  --conv-shadow: rgba(0, 0, 0, 0.5);
+  --conv-tool-run-bg: #241a14;   /* running tool-row accent wash (Dense Chat), dark variant */
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: var(--ui);
+  background: var(--bg-window);
+  color: var(--text);
+}
+
+/* ---- macOS window chrome ----
+   In the prototype this was a fixed 1180x760 card centered on a gray backdrop.
+   Inside the real Tauri WebView the window IS the chrome, so .window fills the
+   viewport (no outer border / shadow / border-radius needed). */
+.window {
+  width: 100%; height: 100%;
+  background: var(--bg-window);
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+/* macOS native-overlay titlebar.
+   The window uses titleBarStyle:"Overlay" (tauri.conf.json) so the REAL OS
+   traffic lights are painted OVER the top-left of this bar — the prototype's
+   fake dots + duplicate app title have been removed.
+   - 44px tall comfortably clears the ~12px traffic lights (positioned via
+     trafficLightPosition y:16 in the config).
+   - padding-left:78px keeps our own content (the .titlebar-controls slot)
+     clear of the native lights at the left. */
+.titlebar {
+  height: 44px; flex: 0 0 44px;
+  background: var(--bg-titlebar);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 14px 0 78px;
+  -webkit-user-select: none; user-select: none;
+}
+/* Window-drag fix: the titlebar carries data-tauri-drag-region, but Tauri v2
+   only starts a window drag when the mousedown event's TARGET is the element
+   bearing the attribute. The .titlebar-controls slot holds genuinely
+   interactive controls (the theme toggle, and later sub-plans' buttons) that
+   MUST keep pointer-events:auto so they receive clicks. Window-drag exclusion
+   for them is NOT done via pointer-events and NOT by omitting the drag
+   attribute (closest() would still match the ancestor .titlebar) — it is
+   handled in JS by isDragTarget() (src/titlebar.ts), which bails when the
+   mousedown target is, or is inside, an interactive control. Native traffic
+   lights are unaffected (painted by the OS over the padding-left inset, not
+   DOM elements), and double-click-to-zoom still works on the bar whitespace. */
+.titlebar-controls { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.theme-toggle {
+  pointer-events: auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-window); color: var(--text);
+  font-size: 14px; line-height: 1; cursor: pointer;
+}
+.theme-toggle:hover { border-color: var(--accent); }
+
+/* Model & effort preset picker (Phase 2). A compact segmented control in the
+   titlebar, sized to sit alongside the 28px-tall .theme-toggle controls. The
+   active preset inverts to the accent fill; adjacent buttons get a left divider. */
+.titlebar-model-picker {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  height: 28px;
+}
+.model-preset {
+  pointer-events: auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 100%; padding: 6px 11px; border: 0;
+  background: var(--bg-window); color: var(--text-dim);
+  font-family: var(--ui); font-size: 11px; font-weight: 600;
+  line-height: 1; cursor: pointer;
+}
+.model-preset + .model-preset { border-left: 1px solid var(--border); }
+.model-preset:hover { border-color: var(--accent); color: var(--accent); }
+/* Visible keyboard focus indicator. Inset offset because the parent picker
+   has overflow:hidden, which would clip a positive (outset) outline. */
+.model-preset:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.model-preset.active { background: var(--accent); color: var(--conv-on-accent); }
+
+/* Opus effort selector (sibling of .titlebar-model-picker). Same segmented
+   language as .model-preset, sized to the 28px-tall titlebar controls. Revealed
+   only when Opus is active; `hidden` removes it from layout entirely. */
+.titlebar-effort {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  height: 28px;
+}
+/* Explicit override so `display` beats the UA `hidden` rule — fully removed
+   from layout (no greyed placeholder) when not Opus. */
+.titlebar-effort[hidden] { display: none; }
+.effort-level {
+  pointer-events: auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 100%; padding: 6px 11px; border: 0;
+  background: var(--bg-window); color: var(--text-dim);
+  font-family: var(--ui); font-size: 11px; font-weight: 600;
+  line-height: 1; cursor: pointer;
+}
+.effort-level + .effort-level { border-left: 1px solid var(--border); }
+.effort-level:hover { border-color: var(--accent); color: var(--accent); }
+/* Inset focus offset because the parent group has overflow:hidden, which would
+   clip a positive (outset) outline. */
+.effort-level:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.effort-level.active { background: var(--accent); color: var(--conv-on-accent); }
+
+/* In-DOM status readout (#hook-status) for the review-response / save-for-review actions
+   (replaces window.alert, a no-op in Tauri v2 WKWebView). A transient one-line message;
+   main.ts sets the text, toggles `.hidden`, and adds `.error` (red) for failures, then
+   auto-clears. The former Install/Remove plan-review hook buttons were removed. */
+.hook-status {
+  display: inline-flex; align-items: center;
+  max-width: 280px; padding: 0 8px; height: 28px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hook-status.error { color: #d9534f; }
+.hook-status.hidden { display: none; }
+
+.body { flex: 1; display: flex; min-height: 0; }
+
+/* ---- Sidebar ---- */
+.sidebar {
+  width: 340px; flex: 0 0 340px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+.sidebar-head {
+  padding: 14px 16px 8px;
+  display: flex; align-items: baseline; justify-content: space-between;
+}
+.sidebar-head h2 { margin: 0; font-size: 13px; letter-spacing: .02em; text-transform: uppercase; color: var(--text-dim); }
+.sidebar-head .count { font-size: 11px; color: var(--text-dim); }
+/* ---- SDK status pill in the sidebar (moved from the titlebar) ----
+   Single-session app: this reflects the one current run. The pill itself reuses the
+   .conv-status chrome/dot tokens; this wrapper just gives it sidebar placement. */
+.sidebar-status { padding: 0 16px 10px; display: flex; }
+/* ---- Sidebar filter (Fix 1) ----
+   The .search container is frozen (CONTRACT.md §1); it now hosts a real interactive control:
+   a search icon, the #plan-filter input, and a clear (✕) button revealed only when there is
+   text (.search.has-text .clear). Terracotta focus ring matches the app's accent tokens. */
+.search {
+  margin: 0 12px 8px; padding: 0 0 0 10px;
+  background: var(--bg-window); border: 1px solid var(--border); border-radius: 7px;
+  display: flex; align-items: center; gap: 6px;
+  transition: border-color .12s, box-shadow .12s;
+}
+.search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.search .ico { font-size: 12px; color: var(--text-faint); flex: 0 0 auto; }
+.search input {
+  flex: 1; min-width: 0; border: 0; outline: 0; background: transparent;
+  font-family: var(--ui); font-size: 12px; color: var(--text); padding: 7px 0;
+}
+.search input::placeholder { color: var(--text-faint); }
+.search .clear {
+  border: 0; background: transparent; color: var(--text-faint); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 9px; display: none;
+}
+.search .clear:hover { color: var(--text-dim); }
+.search.has-text .clear { display: block; }
+
+.plan-list { overflow-y: auto; padding: 4px 8px 12px; }
+
+/* Matched-substring highlight in the visible title / cwd (sidebar only). */
+.plan-title mark, .plan-src mark {
+  background: #ffe08a; color: inherit; border-radius: 2px; padding: 0 1px;
+}
+/* Empty-state when a non-empty filter matches no plans. */
+.filter-empty {
+  padding: 26px 16px; text-align: center; font-size: 12px; color: var(--text-faint);
+}
+
+/* ---- Tabbed left panel (Plans / Contents) ----
+   The sidebar now hosts two panes switched by .tab buttons. Only one pane is
+   visible at a time (.tab-pane.active). */
+.tab-row {
+  display: flex; gap: 2px; padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  -webkit-user-select: none; user-select: none;
+}
+.tab {
+  font-size: 11px; font-weight: 600; color: var(--text-dim);
+  padding: 9px 12px 7px; cursor: pointer;
+  border-bottom: 2px solid transparent;
+  text-transform: uppercase; letter-spacing: .02em;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.tab-pane { display: none; min-height: 0; }
+.tab-pane.active { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+
+/* Flex-scroll reconciliation: #plan-list scrolled as a DIRECT flex child of
+   .sidebar; nesting it inside .tab-pane adds a flex layer, so the scrolling
+   list needs flex:1/min-height:0 here to size-to-fill-and-scroll. Applies to
+   both the plan list and the ToC list. The existing `.plan-list { overflow-y }`
+   rule above is left as-is — this child rule supplies the flex sizing. */
+.tab-pane > .plan-list,
+.tab-pane > #toc-list { flex: 1; min-height: 0; overflow-y: auto; }
+
+/* ---- Table of contents (Contents tab) ---- */
+.toc-head {
+  padding: 14px 16px 8px;
+  display: flex; align-items: baseline; justify-content: space-between;
+}
+.toc-head h2 {
+  margin: 0; font-size: 13px; letter-spacing: .02em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.toc-list { padding: 4px 6px 14px; }
+.toc-item {
+  display: block; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  font-size: 12.5px; color: var(--text); line-height: 1.3;
+  border-left: 2px solid transparent;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.toc-item:hover { background: rgba(0, 0, 0, .05); }
+.toc-item.toc-h1 { font-weight: 700; font-size: 13px; margin-top: 2px; }
+.toc-item.toc-h2 { padding-left: 18px; color: var(--text-dim); }
+/* Transient click affordance — the clicked entry flashes accent-soft, then
+   fades. NOT scroll-spy: it is removed shortly after the click. */
+.toc-item.flash {
+  background: var(--accent-soft); color: var(--accent);
+  border-left-color: var(--accent);
+}
+.toc-empty {
+  padding: 18px 16px; font-size: 12px; color: var(--text-faint);
+  text-align: center;
+}
+.plan {
+  padding: 9px 11px; border-radius: 8px; cursor: pointer;
+  margin-bottom: 2px;
+  display: flex; flex-direction: column; gap: 3px;
+  position: relative;
+}
+.plan:hover { background: rgba(0,0,0,.04); }
+.plan.active { background: var(--sel); }
+.plan.active .plan-title { color: var(--accent); }
+.plan-row { display: flex; align-items: center; gap: 7px; }
+.plan-title {
+  font-size: 13px; font-weight: 400; line-height: 1.25; flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* unread edits since last viewed -> bold; returns to normal once viewed */
+.plan.unread .plan-title { font-weight: 700; }
+.plan.unread .unread-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+  flex: 0 0 auto;
+}
+.unread-dot { width: 7px; height: 7px; flex: 0 0 auto; }
+.plan-src {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: left;   /* keep tail (most specific dir) visible when truncated */
+}
+.plan-meta { font-size: 11px; color: var(--text-dim); display: flex; gap: 8px; }
+.plan-meta .when { font-weight: 500; }
+
+/* ---- live-run placeholder row (.plan.placeholder) ----
+   A running agent conversation with no plan file yet (see CONTRACT.md). Muted/italic title +
+   a small pulsing dot reusing the .conv-working-dot token values (var(--accent) 7px dot on the
+   conv-working-pulse keyframes). Tokens only — no raw colors. */
+.plan.placeholder .plan-title { color: var(--text-dim); font-style: italic; }
+.plan.placeholder.active .plan-title { color: var(--accent); }
+.placeholder-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); flex: 0 0 auto;
+  animation: conv-working-pulse 1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) { .placeholder-dot { animation: none; opacity: 0.7; } }
+
+/* ---- Nested master/sub hierarchy (Sub-Plan 02) ----
+   Three flavors distinguished by STRUCTURE alone (no text tags):
+   - master: disclosure twirl + "N sub-plans" count + indented .children
+   - sub: indent + left rule + 2-digit NN sequence (compact: NN + title + dot only)
+   - standalone: ordinary flat .plan row (the common case)
+   The app's .plan row uses the flex push model (.plan-title { flex: 1 }), so the
+   trailing .child-count / .unread-dot sit flush-right with NO margin-left:auto. */
+
+/* Disclosure twirl — leading the master-row's .plan-row. Rotates -90° when collapsed. */
+.twirl {
+  width: 13px; height: 13px; flex: 0 0 auto;
+  color: var(--text-dim); font-size: 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: transform .12s;
+}
+.master.collapsed .twirl { transform: rotate(-90deg); }
+
+/* Master title is ALWAYS bold (visual hierarchy). The unread CUE for a master is therefore the
+   dot, not bold (see "master unread cue = dot" decision); .plan.unread .unread-dot already paints. */
+.master-row .plan-title { font-weight: 700; }
+
+/* "N sub-plans" count — sits after the flex:1 title (pushed flush-right by the title). */
+.child-count {
+  font-size: 10.5px; color: var(--text-faint); flex: 0 0 auto;
+}
+
+/* Indented children with a left rule, mapped onto the app's --border var. */
+.children { margin: 2px 0 2px 16px; border-left: 2px solid var(--border); padding-left: 6px; }
+.master.collapsed .children { display: none; }
+
+/* Sub row — compact: .seq (mono dotted id, e.g. "02.01") + flex:1 title + dot. The flex:1 title
+   pushes the dot right. min-width keeps single-segment ids column-aligned; longer dotted ids
+   grow naturally in the same mono face. */
+.sub .plan-row { gap: 8px; }
+.sub .seq {
+  font-family: var(--mono); font-size: 11px; font-weight: 700;
+  color: var(--text-dim); flex: 0 0 auto; min-width: 18px;
+}
+.sub .plan-title { font-size: 12.5px; }
+
+/* Internal sub node (a sub with nested dotted children) — same disclosure affordances as a
+   master: twirl + per-node child count + a nested .children (the generic .children rule above
+   supplies the 16px indent + left rule per level, so depth styles itself by nesting). Collapse
+   is SESSION-ONLY (never persisted); direct-child selectors keep a collapsed inner node from
+   hiding/rotating its ancestors' UI. */
+.sub-node.collapsed > .children { display: none; }
+.sub-node.collapsed > .plan .twirl { transform: rotate(-90deg); }
+
+/* ---- Reading pane ---- */
+/* `container-type: inline-size` lets a rendered mermaid box break out of the
+   760px reading column to span the FULL reader width (see .mermaid-box.mermaid-rendered
+   below). Without this, a naturally-wide `graph LR` diagram is squeezed into the
+   ~670px text column and its fit-to-width scale collapses (measured: 54% in a
+   670px column vs 79% across the full ~1060px reader for the same 1135×94 diagram). */
+.reader { flex: 1; overflow-y: auto; min-width: 0; background: var(--bg-window); container-type: inline-size; }
+/* Wider reading column: the prior 760px centered column left a large empty band
+   between the sidebar and the content on wide windows. Raising the cap to 1080px
+   and trimming the horizontal inset to 32px reclaims that wasted left/right space
+   for both the Plan and Conversation panes (they share .reader-inner) while keeping
+   a comfortable gutter. The mermaid full-width breakout below is anchored to the
+   .reader container (100cqw / cqw units), not this max-width, so it is unaffected. */
+.reader-inner { max-width: 1080px; margin: 0 auto; padding: 36px 32px 80px; }
+.doc-header { border-bottom: 1px solid var(--border); padding-bottom: 14px; margin-bottom: 8px; }
+.doc-header.hidden { display: none; }
+.doc-filename { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.doc-src {
+  font-family: var(--mono); font-size: 11px; color: var(--text-faint); margin-top: 3px;
+  display: flex; align-items: center; gap: 6px;
+}
+.doc-src .folder { color: var(--accent); }
+
+/* ---- Review action bar (Plan Review) ----
+   Persistent, NON-OCCLUDING affordance docked at the top of the reading column (normal flow inside
+   .reader-inner — it does NOT float over the pane), so inline commenting in
+   the pane stays fully usable while a review is active. Accent-tinted to read as an active mode.
+   Themed entirely via existing tokens, so the dark theme re-themes it for free. */
+.review-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 10px 0 4px; padding: 8px 12px;
+  background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 9px;
+}
+.review-bar.hidden { display: none; }
+/* Resume banner (Phase 5) — orthogonal to the review bar; shares its accent-tinted vocabulary so it
+   reads as part of the reading-pane header. Sits between .doc-header and .review-bar. The blocked
+   message is muted (var(--text-dim)); the resumable button reuses .rb-btn.rb-approve (terracotta). */
+.resume-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 10px 0 4px; padding: 8px 12px;
+  background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 9px;
+}
+.resume-banner.hidden { display: none; }
+.resume-banner-msg {
+  font-family: var(--ui); font-size: 12px; font-weight: 600; color: var(--accent);
+}
+/* The blocked-phase variant: a muted, button-free notice (set by main.ts toggling `.blocked`). */
+.resume-banner.blocked { background: var(--bg-window); border-color: var(--border); }
+.resume-banner.blocked .resume-banner-msg { color: var(--text-dim); font-weight: 500; }
+.resume-banner .rb-btn.hidden { display: none; }
+/* Lightweight non-blocking toast (Phase 5). Fixed bottom-center, above all panes; auto-dismissed by
+   main.ts. Token-themed so dark mode re-themes it for free. */
+.toast {
+  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+  z-index: 60; max-width: 460px;
+  padding: 10px 16px; border-radius: 10px;
+  background: var(--bg-window); border: 1px solid var(--accent);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .22);
+  font-family: var(--ui); font-size: 12px; font-weight: 500; color: var(--text);
+}
+.toast.hidden { display: none; }
+.review-bar-label {
+  font-family: var(--ui); font-size: 12px; font-weight: 600; color: var(--accent);
+}
+.review-bar-actions { display: flex; gap: 6px; }
+.review-bar-actions .rb-btn {
+  border: 1px solid var(--border); background: var(--bg-window); color: var(--text);
+  border-radius: 7px; height: 26px; padding: 0 12px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.review-bar-actions .rb-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.review-bar-actions .rb-btn:disabled { opacity: .5; cursor: default; }
+/* Individual bar buttons hide per the bar's mode (viewing shows Submit; summary shows
+   Resume). main.ts (refreshReviewBar via applyReviewBarState) is the sole writer of these. */
+.review-bar-actions .rb-btn.hidden { display: none; }
+/* Forced-acceptance REFINE picker (Phase 6): the sub-plan dropdown beside the Refine button. Token-
+   only, sized to match .rb-btn so the ACCEPTANCE-mode bar reads as one row. main.ts
+   (applyAcceptanceBar / refreshReviewBar) is the sole writer of its .hidden. */
+.review-bar-actions .rb-select {
+  border: 1px solid var(--border); background: var(--bg-window); color: var(--text);
+  border-radius: 7px; height: 26px; padding: 0 8px; max-width: 220px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.review-bar-actions .rb-select:hover { border-color: var(--accent); }
+.review-bar-actions .rb-select.hidden { display: none; }
+/* #review-clear in its "click again to confirm" armed state — accent-tinted so the second-click
+   confirmation step is visible (window.confirm is a no-op in Tauri v2 WKWebView; same pattern as
+   the hook buttons' .confirming above). */
+.review-bar-actions .rb-btn.confirming {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+.review-bar-actions .rb-approve {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.review-bar-actions .rb-approve:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
+/* Visual-prototype review (Phase 4d): the PROTOTYPE-mode inline feedback field. Token-only —
+   border/background/text mirror the .rb-btn vocabulary so it reads as part of the bar; it sits in
+   .review-bar-actions before the buttons and flexes to absorb the bar's spare width. #prototype-open
+   is a plain .rb-btn and needs no extra rules. */
+.review-bar-actions .proto-feedback {
+  border: 1px solid var(--border); background: var(--bg-window); color: var(--text);
+  border-radius: 7px; height: 26px; padding: 5px 8px; resize: none;
+  font-family: var(--ui); font-size: 11px; line-height: 1.3;
+  flex: 1 1 220px; min-width: 160px;
+}
+.review-bar-actions .proto-feedback::placeholder { color: var(--text-dim); }
+.review-bar-actions .proto-feedback:focus { outline: none; border-color: var(--accent); }
+.review-bar-actions .proto-feedback.hidden { display: none; }
+
+/* PROTOTYPE-mode layout (Phase 4d). Scoped to `.review-bar.proto` (the modifier is added by
+   applyPrototypeBar / removed by refreshReviewBar in main.ts) so the bar's other two modes —
+   legacy in-process review and pendingApproval — keep their exact shared layout above. The fix:
+   the long label ("Visual prototype — round N of 3") and the three buttons all stop shrinking and
+   wrapping; the #prototype-feedback textarea becomes the sole flexible grower and gets the bar's
+   spare width plus a taller, single-row height so its placeholder is not clipped. */
+/* The textarea is now multi-line and tall, so the bar TOP-aligns its children: the tall textarea
+   and the compact single-line buttons line up at the first text line rather than the buttons
+   centering against the tall box. The panel is also softened here — a quiet window-bg surface with a
+   single hairline border (no accent fill + accent border together, which read as a heavy glow). */
+.review-bar.proto {
+  align-items: flex-start; gap: 14px; padding: 10px 12px;
+  background: var(--bg-window); border: 1px solid var(--border);
+}
+/* Label: never wrap, never shrink — sits on the first text line of the textarea (nudged down to the
+   textarea's first baseline by its top padding). */
+.review-bar.proto .review-bar-label {
+  white-space: nowrap; flex: 0 0 auto; align-self: flex-start; padding-top: 8px;
+}
+/* Actions row grows to fill the width left of the label and top-aligns its items so the buttons
+   sit beside the FIRST line of the textarea. It WRAPS (row-gap added) so that when the bar is too
+   narrow for textarea + 3 non-shrinking buttons on one line, the buttons drop to a second row
+   beneath the full-width textarea instead of overflowing/clipping past the panel edge. */
+.review-bar.proto .review-bar-actions {
+  flex: 1 1 auto; min-width: 0; align-items: flex-start;
+  flex-wrap: wrap; gap: 8px;
+}
+/* The textarea is the primary input → the ONLY flexible element; multi-line (~5 rows). Height target:
+   5 lines × (11px × 1.3 line-height) ≈ 72px + 8px×2 vertical padding ≈ 88px border box.
+   flex-basis 100% lets it claim the full first wrap-line so the buttons reflow below it when narrow. */
+.review-bar.proto .proto-feedback {
+  flex: 1 1 240px; min-width: 200px; height: 88px; padding: 8px 10px; resize: none;
+}
+/* Buttons keep their natural single-line height (NOT stretched to the textarea height). */
+.review-bar.proto .rb-btn {
+  flex: 0 0 auto; white-space: nowrap; height: 30px;
+}
+/* Working-reference checkbox (Phase 3): a compact, non-shrinking inline control that sits with the
+   buttons. Hidden outside PROTOTYPE mode (main.ts toggles .hidden) and laid out only here. */
+.review-bar-actions .proto-workingref.hidden { display: none; }
+.review-bar.proto .proto-workingref {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  white-space: nowrap; align-self: flex-start; padding-top: 7px;
+  font-family: var(--ui); font-size: 11px; color: var(--text); cursor: pointer;
+}
+.review-bar.proto .proto-workingref input { cursor: pointer; margin: 0; }
+
+/* rich markdown typography (used for real in Sub-Plan 02) */
+.md { font-size: var(--reading-font-size); line-height: 1.62; color: var(--text); }
+.md h1 { font-size: 1.8em; font-weight: 700; margin: 14px 0 6px; line-height: 1.2; }
+.md h2 { font-size: 1.333em; font-weight: 700; margin: 30px 0 8px; padding-top: 6px; }
+.md h3 { font-size: 1.067em; font-weight: 700; margin: 22px 0 6px; color: var(--text); }
+.md p { margin: 10px 0; }
+.md strong { font-weight: 700; }
+.md em { font-style: italic; }
+.md a { color: var(--link); text-decoration: none; border-bottom: 1px solid rgba(10,102,194,.35); }
+.md a:hover { border-bottom-color: var(--link); }
+.md ul, .md ol { margin: 8px 0; padding-left: 22px; }
+.md ol { list-style: decimal; }
+.md ul { list-style: disc; }
+.md li { margin: 4px 0; }
+.md li > ul, .md li > ol { margin: 2px 0; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 26px 0; }
+
+/* GFM tables — bordered, matching the chrome. */
+.md table {
+  border-collapse: collapse;
+  margin: 14px 0;
+  font-size: 0.9em;
+  width: auto;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+.md th, .md td {
+  border: 1px solid var(--border);
+  padding: 6px 11px;
+  text-align: left;
+  vertical-align: top;
+}
+.md th {
+  background: var(--bg-titlebar);
+  font-weight: 700;
+}
+.md tbody tr:nth-child(even) { background: rgba(0,0,0,.02); }
+
+/* Blockquotes */
+.md blockquote {
+  margin: 14px 0;
+  padding: 2px 16px;
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
+}
+.md blockquote p { margin: 6px 0; }
+
+/* Embedded images */
+.md img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  display: block;
+  margin: 16px 0;
+}
+
+/* Rendered mermaid SVG sizing — the diagram lives inside .mermaid-box. */
+.mermaid-box.mermaid-rendered { text-align: center; }
+.mermaid-box svg { max-width: 100%; height: auto; }
+
+/* ---- Mermaid pan/zoom (Fix 2) ----
+   A rendered diagram is wrapped in a fixed-height clipped frame
+   (.mermaid-viewport) containing a transformed wrapper (.mermaid-stage). The
+   stage holds the SAME sanitized SVG; only the outer divs are transformed.
+   The clip frame removes the box's own padding so the band is edge-to-edge. */
+.mermaid-box.mermaid-rendered { padding: 0; overflow: hidden; }
+/* Break the rendered diagram out of the centered 760px reading column to span the
+   full reader width. `100cqw` / `calc(50% - 50cqw)` is anchored to the .reader
+   container (container-type: inline-size, above) so it stays correct as the window
+   resizes — and needs no JS to know the reader width. A wider viewport means a
+   wide diagram fits at a much larger scale (the dominant fix for the "too small"
+   symptom). The error-fallback box keeps the normal in-column width. */
+.mermaid-box.mermaid-rendered {
+  width: 100cqw;
+  margin-left: calc(50% - 50cqw);
+  margin-right: calc(50% - 50cqw);
+}
+.mermaid-viewport {
+  position: relative;
+  /* Initial/fallback height; the pan/zoom controller overrides this per diagram
+     via an inline `height` so the clip frame matches the fitted diagram's shape
+     (a wide-short `graph LR` gets a short band; a tall `graph TD` gets a tall one),
+     clamped in panzoom.ts. A diagram that never gets a controller (none today)
+     would simply keep this fixed height. */
+  height: 340px;
+  overflow: hidden;
+  cursor: grab;
+  border-radius: 10px;
+  background:
+    repeating-linear-gradient(0deg, transparent 0 23px, rgba(0,0,0,.03) 23px 24px),
+    repeating-linear-gradient(90deg, transparent 0 23px, rgba(0,0,0,.03) 23px 24px);
+}
+.mermaid-viewport.dragging { cursor: grabbing; }
+.mermaid-stage {
+  position: absolute;
+  top: 0; left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+/* The SVG must render at natural size so it can be panned, NOT squashed by the
+   .mermaid-box svg { max-width: 100% } rule above. */
+.mermaid-stage svg { display: block; max-width: none; height: auto; }
+/* On-screen controls (bottom-right) — terracotta/cream tokens. */
+.mermaid-ctl {
+  position: absolute; right: 10px; bottom: 10px;
+  display: flex; flex-direction: column;
+  background: var(--bg-window);
+  border: 1px solid var(--border); border-radius: 9px;
+  overflow: hidden; box-shadow: 0 2px 6px rgba(0,0,0,.12);
+}
+.mermaid-ctl button {
+  border: 0; background: var(--bg-window);
+  width: 32px; height: 30px; cursor: pointer; font-size: 15px;
+  color: var(--text);
+  display: flex; align-items: center; justify-content: center;
+  border-bottom: 1px solid var(--border);
+}
+.mermaid-ctl button:last-child { border-bottom: 0; font-size: 11px; }
+.mermaid-ctl button:hover { background: var(--accent-soft); color: var(--accent); }
+/* Live zoom-% readout (bottom-left). */
+.mermaid-zoom-readout {
+  position: absolute; left: 10px; bottom: 10px;
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  background: rgba(255,255,255,.85);
+  padding: 2px 7px; border-radius: 7px; border: 1px solid var(--border);
+  pointer-events: none;
+}
+/* Raw-source fallback shown when a diagram fails to render. */
+.mermaid-src-error {
+  background: #1e1e22; color: #e6e6ea; border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto; margin: 0;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.md code {
+  font-family: var(--mono); font-size: 0.833em;
+  background: var(--code-bg); padding: 1.5px 5px; border-radius: 4px;
+  border: 1px solid var(--border);
+}
+/* 0.926em (NOT 0.833em): inline code inside a table cell inherits `.md table`'s
+   0.9em context, so the plain 0.833em above would compound to 0.833 × 0.9 ≈
+   0.75em of base and render smaller than prose code. 0.926em counter-scales
+   (0.833 / 0.9) so 0.926 × 0.9 ≈ 0.833em of base — matching inline code in prose. */
+.md td code, .md th code { font-size: 0.926em; }
+.md pre {
+  background: #1e1e22; color: #e6e6ea; border-radius: 9px;
+  padding: 14px 16px; overflow-x: auto; margin: 14px 0;
+  font-family: var(--mono); font-size: 0.833em; line-height: 1.55;
+}
+/* 1em (NOT 0.833em): the code element is a CHILD of `.md pre` (already 0.833em),
+   so 0.833em here would compound and shrink it below the intended size. 1em
+   keeps it equal to its `.md pre` parent — preserving the original 12.5px ratio. */
+.md pre code { background: none; border: none; padding: 0; color: inherit; font-size: 1em; }
+/* Reconcile the highlight.js github-dark theme with the existing #1e1e22 pre
+   background. The theme paints its own bg/padding on .hljs; we render highlighted
+   code as `<pre><code class="hljs">`, so neutralize the theme's box and let our
+   `.md pre` styling own the surface. Token colors from the theme still apply. */
+.md pre code.hljs {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+/* GFM task lists (rendered by markdown.ts's gfm_task_lists rule): a disabled
+   read-only checkbox prepended to the item text. Drop the list marker on task
+   items (but not on sibling normal items) and align the box with the text. */
+.md ul.task-list, .md ol.task-list { padding-left: 22px; }
+.md li.task-list-item { list-style: none; margin-left: -18px; }
+.md li.task-list-item .task-checkbox {
+  appearance: none; -webkit-appearance: none;
+  width: 15px; height: 15px; border-radius: 4px;
+  border: 1.5px solid var(--text-faint);
+  background: var(--bg-window);
+  flex: 0 0 auto; margin: 0 8px 0 0; padding: 0;
+  position: relative; top: 3px; cursor: default; vertical-align: top;
+}
+.md li.task-list-item .task-checkbox:checked {
+  background: var(--live); border-color: var(--live);
+}
+.md li.task-list-item .task-checkbox:checked::after {
+  content: "✓"; color: #fff; font-size: 11px; line-height: 1;
+  position: absolute; top: 0; left: 2px;
+}
+
+/* mermaid mock (rendered for real in Sub-Plan 02) */
+.mermaid-box {
+  background: #fbfbfa; border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px; margin: 16px 0;
+}
+.mermaid-cap { font-size: 11px; color: var(--text-dim); font-family: var(--mono); margin-bottom: 10px;
+   display:flex; align-items:center; gap:6px; }
+.mermaid-cap .pill { background: var(--accent-soft); color: var(--accent); padding: 1px 7px; border-radius: 9px; font-weight: 700; }
+.node { fill: #fff; stroke: var(--accent); stroke-width: 1.5; }
+.node-soft { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+.nodetext { font-family: var(--ui); font-size: 11px; fill: var(--text); }
+.edge { stroke: #9a9994; stroke-width: 1.4; fill: none; marker-end: url(#arrow); }
+.edgelabel { font-family: var(--ui); font-size: 9.5px; fill: var(--text-dim); }
+
+/* embedded image mock (rendered for real in Sub-Plan 02) */
+figure { margin: 18px 0; }
+.imgmock {
+  width: 100%; height: 200px; border-radius: 10px; border: 1px solid var(--border);
+  background: linear-gradient(135deg, #eef4ff 0%, #f7efff 100%);
+  display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden;
+}
+.imgmock .grid {
+  position: absolute; inset: 0;
+  background-image: linear-gradient(rgba(120,120,160,.12) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(120,120,160,.12) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.imgmock .screenshot {
+  position: relative; z-index: 1; background: #fff; border:1px solid #cfd6e6; border-radius:6px;
+  padding: 10px 14px; box-shadow: 0 6px 18px rgba(40,60,120,.12); font-size: 12px; color:#3a4a6b;
+}
+figcaption { font-size: 11px; color: var(--text-dim); text-align: center; margin-top: 6px; }
+
+/* ---- Sub-Plan 01 raw-text view ----
+   01 shows the plan as RAW markdown text (no rendering — that's 02). The raw text
+   container preserves whitespace/newlines and wraps long lines. */
+.md.raw {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 0.833em;
+  line-height: 1.55;
+}
+
+/* Empty-state when no plan is selected. */
+.empty-state {
+  color: var(--text-faint);
+  font-size: 14px;
+  margin-top: 40px;
+  text-align: center;
+}
+
+/* ---- Sub-Plan 02: comment highlights + selection popover ----
+   Visual values sourced from .plan-tree/prototype/index.html. */
+.md ::selection { background: var(--hl); }
+
+/* Committed comment highlights in the rendered text (one or more sibling spans per comment,
+   all sharing a data-c id). */
+.cmt-hl {
+  background: var(--hl);
+  border-radius: 2px;
+  padding: 0 1px;
+  cursor: pointer;
+  box-shadow: inset 0 -2px 0 rgba(194, 65, 12, 0.4);
+}
+.cmt-hl.active { background: var(--hl-active); }
+
+/* Selection popover (the "add comment" affordance). Positioned absolutely by a DOM adapter in
+   comments.ts; .hidden toggled solely by renderPopover(). */
+.sel-popover {
+  position: absolute;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+  width: 280px;
+  overflow: hidden;
+}
+.sel-popover.hidden { display: none; }
+.sel-popover .sp-quote {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border);
+  font-style: italic;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sel-popover textarea {
+  border: 0;
+  outline: 0;
+  resize: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 12.5px;
+  padding: 9px 10px;
+  height: 64px;
+}
+.sel-popover .sp-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+.sel-popover .sp-foot button {
+  border: 1px solid var(--border);
+  background: var(--bg-window);
+  color: var(--text);
+  border-radius: 7px;
+  height: 26px;
+  padding: 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.sel-popover .sp-foot .save {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* ========================================================================================
+   Conversation domain (Sub-Plan 02) — namespaced .conv-* block. TOKENS ONLY: every color
+   resolves through var(--*) (existing tokens or the --conv-* set declared in BOTH :root and
+   :root[data-theme="dark"]), so the entire surface re-themes in dark mode. No hardcoded
+   hex/rgb/hsl in any rule here.
+   ======================================================================================== */
+
+/* ---- titlebar controls: + New plan button + SDK status pill ---- */
+.conv-new-plan {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 26px; padding: 0 10px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--accent-soft); color: var(--accent);
+  font-family: var(--ui); font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.conv-new-plan:hover { background: var(--accent); color: var(--conv-on-accent); }
+.conv-new-plan .ico { font-size: 13px; line-height: 1; }
+.conv-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 24px; padding: 0 10px; border-radius: 12px;
+  border: 1px solid var(--border); background: var(--bg-window);
+  color: var(--text-dim); font-family: var(--ui); font-size: 11px; font-weight: 600;
+}
+.conv-status::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-faint);
+}
+.conv-status[data-status="ready"]::before { background: var(--live); }
+.conv-status[data-status="building"]::before { background: var(--accent); }
+.conv-status[data-status="auth"]::before { background: var(--accent); }
+.conv-status[data-status="error"]::before { background: var(--conv-danger); }
+.conv-status[data-status="error"] { color: var(--conv-danger); border-color: var(--conv-danger); }
+
+/* ---- Conversation pane toolbar + stream ---- */
+.conv-toolbar {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 0 0 12px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+}
+/* Session controls share the base chrome; Stop gets the danger hover. */
+.conv-cancel, .conv-pause, .conv-resume {
+  height: 26px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-window); color: var(--text-dim);
+  font-family: var(--ui); font-size: 12px; cursor: pointer;
+}
+.conv-pause:hover, .conv-resume:hover { border-color: var(--accent); color: var(--accent); }
+.conv-cancel:hover { border-color: var(--conv-danger); color: var(--conv-danger); }
+.conv-cancel:disabled, .conv-pause:disabled, .conv-resume:disabled {
+  opacity: 0.4; cursor: default; border-color: var(--border); color: var(--text-dim);
+}
+/* The stream scrolls independently while the input row stays pinned. It is made
+   scrollable exactly like the sidebar lists (#plan-list / #toc-list): flex:1 to take
+   the free space, min-height:0 so it can shrink below content, overflow-y:auto.
+   #tab-conversation is .tab-pane.active (flex column, flex:1, min-height:0); to bound
+   its height we make .reader-inner fill the reader ONLY when the conversation pane is
+   active (:has), leaving the Plan tab's natural .reader scroll untouched. */
+.reader-inner:has(> #tab-conversation.active) {
+  display: flex; flex-direction: column;
+  height: 100%; min-height: 0;
+}
+/* Stream + minimap sit side by side; the wrap takes the vertical space the stream
+   used to occupy (flex:1, min-height:0 so it can shrink below content). */
+.conv-stream-wrap {
+  flex: 1; display: flex; min-height: 0; gap: 0;
+}
+.conv-stream {
+  display: flex; flex-direction: column; gap: 6px;
+  flex: 1; min-height: 0; overflow-y: auto;
+  /* min-width:0 lets this flex item shrink below its content width instead of
+     overflowing the row (default flex min-width:auto = content size). Without it a
+     wide code block / long unbreakable path forced the stream wider than its column,
+     turning overflow-x into a scroll and clipping the LEFT edge of every bubble.
+     overflow-x:hidden keeps this a vertical-only scroller. */
+  min-width: 0; overflow-x: hidden;
+  /* REQUIRED: minimap layout reads child offsetTop relative to this scroll
+     container (block tops/heights + click-to-scroll). See CONTRACT.md. */
+  position: relative;
+}
+
+/* ---- right-margin minimap gutter (render-only; JS sets block/viewport top+height inline) ---- */
+.conv-minimap {
+  flex: 0 0 56px; position: relative; overflow: hidden;
+  cursor: pointer; user-select: none;
+  margin-left: 4px;
+  border-left: 1px solid var(--border);
+  background: transparent;
+}
+.conv-minimap.is-empty { display: none; }
+/* Blocks are absolutely positioned; top/height come from JS inline styles. Alignment is
+   tier-specific (below) to mirror the chat bubbles: user right, assistant/meta left. */
+.conv-minimap-block {
+  position: absolute; border-radius: 3px; opacity: 0.50;
+}
+.conv-minimap-block:hover { opacity: 0.9; }
+/* User turns reuse the user-bubble accent and anchor RIGHT (like .conv-text-user bubbles). */
+.conv-minimap-block[data-tier="user"] {
+  background: var(--accent);
+  right: 7px; left: auto; width: 58%;
+}
+/* Assistant output reads as a neutral mid tone, anchored LEFT. */
+.conv-minimap-block[data-tier="assistant"] {
+  background: var(--text-dim);
+  left: 7px; right: auto; width: 58%;
+}
+/* Meta rows (tool/system/markers) are dimmer and slightly more transparent so they recede;
+   anchored LEFT like assistant. */
+.conv-minimap-block[data-tier="meta"] {
+  background: var(--text-faint); opacity: 0.4;
+  left: 7px; right: auto; width: 58%;
+}
+/* Loud failure rows (error / fatal-error / perm-denied / failed-result) read RED and stay at the
+   base block opacity (0.50) — the dimming above is scoped to [data-tier="meta"] only, so danger is
+   NOT dimmed and is the easiest block to spot. Anchored LEFT like assistant/meta. */
+.conv-minimap-block[data-tier="danger"] {
+  background: var(--conv-danger);
+  left: 7px; right: auto; width: 58%;
+}
+.conv-minimap-viewport {
+  position: absolute; left: 0; right: 0;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid var(--border); border-radius: 2px;
+  pointer-events: none;
+}
+
+/* ---- free-text message composer (human-in-the-loop) ---- */
+.conv-input-row {
+  display: flex; gap: 8px; align-items: flex-end;
+  padding-top: 12px; margin-top: 14px; border-top: 1px solid var(--border);
+}
+.conv-input-field {
+  flex: 1 1 auto; resize: vertical; min-height: 38px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-window); color: var(--text);
+  font-family: var(--ui); font-size: 13px; padding: 8px 10px; line-height: 1.4;
+}
+.conv-input-field:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.conv-input-field:disabled { opacity: 0.5; cursor: default; }
+.conv-input-send { flex: 0 0 auto; height: 38px; }
+.conv-input-send:disabled { opacity: 0.4; cursor: default; border-color: var(--border); color: var(--text-dim); }
+
+/* ---- single in-place "working…" indicator (Part B) ---- */
+.conv-working {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--text-dim); font-family: var(--ui); font-size: 12.5px;
+  padding: 4px 2px;
+}
+.conv-working-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); flex: 0 0 auto;
+  animation: conv-working-pulse 1s ease-in-out infinite;
+}
+@keyframes conv-working-pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+/* Dense Chat motion (state-change only): running card fades in; expanded body slides in. Step
+   bodies stay color-free (the dark-mode guard does not scan @keyframes, but colored steps would
+   still be a real dark-mode bug). */
+@keyframes conv-tool-settle { from { opacity: 0.4; } to { opacity: 1; } }
+@keyframes conv-tool-reveal { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .conv-working-dot { animation: none; opacity: 0.7; }
+  /* Still the pulse but keep the dot legible at a resting opacity. */
+  .conv-tool-pulse { animation: none; opacity: 0.7; }
+  .conv-tool[data-status="running"] { animation: none; }
+  .conv-tool.expanded .conv-tool-body { animation: none; }
+}
+
+/* ---- assistant-text bubble (SANITIZED markdown) ---- */
+.conv-text {
+  background: var(--conv-bubble-bg);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 14px; color: var(--text);
+  font-family: var(--ui); font-size: 13.5px; line-height: 1.55;
+  /* min-width:0 so the bubble (a flex child of .conv-stream) can shrink to its
+     column; overflow-wrap:anywhere forces long unbreakable tokens (e.g. a
+     /private/tmp/... path) to wrap rather than overflow and widen the stream. */
+  min-width: 0; overflow-wrap: anywhere;
+}
+.conv-text :first-child { margin-top: 0; }
+.conv-text :last-child { margin-bottom: 0; }
+.conv-text code {
+  font-family: var(--mono); font-size: 0.92em;
+  background: var(--code-bg); border-radius: 4px; padding: 1px 4px;
+  /* inline code paths/tokens wrap with the surrounding text instead of overflowing */
+  overflow-wrap: anywhere;
+}
+.conv-text pre {
+  background: var(--code-bg); border-radius: 8px; padding: 10px 12px;
+  /* max-width:100% pins the block to the bubble; overflow-x:auto scrolls a wide
+     code line WITHIN its own box rather than widening the bubble/stream. The
+     descendant code keeps pre whitespace so it does not soft-wrap unexpectedly. */
+  max-width: 100%; overflow-x: auto;
+}
+.conv-text pre code { overflow-wrap: normal; white-space: pre; }
+.conv-text a { color: var(--link); }
+
+/* ---- user-attributed bubble (verbatim echo of what the user submitted) ---- */
+/* Distinct from the assistant bubble: accent-soft fill + accent border, right-aligned and inset so
+   the user's own words read as "mine" against the left-aligned assistant/tool stream. Same sanitize
+   path as .conv-text (shared renderTextBubble). */
+.conv-text-user {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  align-self: flex-end;
+  margin-left: 15%;
+}
+
+/* ---- system (plumbing) bubble: harness-injected role:"user" records the human did NOT type ---- */
+/* Subagent task-notifications, command stdout/stderr, bash I/O, system reminders. Deliberately
+   de-emphasized and visually distinct from BOTH the orange user bubble and the grey assistant
+   bubble: left-aligned + inset, muted/faint text, smaller monospace (it holds raw XML/plaintext),
+   dashed low-contrast border + transparent fill so it reads as background infrastructure. Rendered
+   as textContent (never markdown), so `white-space: pre-wrap` preserves the raw layout. */
+.conv-text-system {
+  align-self: flex-start;
+  margin-right: 15%;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  opacity: 0.85;
+}
+
+/* ---- collapsible tool-call row (Dense Chat: density keyed on data-status) ----
+   The renderer emits the SAME .conv-tool / -head / -badge / -name / -summary / -status /
+   -chevron / -body / -input / -result structure and the .expanded toggle for every status;
+   the done/running/error divergence lives entirely here, behind [data-status="…"]. Running
+   rows stay prominent (accent card + bold name + pulsing live status); done rows collapse to a
+   slim dimmed one-liner (done-dot, no status text, hover-reveal chevron); error rows keep the
+   danger treatment at the new density and never collapse. Tokens-only (no literal colors). */
+
+/* Shared structural skeleton (status-specific overrides follow). */
+.conv-tool { overflow: hidden; }
+.conv-tool-head {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  border: 0; background: transparent; cursor: pointer;
+  font-family: var(--ui); color: var(--text); text-align: left;
+}
+.conv-tool-badge {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-weight: 700;
+}
+.conv-tool-name { flex: 0 0 auto; font-weight: 600; }
+.conv-tool-summary {
+  flex: 1 1 auto; min-width: 0; color: var(--text-dim);
+  font-family: var(--mono); font-size: 11.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conv-tool-status {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; color: var(--text-faint);
+}
+.conv-tool-chevron {
+  flex: 0 0 auto; color: var(--text-faint); transition: transform 0.12s ease, opacity 0.12s ease;
+}
+.conv-tool.expanded .conv-tool-chevron { transform: rotate(90deg); }
+.conv-tool-body { display: none; }
+.conv-tool.expanded .conv-tool-body { display: block; animation: conv-tool-reveal 0.16s ease both; }
+.conv-tool-input, .conv-tool-result {
+  margin: 8px 0 0; padding: 9px 11px; border-radius: 8px;
+  background: var(--code-bg); color: var(--text);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+}
+.conv-tool-result-error { color: var(--conv-danger); }
+
+/* DONE — ultra-slim, borderless, dimmed one-liner; detail hidden until expanded. */
+.conv-tool[data-status="done"] {
+  border: 0; background: transparent; border-radius: 6px;
+}
+.conv-tool[data-status="done"] .conv-tool-head {
+  padding: 1px 7px; min-height: 20px; font-size: 11.5px; color: var(--text-faint);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.conv-tool[data-status="done"] .conv-tool-head:hover { background: var(--code-bg); color: var(--text-dim); }
+.conv-tool[data-status="done"] .conv-tool-badge {
+  width: 13px; height: 13px; border-radius: 0; background: transparent;
+  color: var(--text-dim); font-size: 10px;
+}
+.conv-tool[data-status="done"] .conv-tool-name { font-family: var(--mono); color: var(--text-dim); }
+/* The status label collapses to a small done-dot (the ::before), the text itself is hidden. */
+.conv-tool[data-status="done"] .conv-tool-status-text { display: none; }
+.conv-tool[data-status="done"] .conv-tool-status::before {
+  content: ""; flex: 0 0 auto; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--live); opacity: 0.7;
+}
+/* Chevron hidden by default, revealed on hover + while expanded. */
+.conv-tool[data-status="done"] .conv-tool-chevron { font-size: 10px; opacity: 0; }
+.conv-tool[data-status="done"] .conv-tool-head:hover .conv-tool-chevron,
+.conv-tool[data-status="done"].expanded .conv-tool-chevron { opacity: 1; }
+/* Done body indents to align under the row content (badge gutter), tighter padding. */
+.conv-tool[data-status="done"] .conv-tool-body { padding: 0 7px 3px 25px; }
+.conv-tool[data-status="done"] .conv-tool-input,
+.conv-tool[data-status="done"] .conv-tool-result {
+  margin: 1px 0; font-size: 11px; color: var(--text-dim);
+}
+
+/* RUNNING — prominent accent card; bold mono name; uppercase live status with a pulsing dot. */
+.conv-tool[data-status="running"] {
+  margin: 3px 0; border: 1px solid var(--accent-soft); border-radius: 8px;
+  background: var(--conv-tool-run-bg);
+  animation: conv-tool-settle 0.22s ease both;
+}
+.conv-tool[data-status="running"] .conv-tool-head { padding: 6px 9px; gap: 8px; font-size: 12px; }
+.conv-tool[data-status="running"] .conv-tool-badge {
+  width: 18px; height: 18px; border-radius: 5px;
+  background: var(--accent-soft); color: var(--accent); font-size: 10px;
+}
+.conv-tool[data-status="running"] .conv-tool-name { font-family: var(--mono); font-weight: 700; color: var(--text); }
+.conv-tool[data-status="running"] .conv-tool-status {
+  color: var(--accent); font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+.conv-tool-pulse {
+  flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); opacity: 0.7;
+  animation: conv-working-pulse 1s ease-in-out infinite;
+}
+.conv-tool[data-status="running"] .conv-tool-chevron { opacity: 1; }
+.conv-tool[data-status="running"] .conv-tool-body { padding: 0 9px 8px; }
+
+/* ERROR — danger border/fill at the denser padding; NEVER collapses to the slim treatment. */
+.conv-tool[data-status="error"] {
+  margin: 3px 0; border: 1px solid var(--conv-danger); border-radius: 8px;
+  background: var(--conv-danger-soft);
+}
+.conv-tool[data-status="error"] .conv-tool-head { padding: 6px 9px; gap: 8px; font-size: 12px; }
+.conv-tool[data-status="error"] .conv-tool-badge {
+  width: 18px; height: 18px; border-radius: 5px;
+  background: var(--conv-danger-soft); color: var(--conv-danger); font-size: 10px;
+}
+.conv-tool[data-status="error"] .conv-tool-name { font-weight: 600; color: var(--text); }
+.conv-tool[data-status="error"] .conv-tool-status { color: var(--conv-danger); }
+.conv-tool[data-status="error"] .conv-tool-chevron { opacity: 1; }
+.conv-tool[data-status="error"] .conv-tool-body { padding: 0 9px 8px; }
+
+/* ---- best-effort Skill chip (observed-name only) ---- */
+.conv-chip {
+  flex: 0 0 auto; padding: 1px 7px; border-radius: 10px;
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.conv-chip-skill { background: var(--accent-soft); color: var(--accent); }
+
+/* ---- nested subagent group (accent left border, keyed by agent_id; NO name label) ---- */
+.conv-subagent {
+  border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0;
+  background: var(--accent-soft);
+  padding: 8px 10px 8px 12px; margin-left: 2px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.conv-subagent-header {
+  display: flex; flex-direction: column; gap: 2px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+.conv-subagent-title {
+  font-family: var(--ui); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent);
+}
+.conv-subagent-desc {
+  font-family: var(--ui); font-size: 12.5px; font-weight: 600; color: var(--text);
+}
+.conv-subagent-prompt {
+  font-family: var(--ui); font-size: 11.5px; color: var(--text-dim);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* ---- mode chips + build banner ---- */
+.conv-mode {
+  align-self: flex-start; padding: 3px 11px; border-radius: 12px;
+  border: 1px solid var(--border); background: var(--bg-window);
+  color: var(--text-dim); font-family: var(--ui); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.conv-mode-build {
+  align-self: stretch; border-radius: 8px; text-transform: none; letter-spacing: 0;
+  border-color: var(--conv-build-text); background: var(--conv-build-bg);
+  color: var(--conv-build-text); padding: 9px 13px; font-size: 12.5px;
+}
+
+/* ---- awaiting-review notice (rendered by 02; resolved by 03) ---- */
+.conv-perm-request {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-window); color: var(--text-dim);
+  padding: 9px 13px; font-family: var(--ui); font-size: 12.5px;
+}
+
+/* ---- AskUserQuestion card (interactive question + answers) ---- */
+.conv-question {
+  border: 1px solid var(--accent); border-radius: 10px;
+  background: var(--bg-window); padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 14px;
+  font-family: var(--ui); font-size: 13px; color: var(--text);
+}
+.conv-question-section { display: flex; flex-direction: column; gap: 6px; }
+.conv-question-header { font-weight: 700; color: var(--accent); font-size: 12px; }
+.conv-question-text { color: var(--text); font-size: 13px; }
+.conv-question-option {
+  display: flex; align-items: baseline; gap: 7px; cursor: pointer;
+  padding: 4px 2px;
+}
+.conv-question-option-label { color: var(--text); }
+.conv-question-option-desc { color: var(--text-dim); font-size: 12px; }
+/* Free-text "Other…" input — revealed when the synthetic Other toggle is selected. */
+.conv-question-other-input {
+  height: 28px; padding: 0 10px; margin-left: 22px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-window); color: var(--text);
+  font-family: var(--ui); font-size: 13px;
+}
+.conv-question-other-input::placeholder { color: var(--text-dim); }
+.conv-question-other-input:focus { outline: none; border-color: var(--accent); }
+.conv-question-submit {
+  align-self: flex-start; height: 28px; padding: 0 16px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--accent); color: var(--conv-on-accent);
+  font-family: var(--ui); font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.conv-question-submit:hover:not(:disabled) { opacity: 0.9; }
+.conv-question-submit:disabled {
+  opacity: 0.4; cursor: default; background: var(--bg-window);
+  border-color: var(--border); color: var(--text-dim);
+}
+/* Answered state — read-only record of the chosen answers. */
+.conv-question-answered { border-color: var(--border); }
+.conv-question-answer {
+  color: var(--accent); font-weight: 600; font-size: 12.5px;
+}
+
+/* ---- permission_denied / result / error / exit rows ---- */
+.conv-perm-denied {
+  border: 1px solid var(--conv-danger); border-radius: 8px;
+  background: var(--conv-danger-soft); color: var(--conv-danger);
+  padding: 9px 13px; font-family: var(--ui); font-size: 12.5px;
+}
+.conv-result {
+  align-self: flex-start; padding: 7px 13px; border-radius: 8px;
+  border: 1px solid var(--live); background: var(--bg-window);
+  color: var(--live); font-family: var(--ui); font-size: 12px; font-weight: 600;
+}
+.conv-result-error { border-color: var(--conv-danger); color: var(--conv-danger); }
+/* A deliberately-interrupted turn (the orchestrator's gate boundary) — muted/neutral, NOT an error face. */
+.conv-result-interrupted { border-color: var(--border); color: var(--text-dim); font-weight: 400; }
+.conv-error {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--conv-danger-soft); color: var(--conv-danger);
+  padding: 9px 13px; font-family: var(--ui); font-size: 12.5px;
+}
+.conv-error-fatal { border-color: var(--conv-danger); font-weight: 600; }
+.conv-exit {
+  color: var(--text-faint); font-family: var(--ui); font-size: 11.5px;
+  padding: 4px 2px; font-style: italic;
+}
+/* A plain notice (an informational orchestrator message) — neutral/informational, NOT an error face. */
+.conv-notice {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-window); color: var(--text);
+  padding: 9px 13px; font-family: var(--ui); font-size: 12.5px;
+}
+
+/* ---- plan-select history empty state ---- */
+/* A muted, centered placeholder painted into #conversation-stream when a selected plan has no
+   resolvable transcript (no-transcript) or yields no renderable content (no-content). Visually
+   distinct from a .conv-notice row (no border/card — just dimmed, centered guidance text). */
+.conv-empty {
+  color: var(--text-dim); font-family: var(--ui); font-size: 13px;
+  text-align: center; padding: 32px 16px; line-height: 1.5;
+}
+
+/* ---- composer modal ---- */
+.conv-modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--conv-overlay);
+}
+.conv-modal-card {
+  width: min(560px, 92vw); max-height: 86vh; overflow-y: auto;
+  background: var(--bg-window); border: 1px solid var(--border); border-radius: 14px;
+  padding: 20px 22px; box-shadow: 0 18px 50px var(--conv-shadow);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.conv-modal-head h3 { margin: 0 0 4px; font-size: 16px; color: var(--text); }
+.conv-field-label {
+  font-family: var(--ui); font-size: 11px; font-weight: 600; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-top: 4px;
+}
+.conv-request, .conv-dir-field, .conv-auth-input {
+  width: 100%; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg-window); color: var(--text);
+  font-family: var(--ui); font-size: 13px;
+}
+.conv-request { resize: vertical; font-family: var(--ui); }
+.conv-request:focus, .conv-dir-field:focus, .conv-auth-input:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.conv-dir-field[readonly] { color: var(--text-dim); }
+.conv-dir-row, .conv-auth-row { display: flex; gap: 8px; }
+.conv-dir-row .conv-dir-field, .conv-auth-row .conv-auth-input { flex: 1 1 auto; }
+.conv-modal-foot {
+  display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px;
+}
+.conv-btn {
+  padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg-window); color: var(--text);
+  font-family: var(--ui); font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.conv-btn:hover { border-color: var(--accent); color: var(--accent); }
+.conv-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--conv-on-accent); }
+.conv-btn-primary:hover { background: var(--accent); color: var(--conv-on-accent); opacity: 0.9; }
+
+/* ---- auth onboarding block (inside the composer) ---- */
+.conv-auth {
+  border: 1px solid var(--accent); border-radius: 10px;
+  background: var(--accent-soft); padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.conv-auth-msg { margin: 0; font-family: var(--ui); font-size: 12.5px; color: var(--text); }
+.conv-auth-msg code {
+  font-family: var(--mono); font-size: 0.92em;
+  background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
+}
+
+/* Generic hide hook: any element with `.hidden` is removed from layout. Component-scoped
+   `.hidden` rules above remain (higher specificity, harmless duplicates). Added because the
+   conversation domain (#composer-modal/.conv-auth/.conv-error) toggled `.hidden` with no CSS
+   backing it, leaving the modal/banner/error permanently visible. */
+.hidden { display: none !important; }

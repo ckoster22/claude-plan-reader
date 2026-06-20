@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-set-focus",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "opener:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [{ "name": "agent-driver", "sidecar": true }]
+    },
+    {
+      "identifier": "shell:allow-stdin-write",
+      "allow": [{ "name": "agent-driver", "sidecar": true }]
+    },
+    {
+      "identifier": "shell:allow-kill",
+      "allow": [{ "name": "agent-driver", "sidecar": true }]
+    },
+    "dialog:allow-open"
+  ]
+}

@@ -1,0 +1,59 @@
+[package]
+name = "tauri-app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+# Agent SDK driver (Sub-Plan 01) — spawns the compiled `agent-driver` sidecar as
+# an `externalBin`, giving a (Receiver<CommandEvent>, CommandChild) pair: the
+# stdout JSON-lines stream + stdin-write + kill handles the driver needs. Pinned
+# to a reproducible version (verified against crates.io 2026-06); the non-raw
+# reader line-buffers across pipe reads (splits on \n OR \r, retains the
+# delimiter byte) so one Stdout event == one whole JSON line — agent.rs relies
+# on that, never calling set_raw_out(true).
+tauri-plugin-shell = "=2.3.5"
+# Native folder picker (Sub-Plan 02) — backs the New-plan composer's working-directory
+# "Choose…" button via the frontend `@tauri-apps/plugin-dialog` `open({directory:true})`
+# call. Additive plugin init in lib.rs (`.plugin(tauri_plugin_dialog::init())`); does NOT
+# touch agent.rs. The capability identifier is verified against this crate's permission
+# schema (see src-tauri/capabilities/default.json).
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# File-watch stack — pinned to reproducible versions (verified against crates.io 2026-05).
+# notify-debouncer-full 0.7.0 (>=0.4) uses the RecommendedCache file-ID cache internally,
+# which is what makes atomic-save/rename tracking reliable on macOS. Its current stable
+# constructor is the 3-arg `new_debouncer(timeout, tick_rate, handler)` form (verified by
+# compiling against docs.rs/0.7.0 — the 4-arg `RecommendedCache::new()` form is not in any
+# released stable version).
+notify = "=8.2.0"
+notify-debouncer-full = "=0.7.0"
+dirs = "=6.0.0"
+# base64 for `read_image_as_data_url` — encodes local image bytes into a `data:` URL
+# the WebView can load directly (it cannot fetch `file://`). 0.22 is the current stable
+# line; the deprecated free fns are gone, so we use the Engine API
+# (`general_purpose::STANDARD.encode`).
+base64 = "0.22"
+# Graceful agent-tree teardown (INV-4): the read-task signals a `oneshot` on
+# CommandEvent::Terminated and end/kill_session `block_on(timeout(..))` it, only
+# SIGKILLing as the fallback. tauri re-exports tokio's mpsc + block_on but NOT
+# `sync::oneshot` / `time::timeout`, so we depend on tokio directly. tauri pins
+# tokio 1.x already (same lock entry); we ask only for the two features we use.
+tokio = { version = "1", features = ["sync", "time"] }
+
