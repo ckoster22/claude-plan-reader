@@ -19,8 +19,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 // src-tauri/capabilities/default.json.
 
 // True when the mousedown originated on a drag region (not on an interactive
-// control). Interactive controls (the theme toggle and the Prompt Feedback
-// button) live INSIDE `.titlebar[data-tauri-drag-region]`, so a plain
+// control). Interactive controls (the theme toggle, and later sub-plans'
+// buttons) live INSIDE `.titlebar[data-tauri-drag-region]`, so a plain
 // `closest("[data-tauri-drag-region]")` walk would match the ancestor
 // `.titlebar` and (wrongly) start a window drag on them — which can swallow
 // the ensuing click. We therefore bail FIRST when the target is, or is inside,
@@ -34,7 +34,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 function isDragTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   // Interactive controls inside the drag region (the theme toggle in
-  // .titlebar-controls, and the Prompt Feedback button) must never start a
+  // .titlebar-controls, and later sub-plans' buttons) must never start a
   // window drag — closest() would otherwise match the ancestor .titlebar.
   if (target.closest("button, a, input, select, textarea, [data-no-drag]")) return false;
   return target.closest("[data-tauri-drag-region]") !== null;
@@ -160,15 +160,22 @@ export function nextTextSize(currentPx: number, dir: 1 | -1): number {
 // Wire the A− / A+ reading-pane text-size steppers. Mirrors initThemeToggle:
 // pure-ish + dependency-injected so jsdom tests can pass fake elements + storage.
 //   - reads the persisted size (default DEFAULT_TEXT_SIZE; validated against the ladder)
-//   - applies it via root.style.setProperty("--reading-font-size", px + "px")
+//   - applies it BOTH as the root var (--reading-font-size) AND as a direct inline
+//     style.fontSize on the consuming reading-pane element (see WKWebView note below)
 //   - on a button click: computes nextTextSize, persists, re-applies, updates disabled state
 //   - disables A− at the ladder floor and A+ at the ladder ceiling
 // No-op (safe) when both buttons are null.
+//
+// `target` is the reading-pane element whose font-size the var feeds (.md = #reading-pane;
+// it is the ONLY production consumer of --reading-font-size — the conversation domain uses
+// the separate --conv-* token set, so it is intentionally not touched here). Injected for
+// jsdom testability; defaults to the live #reading-pane.
 export function initTextSize(
   decButton: Element | null,
   incButton: Element | null,
   root: HTMLElement = document.documentElement,
   storage: Pick<Storage, "getItem" | "setItem"> = localStorage,
+  target: HTMLElement | null = document.querySelector("#reading-pane"),
 ): void {
   const ladder = TEXT_SIZE_LADDER;
   const min = ladder[0];
@@ -182,7 +189,18 @@ export function initTextSize(
   let size = readSize();
 
   const apply = (): void => {
+    // Keep the root var: the anti-FOUC inline script (index.html) sets it before
+    // #reading-pane exists, and .md{font-size:var(--reading-font-size)} drives the
+    // initial paint off it. Do NOT remove it.
     root.style.setProperty("--reading-font-size", size + "px");
+    // LEARNED THE HARD WAY (WKWebView repaint quirk): in WebKit, changing a CSS custom
+    // property on :root that feeds a var()-derived INHERITED font-size updates computed
+    // style but does NOT invalidate paint — getComputedStyle reports the new size yet the
+    // on-screen glyphs never repaint (confirmed in the live native app via WebView devtools;
+    // Blink/Chrome i.e. `npm run mock` does NOT reproduce, so unit tests + the mock harness
+    // pass while the native app stays broken). Setting font-size DIRECTLY as an inline style
+    // on the consuming element DOES invalidate paint. Both writes are required — keep them.
+    if (target) target.style.fontSize = size + "px";
     // Disable the stepper that would overshoot the ladder end.
     if (decButton instanceof HTMLButtonElement) decButton.disabled = size <= min;
     if (incButton instanceof HTMLButtonElement) incButton.disabled = size >= max;

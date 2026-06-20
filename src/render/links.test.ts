@@ -95,4 +95,43 @@ describe("attachLinkHandler — click handling (default-DENY navigation)", () =>
     expect(ev.defaultPrevented).toBe(true);
     expect(openUrl).not.toHaveBeenCalled();
   });
+
+  it("a bare '#' anchor preventDefaults and does NOT throw (empty fragment id guard)", () => {
+    // A bare `#` yields an empty fragment id; querySelector('#') throws a SyntaxError without the
+    // guard. INV-5 routes conversation fragment links through this handler, so it must be safe.
+    const pane = document.createElement("div");
+    const a = document.createElement("a");
+    a.setAttribute("href", "#");
+    a.textContent = "top";
+    pane.appendChild(a);
+    document.body.appendChild(pane);
+    attachLinkHandler(pane);
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    // FALSIFY: remove the empty-id guard → querySelector('#') throws → this dispatch throws → RED.
+    expect(() => a.dispatchEvent(ev)).not.toThrow();
+    expect(ev.defaultPrevented).toBe(true);
+    expect(openUrl).not.toHaveBeenCalled();
+  });
+
+  it("attachLinkHandler is idempotent: calling twice does NOT double-bind the click listener (INV-5)", () => {
+    // The seam relies on idempotency — renderTree attaches once per frame against the SAME stable
+    // container, so repeated attach must not stack handlers (which would fire openUrl twice).
+    const pane = document.createElement("div");
+    const a = document.createElement("a");
+    a.setAttribute("href", "https://example.com/once");
+    a.dataset.external = "1";
+    a.textContent = "link";
+    pane.appendChild(a);
+    document.body.appendChild(pane);
+
+    attachLinkHandler(pane);
+    attachLinkHandler(pane); // second call must be a no-op (WeakSet-guarded)
+
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    a.dispatchEvent(ev);
+
+    // FALSIFY: drop the WeakSet guard → two listeners → openUrl called twice → RED.
+    expect(openUrl).toHaveBeenCalledTimes(1);
+    expect(ev.defaultPrevented).toBe(true);
+  });
 });

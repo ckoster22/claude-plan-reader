@@ -40,6 +40,9 @@ export function attachLinkHandler(paneEl: HTMLElement): void {
       // Intra-doc anchor: scroll the target into view within the pane.
       ev.preventDefault();
       const id = href.slice(1);
+      // A bare `#` (empty fragment id) is a same-document no-op; `querySelector("#")`
+      // would throw a SyntaxError on the empty selector, so bail out before querying.
+      if (id === "") return;
       // Try id, then a name attribute fallback.
       const dest =
         paneEl.querySelector(`#${cssEscape(id)}`) ??

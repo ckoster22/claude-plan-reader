@@ -1,4 +1,4 @@
-// Testable core of the post-list cwd resolution + retry policy.
+// Sub-Plan 03 — testable core of the post-list cwd resolution + retry policy.
 //
 // Extracted from `main.ts` so the "thrown error stays retryable, null result re-attempts a
 // bounded number of times then pins unknown" policy is unit-testable without the DOM. The

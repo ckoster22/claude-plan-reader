@@ -5,6 +5,9 @@ import {
   THEME_KEY,
   nextTextSize,
   TEXT_SIZE_LADDER,
+  initTextSize,
+  TEXT_SIZE_KEY,
+  DEFAULT_TEXT_SIZE,
 } from "./titlebar";
 
 // Window-drag regression guard.
@@ -293,5 +296,158 @@ describe("nextTextSize steps and clamps", () => {
     expect(nextTextSize(13.4, -1)).toBe(13);
     // Way above the ceiling snaps to 21, then +1 clamps at 21.
     expect(nextTextSize(100, 1)).toBe(21);
+  });
+});
+
+// initTextSize behavior (the wiring around nextTextSize). Mirrors the
+// initThemeToggle tests: pure + dependency-injected, so jsdom can pass fake
+// buttons + a fake root element + fake storage.
+//
+// INVARIANT (asserted independent of the current implementation):
+//   - A+ click RAISES --reading-font-size by exactly one ladder rung and persists it.
+//   - A− click LOWERS --reading-font-size by exactly one ladder rung and persists it.
+//   - At the ladder ceiling A+ is a no-op (no overshoot, nothing persisted); same
+//     for A− at the floor.
+//   - The persisted value (from a prior session) is RE-APPLIED to the var at init.
+//
+// These are falsifiable: if the click listeners are wired to the wrong handler
+// (e.g. dec→step(+1)) or the var is set on the wrong element / not at all, the
+// font-size assertions go red.
+describe("initTextSize behavior", () => {
+  function setup(persisted?: number) {
+    const root = document.createElement("html");
+    const decButton = document.createElement("button");
+    const incButton = document.createElement("button");
+    // The reading-pane element the var feeds. The native fix sets font-size DIRECTLY
+    // on it (WKWebView repaint quirk — see initTextSize); we assert both writes below.
+    const target = document.createElement("div");
+    const store = new Map<string, string>();
+    if (persisted !== undefined) store.set(TEXT_SIZE_KEY, String(persisted));
+    const storage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: vi.fn((k: string, v: string) => {
+        store.set(k, v);
+      }),
+    };
+    return { root, decButton, incButton, target, storage, store };
+  }
+
+  const fontPx = (root: HTMLElement) =>
+    root.style.getPropertyValue("--reading-font-size");
+
+  const click = (b: Element) =>
+    b.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+  it("applies the default size to --reading-font-size at init when nothing is persisted", () => {
+    const { root, decButton, incButton, storage, target } = setup();
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe(`${DEFAULT_TEXT_SIZE}px`);
+  });
+
+  it("re-applies the PERSISTED size to --reading-font-size at init", () => {
+    const { root, decButton, incButton, storage, target } = setup(19);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe("19px");
+  });
+
+  it("clicking A+ RAISES the var by exactly one ladder rung and persists it", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe("15px");
+
+    click(incButton);
+
+    // 15 → next rung up is 17.
+    expect(fontPx(root)).toBe("17px");
+    expect(storage.setItem).toHaveBeenCalledWith(TEXT_SIZE_KEY, "17");
+  });
+
+  it("clicking A− LOWERS the var by exactly one ladder rung and persists it", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(decButton);
+
+    // 15 → next rung down is 14.
+    expect(fontPx(root)).toBe("14px");
+    expect(storage.setItem).toHaveBeenCalledWith(TEXT_SIZE_KEY, "14");
+  });
+
+  it("A+ at the ceiling is a no-op: the var stays at the max and nothing is persisted", () => {
+    const max = TEXT_SIZE_LADDER[TEXT_SIZE_LADDER.length - 1];
+    const { root, decButton, incButton, storage, target } = setup(max);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(incButton);
+
+    expect(fontPx(root)).toBe(`${max}px`);
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  it("A− at the floor is a no-op: the var stays at the min and nothing is persisted", () => {
+    const min = TEXT_SIZE_LADDER[0];
+    const { root, decButton, incButton, storage, target } = setup(min);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(decButton);
+
+    expect(fontPx(root)).toBe(`${min}px`);
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  it("round-trips: A+ then A− returns to the starting rung", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(incButton); // 15 → 17
+    expect(fontPx(root)).toBe("17px");
+    click(decButton); // 17 → 15
+    expect(fontPx(root)).toBe("15px");
+  });
+
+  // WKWebView repaint-quirk regression guard. The native bug: changing only the :root
+  // custom property updates computed style but does NOT repaint glyphs in WebKit. The fix
+  // ALSO writes font-size directly onto the consuming reading-pane element (which DOES
+  // invalidate paint). These assert that direct write at init and on each step.
+  //
+  // FALSIFIABLE: comment out `if (target) target.style.fontSize = size + "px";` in
+  // initTextSize and these go red (the var-only assertions above still pass — which is
+  // exactly why they could not catch the native bug). jsdom/Blink cannot prove the visual
+  // repaint; this only proves the inline write is performed.
+  const inlinePx = (el: HTMLElement) => el.style.fontSize;
+
+  it("writes the persisted size DIRECTLY onto the target element's inline font-size at init", () => {
+    const { root, decButton, incButton, storage, target } = setup(19);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(inlinePx(target)).toBe("19px");
+  });
+
+  it("clicking A+ writes the new rung to BOTH the root var AND the target's inline font-size", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+    expect(fontPx(root)).toBe("15px");
+    expect(inlinePx(target)).toBe("15px");
+
+    click(incButton);
+
+    expect(fontPx(root)).toBe("17px");
+    expect(inlinePx(target)).toBe("17px");
+  });
+
+  it("clicking A− writes the new rung to BOTH the root var AND the target's inline font-size", () => {
+    const { root, decButton, incButton, storage, target } = setup(15);
+    initTextSize(decButton, incButton, root, storage, target);
+
+    click(decButton);
+
+    expect(fontPx(root)).toBe("14px");
+    expect(inlinePx(target)).toBe("14px");
+  });
+
+  it("is a safe no-op when target is null (still updates the root var)", () => {
+    const { root, decButton, incButton, storage } = setup(15);
+    initTextSize(decButton, incButton, root, storage, null);
+    click(incButton);
+    expect(fontPx(root)).toBe("17px");
   });
 });

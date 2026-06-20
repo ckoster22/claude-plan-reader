@@ -74,7 +74,7 @@ vi.mock("./render", async () => {
     }),
     settle: vi.fn(() => H.settleMock()),
     extractToc: actual.extractToc,
-    // Comment facade exports — no-ops here (this test exercises the ToC rebuild guard, not
+    // Sub-Plan 02 facade exports — no-ops here (this test exercises the ToC rebuild guard, not
     // the comment re-apply). loadCommentsFor resolves immediately so the openPlan/reload flows
     // complete; applyComments is a no-op.
     applyComments: vi.fn(),

@@ -1,11 +1,11 @@
-// Pure prompt-generation for the "Prompt Feedback" overlay.
+// Sub-Plan 03 — pure prompt-generation for the "Prompt Feedback" overlay.
 //
 // Standalone & pure (imports only the CommentRecord type) so it is unit-testable with no DOM /
 // Tauri. main.ts (title-bar domain) consumes it; the render facade does NOT — the feedback
 // button is title-bar chrome, not reading-pane content.
 //
-// Output is a lead line, then ONE numbered entry per record — `N. Re: "<quote>"` with the
-// comment on the next indented line.
+// Output mirrors the interactive prototype (.plan-tree/prototype/index.html): a lead line, then
+// ONE numbered entry per record — `N. Re: "<quote>"` with the comment on the next indented line.
 
 import type { CommentRecord } from "./types";
 

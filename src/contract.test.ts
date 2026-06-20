@@ -1,10 +1,11 @@
 // Wire contract-conformance test (TS side).
 //
 // HONEST SCOPE: this test locks the SHAPE the frontend EXPECTS of a `list_plans` response —
-// the exact six snake_case keys per record (CONTRACT.md §"PlanRecord") — and gives render
-// coverage across the cwd null/real-path branches. The fixture is authored AGAINST CONTRACT.md,
-// not copied from a runtime dump, so it is a written statement of the contract, not an
-// observation of the backend.
+// the exact twelve snake_case keys per record (CONTRACT.md §"PlanRecord — five appended fields"
+// + §"PlanRecord — additive `nn_path` field")
+// — and gives render coverage across all three flavors + the cwd null/real-path branches. The
+// fixture is authored AGAINST CONTRACT.md, not copied from a runtime dump, so it is a written
+// statement of the contract, not an observation of the backend.
 //
 // It does NOT validate the live backend or assert how Rust serializes `PlanRecord`. The
 // authoritative Rust→JSON serialization is asserted by the Rust-side test; drift is therefore
@@ -52,14 +53,21 @@ import { asAbsPath, asStem, type PlanRecord, type SidebarCtx, type CommentRecord
 import fixture from "./__fixtures__/list_plans.sample.json";
 
 // ---- Contract anchor ---------------------------------------------------------------------
-// The six snake_case keys the frontend expects on every PlanRecord, sorted. Written out
-// literally so an added/dropped fixture key is caught by the deep-equal below.
+// The twelve snake_case keys the frontend expects on every PlanRecord, sorted. Written out
+// literally so an added/dropped fixture key is caught by the deep-equal below. `nn_path` is the
+// Phase-2 additive field: the full canonical dotted id ("02.01"); `nn` stays = first segment.
 const EXPECTED_KEYS = [
   "absolute_path",
+  "child_count",
+  "collapsed",
   "cwd",
   "filename_stem",
+  "flavor",
   "h1s",
   "mtime_ms",
+  "nn",
+  "nn_path",
+  "tree_id",
   "unread",
 ].sort();
 
@@ -69,6 +77,7 @@ const EXPECTED_KEYS = [
 function toPlanRecord(raw: (typeof fixture)[number]): PlanRecord {
   return {
     ...raw,
+    flavor: raw.flavor as PlanRecord["flavor"],
     absolute_path: asAbsPath(raw.absolute_path),
     filename_stem: asStem(raw.filename_stem),
   };
@@ -79,7 +88,10 @@ const records: PlanRecord[] = fixture.map(toPlanRecord);
 function makeCtx(over: Partial<SidebarCtx> = {}): SidebarCtx {
   return {
     openPath: null,
+    collapseOverride: new Map(),
+    subCollapse: new Map(),
     onOpen: vi.fn(),
+    onToggleCollapse: vi.fn(),
     ...over,
   };
 }
@@ -94,8 +106,8 @@ beforeEach(() => {
 });
 
 describe("contract — fixture sanity (authored against CONTRACT.md)", () => {
-  it("contains a small flat list of plain records", () => {
-    expect(fixture.length).toBeGreaterThanOrEqual(2);
+  it("contains exactly one master, two subs, and one standalone in pre-ordered display shape", () => {
+    expect(fixture.map((r) => r.flavor)).toEqual(["master", "sub", "sub", "standalone"]);
   });
 
   it("covers both cwd states: at least one null cwd and at least one real-path cwd", () => {
@@ -103,21 +115,40 @@ describe("contract — fixture sanity (authored against CONTRACT.md)", () => {
     expect(fixture.some((r) => typeof r.cwd === "string" && r.cwd.length > 0)).toBe(true);
   });
 
-  it("covers the h1s branches: at least one non-empty and at least one empty heading list", () => {
-    expect(fixture.some((r) => r.h1s.length > 0)).toBe(true);
-    expect(fixture.some((r) => r.h1s.length === 0)).toBe(true);
+  it("the master has a non-null tree_id, child_count>=1, collapsed:false; subs share its tree_id with an nn", () => {
+    const master = fixture.find((r) => r.flavor === "master")!;
+    expect(master.tree_id).not.toBeNull();
+    expect(master.child_count).toBeGreaterThanOrEqual(1);
+    expect(master.collapsed).toBe(false);
+
+    const subs = fixture.filter((r) => r.flavor === "sub");
+    for (const sub of subs) {
+      expect(sub.tree_id).toBe(master.tree_id);
+      expect(typeof sub.nn).toBe("number");
+      // nn_path is the canonical dotted id; for these flat (depth-1) subs it is the
+      // zero-padded single segment, and nn equals its first segment.
+      expect(typeof sub.nn_path).toBe("string");
+      expect(Number(sub.nn_path!.split(".")[0])).toBe(sub.nn);
+    }
+  });
+
+  it("the standalone has null tree_id, nn, and child_count", () => {
+    const standalone = fixture.find((r) => r.flavor === "standalone")!;
+    expect(standalone.tree_id).toBeNull();
+    expect(standalone.nn).toBeNull();
+    expect(standalone.child_count).toBeNull();
   });
 });
 
 describe("contract — PlanRecord key set is locked", () => {
-  it("EVERY fixture record has exactly the six expected snake_case keys (no more, no fewer)", () => {
+  it("EVERY fixture record has exactly the twelve expected snake_case keys (no more, no fewer)", () => {
     for (const raw of fixture) {
       expect(Object.keys(raw).sort()).toEqual(EXPECTED_KEYS);
     }
   });
 
-  it("the expected key set is exactly six keys", () => {
-    expect(EXPECTED_KEYS).toHaveLength(6);
+  it("the expected key set is exactly twelve keys", () => {
+    expect(EXPECTED_KEYS).toHaveLength(12);
   });
 });
 
@@ -131,8 +162,13 @@ describe("contract — fixture is consumable as PlanRecord[]", () => {
       // Non-branded fields survive the spread unchanged and keep their contract types.
       expect(typeof rec.mtime_ms).toBe("number");
       expect(typeof rec.unread).toBe("boolean");
+      expect(typeof rec.collapsed).toBe("boolean");
+      expect(["master", "sub", "standalone"]).toContain(rec.flavor);
       expect(rec.cwd === null || typeof rec.cwd === "string").toBe(true);
-      expect(Array.isArray(rec.h1s)).toBe(true);
+      expect(rec.tree_id === null || typeof rec.tree_id === "string").toBe(true);
+      expect(rec.nn === null || typeof rec.nn === "number").toBe(true);
+      expect(rec.nn_path === null || typeof rec.nn_path === "string").toBe(true);
+      expect(rec.child_count === null || typeof rec.child_count === "number").toBe(true);
     }
   });
 });
@@ -151,7 +187,7 @@ describe("contract — table-of-contents sidebar selectors present in index.html
     'id="plan-filter"',
     'class="search"',
     'class="clear"',
-    // Theme toggle in the .titlebar-controls slot + the persisted-theme
+    // Sub-Plan 01: theme toggle in the .titlebar-controls slot + the persisted-theme
     // localStorage key (pins the inline anti-FOUC script's key to the contract).
     'class="titlebar-controls"',
     'id="theme-toggle"',
@@ -196,7 +232,7 @@ describe("contract — text-size anti-FOUC literals pinned in index.html", () =>
   });
 });
 
-describe("contract — highlight/comment selectors present in index.html", () => {
+describe("contract — Sub-Plan 02 highlight/comment selectors present in index.html", () => {
   // Popover markup the comment feature depends on. Reads the real file, so removing any of
   // these from index.html turns its assertion red.
   const TOKENS = [
@@ -243,10 +279,11 @@ describe("contract — highlight/comment selectors present in index.html", () =>
   });
 });
 
-describe("contract — Prompt Feedback selectors present in index.html", () => {
-  // Button + overlay markup the feedback feature depends on. Reads the real index.html, so removing
-  // any of these turns its assertion red. The facade `clearAllComments` is asserted separately.
-  const TOKENS = [
+describe("contract — Prompt Feedback button + overlay are REMOVED from index.html", () => {
+  // The old titlebar "Prompt Feedback" button + its overlay were removed (commenting goes through the
+  // conversation composer + the #review-bar now). These tokens must NOT appear anywhere in the real
+  // index.html, so a re-introduction turns this red.
+  const REMOVED = [
     'id="feedback-btn"',
     'id="feedback-count"',
     'id="feedback-overlay"',
@@ -254,38 +291,30 @@ describe("contract — Prompt Feedback selectors present in index.html", () => {
     'id="feedback-copy"',
     'id="feedback-clear"',
   ];
-  for (const token of TOKENS) {
-    it(`index.html contains \`${token}\``, () => {
-      expect(INDEX_HTML).toContain(token);
+  for (const token of REMOVED) {
+    it(`index.html does NOT contain \`${token}\``, () => {
+      expect(INDEX_HTML).not.toContain(token);
     });
   }
 
-  it("the feedback overlay lives OUTSIDE #reading-pane (survives the pane's innerHTML wipe)", () => {
-    // Appears AFTER #reading-pane closes, as a sibling under .window (not nested in the pane).
-    const paneIdx = INDEX_HTML.indexOf('id="reading-pane"');
-    const overlayIdx = INDEX_HTML.indexOf('id="feedback-overlay"');
-    expect(paneIdx).toBeGreaterThan(-1);
-    expect(overlayIdx).toBeGreaterThan(paneIdx);
-  });
-
-  it("the feedback button is the FIRST control in .titlebar-controls (theme toggle stays far-right)", () => {
-    // #feedback-btn must precede #theme-toggle inside the markup.
-    expect(INDEX_HTML).toMatch(/class="titlebar-controls"[\s\S]*id="feedback-btn"[\s\S]*id="theme-toggle"/);
-  });
-
-  it("neither the feedback button nor overlay carries data-tauri-drag-region", () => {
-    // Slice the button markup and the overlay markup and assert the drag attribute is absent in
-    // each (the titlebar wrapper carries it, so a global check would be wrong).
-    const btnStart = INDEX_HTML.indexOf('id="feedback-btn"');
-    const btnEnd = INDEX_HTML.indexOf('id="theme-toggle"');
-    expect(INDEX_HTML.slice(btnStart, btnEnd)).not.toContain("data-tauri-drag-region");
-    const ovStart = INDEX_HTML.indexOf('id="feedback-overlay"');
-    const ovEnd = INDEX_HTML.indexOf('id="feedback-clear"');
-    expect(INDEX_HTML.slice(ovStart, ovEnd)).not.toContain("data-tauri-drag-region");
-  });
-
   it("the facade clearAllComments surface is documented in CONTRACT.md", () => {
     expect(CONTRACT_MD).toContain("clearAllComments");
+  });
+});
+
+describe("contract — #sdk-status pill lives in the sidebar (moved off the titlebar)", () => {
+  it("#sdk-status appears INSIDE the sidebar's Plans tab, not the titlebar-controls", () => {
+    const statusIdx = INDEX_HTML.indexOf('id="sdk-status"');
+    expect(statusIdx).toBeGreaterThan(-1);
+    // It must come AFTER the sidebar's Plans head (#plan-count) — i.e. it is sidebar chrome now.
+    const planCountIdx = INDEX_HTML.indexOf('id="plan-count"');
+    expect(planCountIdx).toBeGreaterThan(-1);
+    expect(statusIdx).toBeGreaterThan(planCountIdx);
+    // And it must NOT sit between the titlebar-controls open and the #new-plan-btn (its old home).
+    const controlsIdx = INDEX_HTML.indexOf('class="titlebar-controls"');
+    const themeToggleIdx = INDEX_HTML.indexOf('id="theme-toggle"');
+    const titlebarControlsSlice = INDEX_HTML.slice(controlsIdx, themeToggleIdx);
+    expect(titlebarControlsSlice).not.toContain('id="sdk-status"');
   });
 });
 
@@ -328,16 +357,25 @@ describe("contract — CommentRecord carries exactly its 6 fields (separate from
   });
 });
 
-describe("contract — render coverage across cwd states", () => {
-  it("renders every fixture record as a flat .plan row without throwing", () => {
+describe("contract — render coverage across flavors + cwd states", () => {
+  it("renders all three flavors from the fixture without throwing: master row, sub rows, standalone row", () => {
     expect(() => renderSidebar(listEl, records, makeCtx())).not.toThrow();
 
-    const rows = listEl.querySelectorAll<HTMLElement>(".plan[data-path]");
-    expect(rows.length).toBe(records.length);
-    for (const row of Array.from(rows)) {
-      expect(row.classList.contains("master")).toBe(false);
-      expect(row.classList.contains("sub")).toBe(false);
-    }
+    // master → .master wrapper with a .master-row
+    const masterRow = listEl.querySelector('.master .master-row[data-path="/Users/u/.claude/plans/master-alpha.md"]');
+    expect(masterRow).toBeTruthy();
+
+    // both subs nested under the master's .children
+    const subs = listEl.querySelectorAll(".master .children .plan.sub");
+    expect(subs.length).toBe(2);
+
+    // standalone → a flat .plan that is neither .master nor .sub
+    const standalone = listEl.querySelector<HTMLElement>(
+      '.plan[data-path="/Users/u/.claude/plans/standalone-solo.md"]',
+    )!;
+    expect(standalone).toBeTruthy();
+    expect(standalone.classList.contains("master")).toBe(false);
+    expect(standalone.classList.contains("sub")).toBe(false);
   });
 
   it("the .plan-src cwd display covers BOTH branches: real-path cwd shown verbatim, null cwd ⇒ empty", () => {
@@ -345,19 +383,19 @@ describe("contract — render coverage across cwd states", () => {
 
     // real-path branch: rec.cwd wins in planSrcText. homePath is unset under vitest (homeDir is
     // mocked but never invoked since DOMContentLoaded never fires), so displayCwd returns the
-    // path verbatim — the row's .plan-src shows its real cwd.
-    const realSrc = listEl.querySelector<HTMLElement>(
-      '.plan[data-path="/Users/u/.claude/plans/add-oauth-device-flow.md"] .plan-src',
+    // path verbatim — the master row's .plan-src shows its real cwd.
+    const masterSrc = listEl.querySelector<HTMLElement>(
+      '.master .master-row[data-path="/Users/u/.claude/plans/master-alpha.md"] .plan-src',
     )!;
-    expect(realSrc).toBeTruthy();
-    expect(realSrc.textContent).toBe("/Users/u/work/auth-gateway");
+    expect(masterSrc).toBeTruthy();
+    expect(masterSrc.textContent).toBe("/Users/u/work/alpha");
 
-    // null-cwd branch: fix-reload-race has cwd:null and its stem is absent from cwdByStem
+    // null-cwd branch: standalone-solo has cwd:null and its stem is absent from cwdByStem
     // (unresolved) ⇒ empty string (no "unknown" flash).
-    const nullSrc = listEl.querySelector<HTMLElement>(
-      '.plan[data-path="/Users/u/.claude/plans/fix-reload-race.md"] .plan-src',
+    const standaloneSrc = listEl.querySelector<HTMLElement>(
+      '.plan[data-path="/Users/u/.claude/plans/standalone-solo.md"] .plan-src',
     )!;
-    expect(nullSrc).toBeTruthy();
-    expect(nullSrc.textContent).toBe("");
+    expect(standaloneSrc).toBeTruthy();
+    expect(standaloneSrc.textContent).toBe("");
   });
 });
