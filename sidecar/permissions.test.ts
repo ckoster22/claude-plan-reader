@@ -518,9 +518,68 @@ describe("sidecar permissions — bashDecisionFor under 'prototype' is fail-clos
   it("prototype: find is read-only ONLY without a write action token", () => {
     expect(bashDecisionFor("prototype", "find . -name '*.ts'")).toBeNull();
     expect(bashDecisionFor("prototype", "find src -type f")).toBeNull();
-    for (const action of ["-exec", "-execdir", "-delete", "-ok", "-fprint"]) {
+    // The COMPLETE findutils exec family (-exec/-execdir/-ok/-okdir), -delete, and the -f*
+    // file-write family must ALL deny. -okdir is the interactive twin of -execdir (runs an
+    // arbitrary command in the matched file's dir) — same write/exec class as the rest.
+    for (const action of [
+      "-exec",
+      "-execdir",
+      "-ok",
+      "-okdir",
+      "-delete",
+      "-fls",
+      "-fprint",
+      "-fprint0",
+      "-fprintf",
+    ]) {
       expect(bashDecisionFor("prototype", `find . ${action} foo`), action).not.toBeNull();
     }
+  });
+
+  it("prototype: find -okdir (interactive twin of -execdir) is DENIED (uncovered exec primary)", () => {
+    // -okdir runs an arbitrary command in the matched file's directory — same escape class as
+    // -exec/-execdir/-ok. It was the only findutils exec/write primary still omitted from
+    // FIND_WRITE_ACTIONS after the -f* fix.
+    // FALSIFY: drop "-okdir" from FIND_WRITE_ACTIONS → these return null (allow) → RED.
+    const denied = [
+      "find . -okdir cat {} ;",
+      "find /etc -okdir cat {} +",
+      "find . -name '*.ts' -okdir rm {} ;",
+    ];
+    for (const command of denied) {
+      expect(bashDecisionFor("prototype", command), command).not.toBeNull();
+    }
+  });
+
+  it("prototype: find -fls/-fprintf/-fprint0 (file-write actions) are DENIED (Medium escape)", () => {
+    // The confirmed Medium escape: FIND_WRITE_ACTIONS omitted the -f* file-write actions
+    // (`-fls FILE`, `-fprintf FILE FORMAT`, `-fprint0 FILE`), so `find . -fls out.txt` wrote
+    // an arbitrary file yet returned ALLOW under the fail-closed prototype allowlist — defeating
+    // INV-1 containment (writes confined to <cwd>/.plan-tree/prototype/) with no Write/Edit.
+    // FALSIFY: revert FIND_WRITE_ACTIONS to {-exec,-execdir,-delete,-ok,-fprint} → these
+    // file-writing find forms return null (allow) → every assertion below goes RED.
+    const denied = [
+      "find . -fls out.txt",
+      "find . -fprintf out.txt %p",
+      "find . -fprint0 out.txt",
+      "find / -maxdepth 0 -fls /tmp/x",
+      // an absolute-path write to a sensitive file is the concrete attack
+      "find . -maxdepth 0 -fprintf /Users/alice/.claude/settings.json {}",
+    ];
+    for (const command of denied) {
+      expect(bashDecisionFor("prototype", command), command).not.toBeNull();
+    }
+  });
+
+  it("prototype: read-only -f* find primaries (-fstype/-follow) and -printf still ALLOW (no over-denial)", () => {
+    // The fix must DENY the -f* WRITE actions without regressing the read-only -f* primaries:
+    // `-fstype TYPE` is a filesystem-type TEST (filter), `-follow` is a symlink-follow option, and
+    // `-printf FORMAT` prints to STDOUT (not a file — a stdout redirect would be caught by
+    // OUTPUT_REDIRECT separately). None of these write a file by themselves.
+    // FALSIFY: blanket-deny any `-f*` token → `-fstype`/`-follow` flip to a deny reason → RED.
+    expect(bashDecisionFor("prototype", "find . -fstype apfs -name x"), "-fstype").toBeNull();
+    expect(bashDecisionFor("prototype", "find . -follow -name x"), "-follow").toBeNull();
+    expect(bashDecisionFor("prototype", "find . -printf %p"), "-printf").toBeNull();
   });
 
   it("prototype: echo is read-only ONLY without a redirect (a redirect makes it write-shaped)", () => {
@@ -669,6 +728,13 @@ describe("sidecar permissions — bashDecisionFor under 'plan' preserves test ru
       "npx tsc --noEmit",
       "grep -rn pattern src",
       "find . -name '*.ts'",
+      // read-only find primaries that must NOT be caught by the -f*/-okdir write-action fixes
+      "find . -fstype apfs -name x", // -fstype is a TEST (filter), not a write
+      "find . -follow -name x", // -follow is a symlink option, not a write
+      "find . -printf %p", // -printf prints to STDOUT (not a file)
+      "find . -print", // -print is a STDOUT action, not a write
+      "find . -print0", // -print0 is a STDOUT action, not a write
+      "find . -ls", // -ls is a STDOUT list action — must NOT be matched by `ok(dir)?`/-f* fixes
       "ls -la src",
       "cat README.md",
       "git status",
@@ -720,9 +786,22 @@ describe("sidecar permissions — bashDecisionFor under 'plan' preserves test ru
       "patch < d.diff",
       "truncate -s 0 f",
       "ln -s a b",
-      // find write actions
+      // find write actions — the COMPLETE exec family (-exec/-execdir/-ok/-okdir).
       "find . -delete",
       "find . -exec rm {} +",
+      "find . -execdir rm {} +",
+      "find . -ok rm {} ;",
+      // -okdir is the interactive twin of -execdir; the plan-tier `ok\b` (no boundary between `ok`
+      // and `dir`) did NOT match it, so it escaped. `ok(dir)?` closes it.
+      "find . -okdir cat {} ;",
+      "find /etc -okdir cat {} +",
+      // the -f* file-write find actions (the Medium escape) — the plan-tier regex must deny these
+      // too. The trailing-\b pitfall in the old /…-(…|fprint)\b/ let `-fprintf` slip (the \b cannot
+      // sit between `fprint` and the trailing `f`), and `-fls`/`-fprint0` were absent entirely.
+      "find . -fls out.txt",
+      "find . -fprintf out.txt %p",
+      "find . -fprint0 out.txt",
+      "find / -maxdepth 0 -fls /tmp/x",
       // the originally-covered write verbs stay denied
       "rm -rf build",
       "sed -i 's/a/b/' f",
@@ -1076,6 +1155,11 @@ describe("sidecar permissions — hook tier and canUseTool gate agree on Bash (I
     "install x y",
     "git stash",
     "find . -delete",
+    "find . -fls out.txt", // -f* file-write find action (deny) — both tiers must agree (Medium escape)
+    "find . -fprintf out.txt %p", // -fprintf writes to a FILE (deny)
+    "find . -okdir cat {} ;", // -okdir exec primary (deny) — both tiers must agree (uncovered escape)
+    "find . -fstype apfs -name x", // -fstype is a read-only TEST (allow) — must not over-deny
+    "find . -ls", // -ls is a STDOUT action (allow) — must not over-deny
     "FOO=bar sh -c '...'",
     "rm -rf build",
     "echo x 1>out", // fd-to-file write (deny)

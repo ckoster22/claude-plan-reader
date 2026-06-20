@@ -268,6 +268,27 @@ describe("loadHistoryForPlan — explicit empty states", () => {
     expect(empty!.textContent).toBe("No conversation history found for this plan.");
   });
 
+  it("an UNDEFINED transcript result (command resolved with no payload) coerces to the no-transcript empty state WITHOUT throwing", async () => {
+    // The try/catch in loadHistoryForPlan only catches a REJECTING invoke; a command that RESOLVES
+    // with undefined (an un-stubbed mock, a backend that returned no payload) would deref `res.found`
+    // on undefined and throw out of this async function — an UNHANDLED REJECTION (the call site is
+    // fire-and-forget) that fails the whole `npm test` run despite passing assertions. The defensive
+    // `!res || !res.found` coercion treats undefined as no-transcript.
+    H.transcript = () => undefined;
+    const els = makeEls();
+    const handle = await initConversation(els, () => {});
+    await flush();
+
+    // (1) The call RESOLVES (does not reject/throw). FALSIFY: revert the guard to `if (!res.found)`
+    // → this await rejects with a TypeError → the test errors → RED.
+    await expect(handle.loadHistoryForPlan("payload-less-plan")).resolves.toBeUndefined();
+    await flush();
+    // (2) It lands on the no-transcript empty state (same as an explicit found=false).
+    const empty = els.stream.querySelector(".conv-empty");
+    expect(empty).not.toBeNull();
+    expect(empty!.textContent).toBe("No conversation history found for this plan.");
+  });
+
   it("found=true but lines yield ZERO renderable nodes → .conv-empty with the no-content message", async () => {
     // Lines that pass the filter but produce no nodes: an assistant record with ONLY whitespace text
     // (skipped by the transform) → the synthesized SystemInit alone yields zero render nodes.

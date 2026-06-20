@@ -726,6 +726,48 @@ describe("PHASE 5 — rogue ExitPlanMode is DENIED (never silently stranded)", (
     await h.cancel();
   });
 
+  it("during the EXEC window (leaf executing): denied with the exec message; no spurious write; run continues", async () => {
+    const rec = makeDeps();
+    const h = createOrchestrator(rec.deps);
+    // Root [01]: single child. Approve root, run 01 through recon→sizer→draft→APPROVE so 01 is
+    // leaf/executing with the driver armed `exec` (the exec result has NOT landed yet — the live
+    // implementation turn is in flight). A rogue ExitPlanMode arriving HERE must be denied with a
+    // corrective message, must NOT write a spurious plan, and must NOT FATAL the run.
+    await driveToRootGate(h, "### Sub-Plan 01: Only\nscope\n");
+    await h.approve("");
+    await h.ingestStream(resultFrame()); // boundary result → 01 recon
+    await h.ingestStream(textFrame("01 recon"));
+    await h.ingestStream(resultFrame());
+    await h.ingestStream(textFrame("SIZER: single / 1 / 0.9"));
+    await h.ingestStream(resultFrame());
+    await h.ingestPermission(exitPlanModeReq("leaf-01-tu", "01 plan body"));
+    await h.approve("01"); // leaf → executing; awaiting = exec; implement turn in flight
+    expect(h.snapshot().root.state.stage).toBe("split");
+
+    const writesBefore = (rec.deps.writeAgentPlan as ReturnType<typeof vi.fn>).mock.calls.length;
+    await h.ingestPermission(exitPlanModeReq("rogue-exec-tu", "a rogue plan during execution"));
+
+    // (a) the run survives — no FATAL. FALSIFY: drop the exec window from the rogue-deny guard → the
+    // frame falls into the leaf branch, dispatches NODE_DRAFTED against leaf/executing (illegal),
+    // the reducer throws a non-PlanValidationError, and enqueueIngest FATALs → orchestrationActive
+    // false → RED.
+    expect(h.orchestrationActive()).toBe(true);
+    // (b) the held permission is resolved as DENY with the corrective message (not stranded).
+    expect(rec.resolves.at(-1)).toEqual({
+      id: "rogue-exec-tu",
+      allow: false,
+      message: "this turn must not call ExitPlanMode — finish implementing the approved plan",
+    });
+    // (c) NO spurious writeAgentPlan for the rogue frame (the only writes are the master + 01's
+    // legitimate draft, which happened before the rogue frame).
+    expect((rec.deps.writeAgentPlan as ReturnType<typeof vi.fn>).mock.calls.length).toBe(writesBefore);
+
+    // The run still completes normally: the real exec result advances 01 to its summary turn.
+    await h.ingestStream(resultFrame()); // exec completion → summary prompt
+    expect(rec.sends.at(-1)).toContain("finished executing");
+    await h.cancel();
+  });
+
   it("during the ROLL-UP window (roll-up summary turn): denied with the summary message; the run continues", async () => {
     const rec = makeDeps();
     const h = createOrchestrator(rec.deps);

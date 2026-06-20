@@ -62,6 +62,48 @@ fn take_if_current<T>(slot: &Mutex<Option<(u64, T)>>, my_id: u64) -> Option<T> {
     }
 }
 
+/// Store `driver` (stamped with `id`) into the singleton `slot`, then run `send` against the just-
+/// stored driver. On send SUCCESS the driver stays in the slot and `Ok(())` is returned (the read
+/// task is wired up by the caller afterward). On send FAILURE the driver is TAKEN BACK OUT of the
+/// slot (`take_if_current`, id-matched so a racing successor is never clobbered) and returned to the
+/// caller as `Err((driver, message))` so it can kill/drain the orphaned child — leaving the slot
+/// `None` so the one-session-per-launch guard is NOT phantom-locked for the rest of the launch.
+///
+/// ROOT CAUSE this fixes: the old code stored the driver and only THEN sent the start line; a send
+/// failure (`?`) returned early with the slot still `Some(dead-driver)`. With no read task ever
+/// spawned, the natural-death `Terminated` handler that frees the slot could never fire, so every
+/// subsequent `start_agent_session` was rejected with "already running" until an app restart.
+///
+/// Generic over the driver type + the send closure so the store→send→rollback ordering is unit-
+/// testable with a fake driver and an injectable failing send (the real `AgentDriver::send_line`
+/// needs a `CommandChild` that cannot be constructed in a test).
+fn store_then_send<T, F>(
+    slot: &Mutex<Option<(u64, T)>>,
+    id: u64,
+    driver: T,
+    send: F,
+) -> Result<(), (T, String)>
+where
+    F: FnOnce(&mut T) -> Result<(), String>,
+{
+    let mut guard = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return Err((driver, "driver state poisoned".to_string())),
+    };
+    *guard = Some((id, driver));
+    // Borrow the just-stored driver and attempt the send while STILL HOLDING the lock, so no
+    // concurrent start can observe a half-initialized slot — and so the rollback below can pull the
+    // driver back out without ever releasing the lock (race-free).
+    let stored = guard.as_mut().map(|(_, d)| d).expect("just inserted");
+    if let Err(e) = send(stored) {
+        // Roll back under the same lock: free the slot and hand the driver to the caller for child
+        // teardown, so the slot is left `None` (not phantom-locked).
+        let recovered = guard.take().map(|(_, d)| d).expect("just inserted");
+        return Err((recovered, e));
+    }
+    Ok(())
+}
+
 /// The live session's child handle plus bookkeeping. One per app launch.
 pub struct AgentDriver {
     child: CommandChild,
@@ -498,27 +540,29 @@ pub fn start_agent_session(
     // SIGKILL fallback.
     let (terminated_tx, terminated_rx) = oneshot::channel::<()>();
 
-    // Store the child, then send the `start` command.
+    // Store the child, then send the `start` command — committing the driver to the slot ONLY if
+    // the send succeeds. If the send fails, `store_then_send` pulls the driver back out (leaving the
+    // slot `None`, so the one-session-per-launch guard is NOT phantom-locked) and hands it back so we
+    // can kill the orphaned child here before propagating the error.
+    let driver = AgentDriver {
+        child,
+        terminated: Some(terminated_rx),
+    };
+    let start_line =
+        start_command_json(&cwd, &permission_mode, &model, &effort, &resume_session_id);
+    if let Err((dead, e)) =
+        store_then_send(&state, id, driver, |d| d.send_line(&start_line))
     {
-        let mut guard = state.lock().map_err(|_| "driver state poisoned")?;
-        *guard = Some((
-            id,
-            AgentDriver {
-                child,
-                terminated: Some(terminated_rx),
-            },
-        ));
-        let driver = guard.as_mut().map(|(_, d)| d).expect("just inserted");
-        driver.send_line(&start_command_json(
-            &cwd,
-            &permission_mode,
-            &model,
-            &effort,
-            &resume_session_id,
-        ))?;
+        // Best-effort kill of the just-spawned child so it is not leaked. `terminated_tx` is dropped
+        // here (the read task is never spawned), which is correct — there is no read task to wire it
+        // to. `kill` consumes the driver (mirrors CommandChild::kill(self)).
+        let _ = dead.kill();
+        return Err(e);
     }
 
-    // Start the read task AFTER the child is stored (it owns its own rx).
+    // Start the read task AFTER the child is committed (it owns its own rx). Reached only on a
+    // successful send, so the success path is identical to before: driver in the slot, read task
+    // spawned with the matching id and the terminated sender.
     spawn_read_task(app, rx, id, Some(terminated_tx));
     Ok(())
 }
@@ -740,6 +784,81 @@ mod tests {
         // (c) empty slot -> None.
         let slot: Mutex<Option<(u64, ())>> = Mutex::new(None);
         assert_eq!(take_if_current(&slot, 5), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 2: a FAILED start-command write must NOT phantom-lock the session slot.
+    //
+    // `start_agent_session` used to store the driver into the singleton slot and
+    // only THEN send the `start` line; a send failure returned early (`?`) with the
+    // slot still `Some(dead-driver)`. With no read task spawned, the natural-death
+    // `Terminated` handler that frees the slot never fired, so EVERY subsequent
+    // start was rejected with "already running" until an app restart.
+    //
+    // The fix factors store→send→on-error-rollback into `store_then_send`, which
+    // commits the driver to the slot ONLY on send success and on failure pulls it
+    // back out (slot → None) and returns it for child teardown. We test that
+    // invariant directly with a fake driver + injectable failing send (the real
+    // `AgentDriver::send_line` needs a `CommandChild` that cannot be built in a
+    // test).
+    // -----------------------------------------------------------------------
+
+    /// On send SUCCESS the driver stays committed in the slot (so the read task can
+    /// be wired to it) and `Ok(())` is returned. Falsifiability complement to the
+    /// failure test below: proves `store_then_send` does not spuriously evict a
+    /// healthy driver.
+    #[test]
+    fn store_then_send_keeps_driver_on_success() {
+        let slot: Mutex<Option<(u64, u32)>> = Mutex::new(None);
+        // The "driver" is a plain u32 sentinel; the send closure succeeds.
+        let res = store_then_send(&slot, 7, 99u32, |_d| Ok(()));
+        assert!(res.is_ok(), "successful send must return Ok, got {res:?}");
+        assert_eq!(
+            *slot.lock().unwrap(),
+            Some((7, 99)),
+            "a successfully-started driver must remain committed in the slot"
+        );
+    }
+
+    /// On send FAILURE the slot must be left `None` (NOT phantom-locked), and the
+    /// driver must be handed back to the caller for teardown along with the error
+    /// message. This is the core regression test for FIX 2.
+    ///
+    /// Falsifiable: revert `store_then_send` to the buggy shape (store the driver,
+    /// run the send, and on failure leave the slot occupied — i.e. drop the
+    /// `guard.take()` rollback) and the `is_none()` assertion below goes RED — a
+    /// subsequent start would then be rejected as "already running". (Confirmed by
+    /// temporarily removing the rollback: the slot stays `Some((9, …))`.)
+    #[test]
+    fn store_then_send_frees_slot_on_failure() {
+        let slot: Mutex<Option<(u64, u32)>> = Mutex::new(None);
+        // The send closure fails — mirroring a `send_line` write error.
+        let res = store_then_send(&slot, 9, 42u32, |_d| Err("write to sidecar stdin: boom".into()));
+
+        // (1) The error carries BOTH the recovered driver (for teardown) and the message.
+        match res {
+            Err((recovered, msg)) => {
+                assert_eq!(recovered, 42, "the driver must be returned for child teardown");
+                assert_eq!(msg, "write to sidecar stdin: boom");
+            }
+            Ok(()) => panic!("a failed send must return Err, not Ok"),
+        }
+
+        // (2) THE INVARIANT: the slot is empty, so the one-session-per-launch guard
+        // (`if guard.is_some() { reject }`) will NOT reject the next start.
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "a failed start must leave the session slot empty, not phantom-locked"
+        );
+
+        // (3) Concretely simulate the very next start's guard check: it must pass.
+        {
+            let guard = slot.lock().unwrap();
+            assert!(
+                guard.is_none(),
+                "the subsequent start's `guard.is_some()` reject must NOT fire"
+            );
+        }
     }
 
     #[test]

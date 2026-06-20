@@ -322,6 +322,21 @@ describe("assertCoherent2", () => {
     const root = splitNode(1, "running-children", [openNode(1, "prototype-review")]);
     expect(() => assertCoherent2(root)).toThrow(/prototype-review \(root-only phase\)/);
   });
+
+  it("rule: sibling nn must be UNIQUE (duplicate-nn siblings are structurally incoherent)", () => {
+    // A "types-cannot-express" invariant (defense in depth for the CHILDREN_PARSED parse guard):
+    // every navigation primitive resolves nn to the FIRST match, so two siblings sharing an nn
+    // silently alias. This tree is coherent in EVERY other respect — child 01 active, two pending
+    // after it (a legal partition) — so the duplicate nn (02, 02) is the SOLE violation, which is
+    // what makes the assertion falsifiable. FALSIFY: drop the nn-collision check in assertStructure
+    // → this tree passes → RED.
+    const root = splitNode(1, "running-children", [
+      leafNode(1, "drafting"),
+      openNode(2, "pending"),
+      openNode(2, "pending"),
+    ]);
+    expect(() => assertCoherent2(root)).toThrow(/duplicate sub-plan nn/);
+  });
 });
 
 // ---- treeIsDone / schema-2 projections ----------------------------------------------------------

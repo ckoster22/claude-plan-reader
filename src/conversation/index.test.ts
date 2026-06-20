@@ -1249,6 +1249,85 @@ describe("controller — AskUserQuestion card resolves resolve_tool_permission w
     expect((updatedInput.questions as unknown[]).length).toBeGreaterThan(0);
     expect(updatedInput.answers).toEqual({ "Pick one": "A", "Pick many": ["Y"] });
   });
+
+  // Fix #7 — the card Submit must ROUTE THROUGH the orchestrator when an orchestration is active
+  // (answerClarify dispatches CLARIFY_ANSWERED → re-arms the paused intent watchdog → resolves the
+  // held permission once), NOT bypass it with a direct resolve_tool_permission (which leaves the
+  // watchdog permanently disarmed — a silent-hang backstop gap). The legacy (no-orchestration) path
+  // keeps the direct resolve.
+  it("WHILE an orchestration is active, Submit routes through answerClarify (NOT a direct resolve_tool_permission)", async () => {
+    const fake = makeFakeHandle(true);
+    const answerClarify = vi.fn(async () => {});
+    fake.answerClarify = answerClarify;
+    __setOrchestratorForTest(fake); // getOrchestrator() returns the fake
+    __setActiveOrchestratorForTest(fake); // isOrchestrationActive() === true
+
+    const els = makeEls();
+    await initConversation(els, () => {});
+    await flush();
+
+    fire("tool-permission-requested", askPayload());
+    await flush();
+
+    const card = els.stream.querySelector(".conv-question")!;
+    expect(card).toBeTruthy();
+    const radios = card.querySelectorAll<HTMLInputElement>('input[type="radio"]');
+    const checkboxes = card.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    radios[1].checked = true; // B
+    radios[1].dispatchEvent(new Event("change", { bubbles: true }));
+    checkboxes[1].checked = true; // Y
+    checkboxes[1].dispatchEvent(new Event("change", { bubbles: true }));
+
+    card.querySelector<HTMLButtonElement>(".conv-question-submit")!.click();
+    await flush();
+
+    // (a) answerClarify was called with the id + parsed answers (the orchestration-aware path).
+    // FALSIFY: drop the isOrchestrationActive() branch in submitQuestion (always direct-resolve) →
+    // answerClarify is never called → RED.
+    expect(answerClarify).toHaveBeenCalledTimes(1);
+    expect(answerClarify).toHaveBeenCalledWith("ask-1", { "Pick one": "B", "Pick many": ["Y"] });
+    // (c) submitQuestion did NOT also fire the direct resolve_tool_permission — resolution is the
+    // orchestrator's job (answerClarify → CLARIFY_ANSWERED effect), so the card must not double-
+    // resolve. FALSIFY: keep the unconditional direct resolve → this length is 1 → RED.
+    expect(calls("resolve_tool_permission")).toHaveLength(0);
+    // The card still re-renders read-only after submit (the stream record path runs in both branches).
+    expect(els.stream.querySelector(".conv-question")!.querySelectorAll("input")).toHaveLength(0);
+  });
+
+  it("with NO orchestration active, Submit uses the legacy direct resolve_tool_permission (answerClarify untouched)", async () => {
+    // No __setActiveOrchestratorForTest → isOrchestrationActive() is false. Install a fake singleton
+    // ONLY to spy on answerClarify and prove the legacy path does NOT call it.
+    const fake = makeFakeHandle(true);
+    const answerClarify = vi.fn(async () => {});
+    fake.answerClarify = answerClarify;
+    __setOrchestratorForTest(fake);
+
+    const els = makeEls();
+    await initConversation(els, () => {});
+    await flush();
+
+    fire("tool-permission-requested", askPayload());
+    await flush();
+
+    const card = els.stream.querySelector(".conv-question")!;
+    // The submit button is disabled until EVERY question is answered (render.ts), so answer BOTH.
+    const radios = card.querySelectorAll<HTMLInputElement>('input[type="radio"]');
+    const checkboxes = card.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    radios[0].checked = true; // A
+    radios[0].dispatchEvent(new Event("change", { bubbles: true }));
+    checkboxes[0].checked = true; // X
+    checkboxes[0].dispatchEvent(new Event("change", { bubbles: true }));
+    card.querySelector<HTMLButtonElement>(".conv-question-submit")!.click();
+    await flush();
+
+    // The legacy path resolves directly and never touches the orchestrator. FALSIFY: route the
+    // non-orchestrated path through answerClarify too → resolve_tool_permission length 0 → RED.
+    const resolves = calls("resolve_tool_permission");
+    expect(resolves).toHaveLength(1);
+    expect(resolves[0].id).toBe("ask-1");
+    expect(resolves[0].allow).toBe(true);
+    expect(answerClarify).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

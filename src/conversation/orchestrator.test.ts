@@ -3423,6 +3423,64 @@ describe("orchestrator — INV-2: a HEADER-LESS decomposition draft denies-for-r
     expect(awaiting).toHaveLength(0);
   });
 
+  it("parseSubPlanHeaders throws PlanValidationError when two headers parse to the SAME nn", () => {
+    // "Sub-Plan 1" and "Sub-Plan 01" both parse to nn 1 → a duplicate-nn collision. It must throw
+    // the recoverable PlanValidationError (not a bare Error), so the held ExitPlanMode is denied-for-
+    // redraft rather than FATALing. FALSIFY: drop the duplicate-nn check in parseSubPlanHeaders →
+    // this returns two subplans instead of throwing → RED.
+    expect(() =>
+      parseSubPlanHeaders("### Sub-Plan 1: First\nbody one\n### Sub-Plan 01: Dup\nbody two"),
+    ).toThrow(PlanValidationError);
+    // Distinct nn still parses cleanly (the check is duplicate-only).
+    const ok = parseSubPlanHeaders("### Sub-Plan 01: A\nbody\n### Sub-Plan 02: B\nbody2");
+    expect(ok.subplans.map((s) => s.nn)).toEqual([1, 2]);
+  });
+
+  it("a live master draft with DUPLICATE Sub-Plan nn → DENY for redraft, run stays active, no FATAL, master NOT persisted", async () => {
+    const { deps, rec } = makeDeps();
+    const h = createOrchestrator(deps);
+    const { obs, fatal, awaiting } = makeObserver();
+    h.subscribe(obs);
+
+    await h.start({ cwd: "/work", request: "do it" });
+    await driveIntentToRecon(h);
+    await h.ingestStream(textFrame("recon"));
+    await h.ingestStream(resultFrame());
+    await h.ingestStream(textFrame("SIZER: split / 2 / 0.8"));
+    await h.ingestStream(resultFrame());
+    // Two headers collide on nn 1 ("Sub-Plan 1" and "Sub-Plan 01") — the duplicate-nn draft that
+    // would otherwise wedge the run mid-execution.
+    await h.ingestPermission(
+      exitPlanModeReq(
+        "master-tu",
+        "### Sub-Plan 1: First\nbody one\n\n### Sub-Plan 01: Collides\nbody two",
+      ),
+    );
+    await flush();
+
+    // RECOVERABLE: the held master ExitPlanMode is DENIED with a redraft message. FALSIFY: drop the
+    // duplicate-nn validation entirely → the duplicate-nn children reach CHILDREN_PARSED (now throwing
+    // a PlanValidationError there) AFTER writeAgentPlan already ran → the master IS persisted and the
+    // held permission is never denied → the writeAgentPlan / resolvePermission assertions go RED.
+    expect(rec.resolvePermission).toHaveLength(1);
+    expect(rec.resolvePermission[0].id).toBe("master-tu");
+    expect(rec.resolvePermission[0].allow).toBe(false);
+    expect(rec.resolvePermission[0].message).toBeTruthy();
+    // The run STAYS ACTIVE awaiting the redraft — no FATAL, no terminal.
+    expect(fatal).toHaveLength(0);
+    expect(h.orchestrationActive()).toBe(true);
+    // The MALFORMED MASTER WAS NOT PERSISTED: writeAgentPlan was never called (validation runs BEFORE
+    // the live write).
+    expect(rec.writeAgentPlan).toHaveLength(0);
+    // No partial children materialized; the root never left open/decomposing; no gate surfaced.
+    expect(h.snapshot().root.state.stage).toBe("open");
+    expect(h.snapshot().root.state.phase).toBe("decomposing");
+    expect(h.snapshot().pendingApproval).toBeNull();
+    expect(awaiting).toHaveLength(0);
+
+    await h.teardown();
+  });
+
   it("COMPLEMENT (falsifiability): a GENUINE non-validation error in the SAME ingest path STILL FATALs", async () => {
     // The discriminator must not be over-broad: only PlanValidationError denies-for-redraft; every
     // OTHER error in the decomposition ingest path must still drive the run to FATAL. We inject a

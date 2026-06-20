@@ -90,18 +90,19 @@ fn guarded_plan_tree_path(cwd: &str, name: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create .plan-tree dir: {e}"))?;
 
-    let joined = dir.join(name);
-    let parent = joined
-        .parent()
-        .ok_or_else(|| "joined path has no parent".to_string())?;
-    let canon_parent =
-        std::fs::canonicalize(parent).map_err(|e| format!(".plan-tree dir unavailable: {e}"))?;
+    // Containment: the canonical `.plan-tree` must sit DIRECTLY inside the canonical cwd, so a
+    // `.plan-tree` that is a SYMLINK out of the cwd is rejected (its canonical parent is NOT the
+    // canonical cwd). Comparing `joined.parent()` to `dir` would be tautological here — an
+    // allow-listed `name` has no `/`, so `joined.parent()` is always exactly `dir` and the check
+    // could never fire. Mirror `reset_plan_tree_dir`'s parent-equals-cwd assert instead.
+    let canon_cwd =
+        std::fs::canonicalize(cwd_path).map_err(|e| format!("cwd unavailable: {e}"))?;
     let canon_dir =
         std::fs::canonicalize(&dir).map_err(|e| format!(".plan-tree dir unavailable: {e}"))?;
-    if canon_parent != canon_dir {
+    if canon_dir.parent() != Some(canon_cwd.as_path()) {
         return Err("path escapes the .plan-tree directory".to_string());
     }
-    Ok(joined)
+    Ok(dir.join(name))
 }
 
 /// Atomically write `contents` to `<cwd>/.plan-tree/<name>`, returning the absolute path written.
@@ -1062,6 +1063,85 @@ mod tests {
 
         std::fs::remove_dir_all(&cwd).ok();
         std::fs::remove_dir_all(&target).ok();
+    }
+
+    /// `.plan-tree` itself being a SYMLINK pointing outside the cwd must be REJECTED by the
+    /// write/read/delete containment guard (`guarded_plan_tree_path`), even for an ALLOW-LISTED
+    /// name — and the symlink's target must be left untouched (no file written there). This mirrors
+    /// `reset_plan_tree_dir_rejects_symlinked_plan_tree` but exercises the write/read/delete trio.
+    ///
+    /// Falsifiable: with the OLD guard (canonical PARENT of `dir.join(name)` vs canonical `dir` —
+    /// tautologically equal because an allow-listed `name` has no `/`, so `joined.parent()` is
+    /// always exactly `dir`), the symlink is NOT rejected: the write lands `state.json` inside the
+    /// symlink's target and the `is_err()` assert below goes RED. The fix (assert canonical
+    /// `.plan-tree`'s PARENT == canonical cwd) makes it pass.
+    #[cfg(unix)]
+    #[test]
+    fn guarded_plan_tree_path_rejects_symlinked_plan_tree() {
+        let cwd = unique_temp_dir();
+        let target = unique_temp_dir(); // lives elsewhere under temp, NOT inside cwd
+        std::fs::write(target.join("victim.md"), "do not touch").expect("seed target");
+        std::os::unix::fs::symlink(&target, cwd.join(".plan-tree")).expect("plant symlink");
+
+        let cwd_s = cwd.to_string_lossy().to_string();
+
+        // WRITE of an allow-listed name through a symlinked `.plan-tree` must be rejected, and must
+        // write NOTHING into the symlink's target.
+        let res = write_plan_tree_file_inner(&cwd_s, "state.json", "PWNED");
+        assert!(res.is_err(), "write via symlinked .plan-tree must be rejected, got {res:?}");
+        assert!(
+            !target.join("state.json").exists(),
+            "no file may be planted in the symlink target"
+        );
+
+        // READ through a symlinked `.plan-tree` must be rejected too (same guard).
+        let res = read_plan_tree_file(cwd_s.clone(), "state.json".to_string());
+        assert!(res.is_err(), "read via symlinked .plan-tree must be rejected, got {res:?}");
+
+        // DELETE through a symlinked `.plan-tree` must be rejected, leaving the target untouched.
+        let res = delete_plan_tree_file_inner(&cwd_s, "victim.md".to_string().as_str());
+        // (victim.md is not even allow-listed, but assert the broader invariant via an allow-listed
+        // name too — the delete of an allow-listed name must be rejected before any unlink.)
+        let _ = res;
+        let res = delete_plan_tree_file_inner(&cwd_s, "state.json");
+        assert!(res.is_err(), "delete via symlinked .plan-tree must be rejected, got {res:?}");
+
+        // The target's pre-existing file is untouched throughout.
+        assert_eq!(
+            std::fs::read_to_string(target.join("victim.md")).expect("victim intact"),
+            "do not touch"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&target).ok();
+    }
+
+    /// A NORMAL (real-directory) `.plan-tree` still works through `guarded_plan_tree_path`: a write
+    /// + read round-trips, both BEFORE the dir exists (first use creates it) and after. This pins
+    /// that the symlink-rejection fix does NOT break the legitimate create-then-write flow.
+    /// Falsifiable: an over-strict guard that rejected a freshly-created real dir would fail the
+    /// `expect`s here.
+    #[test]
+    fn guarded_plan_tree_path_accepts_real_plan_tree() {
+        let cwd = unique_temp_dir();
+        let cwd_s = cwd.to_string_lossy().to_string();
+
+        // First write CREATES `.plan-tree` (it did not exist yet) and succeeds.
+        let written = write_plan_tree_file_inner(&cwd_s, "master.md", "real plan")
+            .expect("first write to a real (to-be-created) .plan-tree must succeed");
+        assert!(written.ends_with("/.plan-tree/master.md"), "got {written}");
+        // The dir is a real directory directly inside cwd.
+        let dir = cwd.join(".plan-tree");
+        assert!(dir.is_dir(), ".plan-tree must be a real directory");
+
+        // A second write/read round-trips against the now-existing dir.
+        write_plan_tree_file_inner(&cwd_s, "recon.md", "recon body")
+            .expect("second write to the existing real dir must succeed");
+        let read = read_plan_tree_file(cwd_s.clone(), "recon.md".to_string())
+            .expect("read should succeed");
+        assert_eq!(read, Some("recon body".to_string()));
+
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     /// A stray regular FILE named `.archive` at the root is REPLACED (removed and recreated as the

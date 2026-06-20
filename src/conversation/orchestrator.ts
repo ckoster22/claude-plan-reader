@@ -954,6 +954,24 @@ export function parseSubPlanHeaders(plan: string): ParsedMasterPlan {
     const bodyEnd = i + 1 < raw.length ? raw[i + 1].start : plan.length;
     return { nn, title: h.title, body: plan.slice(h.bodyStart, bodyEnd).trim() };
   });
+  // INV-2: SIBLING-nn UNIQUENESS. Two headers parsing to the SAME nn (e.g. "Sub-Plan 1" and
+  // "Sub-Plan 01") would mint duplicate-nn siblings — and every navigation primitive resolves nn to
+  // the FIRST match, so the run executes one twin and later events alias back to the other, wedging
+  // it mid-run. Reject HERE (the parse boundary), of the SAME typed class as the empty/out-of-range
+  // cases, so the orchestrator's `instanceof PlanValidationError` catch DENIES the held ExitPlanMode
+  // for a redraft (run stays active, the held permission is resolved, and crucially the malformed
+  // master is NEVER persisted — writeAgentPlan runs only after this returns). The reducer's
+  // CHILDREN_PARSED guard + assertStructure carry the same check as defense in depth.
+  const seenNn = new Set<Nn>();
+  for (const s of subplans) {
+    if (seenNn.has(s.nn)) {
+      throw new PlanValidationError(
+        `master plan validation failed: sub-plan number ${s.nn} appears in more than one header — ` +
+          "sibling sub-plan numbers must be unique; redraft the master decomposition with distinct `### Sub-Plan NN:` headers",
+      );
+    }
+    seenNn.add(s.nn);
+  }
   const preamble = plan.slice(0, raw[0].start).trim();
   return { preamble, subplans };
 }
@@ -2373,24 +2391,40 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
       if (path === null || node === null) return;
       // PHASE 5 (DA P4 follow-up) — ROGUE ExitPlanMode DENY: an ExitPlanMode arriving while the
       // active node matches NO legal drafting branch — a summary turn (leaf summary OR roll-up),
-      // the roll-up window, or a parent-review window — must NOT be silently dropped (that strands
-      // the sidecar's held resolver and stalls the turn forever). Resolve it as a DENY with a
-      // corrective message so the SDK feeds it back as the tool error and the turn finishes its
-      // text instead. LOUD diag either way.
+      // the roll-up window, a parent-review window, or the EXEC window (the leaf's approved-plan
+      // implementation turn) — must NOT be silently dropped (that strands the sidecar's held
+      // resolver and stalls the turn forever) NOR fall into the leaf-draft branch below (during
+      // execution that would write a spurious duplicate plan and dispatch NODE_DRAFTED against a
+      // leaf/executing node — illegal in the reducer, a non-PlanValidationError that FATALs the
+      // run). Resolve it as a DENY with a corrective message so the SDK feeds it back as the tool
+      // error and the turn finishes its work instead. LOUD diag either way.
       const inReviewWindow =
         awaiting.tag === "parent-review" ||
         (node.state.stage === "split" && node.state.phase === "reviewing");
       const inSummaryWindow =
         awaiting.tag === "summary" || (node.state.stage === "split" && inRollupWindow(node));
-      if (inReviewWindow || inSummaryWindow) {
-        const turnLabel = inReviewWindow ? "review" : "summary";
+      // EXEC window is keyed on the ACTIVE NODE'S state, which is authoritative — NOT on
+      // `awaiting.tag === "exec"`: after a leaf approve the reducer moves the node to leaf/executing
+      // AND arms exec together, but `awaiting` can lag the node state (e.g. a stale "exec" tag left
+      // by a prior child whose summary/review hops were driven without resetting it), so routing off
+      // the tag would wrongly DENY a legitimate next-child draft (the node is leaf/drafting). The
+      // leaf-draft branch below also routes purely on node state — this mirrors it.
+      const inExecWindow = node.state.stage === "leaf" && node.state.phase === "executing";
+      if (inReviewWindow || inSummaryWindow || inExecWindow) {
+        // The corrective message names the work the turn is actually doing so the model resumes it
+        // instead of re-drafting: the exec window tells it to keep implementing; review/summary tell
+        // it to finish that turn's text.
+        const message = inExecWindow
+          ? "this turn must not call ExitPlanMode — finish implementing the approved plan"
+          : `this turn must not call ExitPlanMode — finish the ${inReviewWindow ? "review" : "summary"} text`;
+        const turnLabel = inExecWindow ? "exec" : inReviewWindow ? "review" : "summary";
         diag(
           `rogue ExitPlanMode DENIED: id=${req.id} during the ${turnLabel} window (node=${node.state.stage}/${node.state.phase}, awaiting=${awaiting.tag}) — this turn must not draft`,
         );
         await deps.resolvePermission({
           id: req.id,
           allow: false,
-          message: `this turn must not call ExitPlanMode — finish the ${turnLabel} text`,
+          message,
         });
         return;
       }
