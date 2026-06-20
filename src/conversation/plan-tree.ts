@@ -547,6 +547,20 @@ function assertStructure(node: TreeNode, path: NodePath): void {
 
   if (node.state.stage !== "split") return;
   const children = node.state.children;
+
+  // (0) SIBLING-nn UNIQUENESS: a "types-cannot-express" invariant — the NonEmptyArray type proves
+  // children is non-empty but cannot prove the nn segments are distinct, and the navigation
+  // primitives resolve nn to the FIRST match, so a duplicate-nn pair silently aliases. The
+  // CHILDREN_PARSED parse boundary already rejects this for live drafts; this is defense in depth
+  // for any tree (resume rehydration, hand-built fixtures) that reaches rest with a collision.
+  const seenNn = new Set<Nn>();
+  for (const c of children) {
+    if (seenNn.has(c.nn)) {
+      throw new Error(`incoherent: ${at} has duplicate sub-plan nn "${pathKey([c.nn])}" among its children`);
+    }
+    seenNn.add(c.nn);
+  }
+
   const statuses = children.map(statusOf);
 
   // (2) per-level partition: summarized* active? pending*. Walk left-to-right through the three
@@ -1224,6 +1238,24 @@ export function reduce2(
         throw new Error(
           `CHILDREN_PARSED illegal: node "${pathKey(event.path)}" is ${node.state.stage}/${node.state.phase}, expected open/decomposing|awaiting-decomposition-approval`,
         );
+      }
+      // SIBLING-nn UNIQUENESS (INV-2 recoverable): two headers parsing to the SAME nn (e.g.
+      // "Sub-Plan 1" and "Sub-Plan 01") would mint duplicate-nn siblings — and every navigation
+      // primitive (nodeAtPath/replaceAt/advanceAfterSummary) resolves nn to the FIRST match, so the
+      // run executes one twin and later events alias back to the other, wedging mid-run. REJECT it
+      // HERE with a PlanValidationError — the SAME typed class as the empty/out-of-range cases — so
+      // the orchestrator's `instanceof PlanValidationError` catch denies the held ExitPlanMode for a
+      // redraft (run stays active) instead of FATALing. (assertStructure carries a defense-in-depth
+      // Set check for any tree that somehow reaches rest with collisions.)
+      const seenNn = new Set<Nn>();
+      for (const c of event.children) {
+        if (seenNn.has(c.nn)) {
+          throw new PlanValidationError(
+            `decomposition validation failed: sub-plan nn "${pathKey([c.nn])}" appears more than once — ` +
+              "sibling sub-plan numbers must be unique; redraft the decomposition with distinct `### Sub-Plan NN:` headers",
+          );
+        }
+        seenNn.add(c.nn);
       }
       // STASHED, NOT YET IN THE TREE: minted via nonEmpty (an empty decomposition throws here),
       // all open/pending, held transiently until the gate resolves. The node deliberately STAYS

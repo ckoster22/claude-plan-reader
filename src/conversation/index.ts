@@ -173,13 +173,29 @@ export async function initConversation(
   const submitQuestion = (id: string, answers: AskUserQuestionAnswers): void => {
     const questions = pendingQuestions.get(id) ?? [];
     pendingQuestions.delete(id);
-    void invoke("resolve_tool_permission", {
-      id,
-      allow: true,
-      message: null,
-      updatedInput: { questions, answers },
-    }).catch((err) => console.error("resolve_tool_permission (AskUserQuestion) failed", err));
-    // Record the answers so the stream keeps a permanent record and drops the form.
+    // ORCHESTRATION-AWARE ROUTING (mirrors Stop ~ and ingestPermission ~): when a multiplan
+    // orchestration owns the seam, route Submit through answerClarify(id, answers) — it dispatches
+    // CLARIFY_ANSWERED, whose resolvePermission effect resolves the held SDK permission EXACTLY ONCE
+    // (rebuilding updatedInput:{questions, answers} from the orchestrator-retained questions), AND
+    // re-arms the intent watchdog that the AskUserQuestion ingest paused (turnWatchdog was cleared +
+    // the liveness re-arm is gated on turnWatchdog !== null, so the card resolving the hold directly
+    // would leave the watchdog permanently disarmed — a later dead-air stall would hang with no FATAL
+    // backstop). The direct resolve_tool_permission here would BYPASS the orchestrator and, if also
+    // called, DOUBLE-resolve the held id — so it is the ELSE branch (the non-orchestrated legacy
+    // path), never both.
+    if (isOrchestrationActive()) {
+      void getOrchestrator()
+        .answerClarify(id, answers)
+        .catch((err) => console.error("orchestrator answerClarify failed", err));
+    } else {
+      void invoke("resolve_tool_permission", {
+        id,
+        allow: true,
+        message: null,
+        updatedInput: { questions, answers },
+      }).catch((err) => console.error("resolve_tool_permission (AskUserQuestion) failed", err));
+    }
+    // Record the answers so the stream keeps a permanent record and drops the form (both paths).
     model.appendQuestionAnswered(id, answers, synthSeq++);
     rerender();
   };
@@ -781,7 +797,12 @@ export async function initConversation(
       // await (either flips historyGen / session). Never clobber a now-live pane.
       if (gen !== historyGen || session !== "none" || isOrchestrationActive()) return;
       // (5) No resolvable transcript → explicit empty state (distinct from a silently blank pane).
-      if (!res.found) {
+      // DEFENSIVE COERCION: a missing/undefined `res` (a command that resolved with no payload — the
+      // try/catch above only catches a REJECTING invoke, not an undefined RESOLVE) is treated as the
+      // same no-transcript empty state. Dereferencing `res.found` on undefined here would throw out of
+      // this async function with no awaiter (the call site at main.ts is fire-and-forget), surfacing
+      // as an UNHANDLED REJECTION that fails the whole `npm test` run despite passing assertions.
+      if (!res || !res.found) {
         paneSource = { kind: "empty", stem, reason: "no-transcript" };
         rerender();
         return;

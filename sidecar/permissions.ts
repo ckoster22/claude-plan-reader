@@ -127,8 +127,16 @@ export const BASH_WRITE_DENY_PATTERNS: ReadonlyArray<RegExp> = [
   // arbitrary-write risk as an inline-code flag.
   /<<</,
   /<<\s*\w/,
-  // `find … -delete` / `find … -exec …` mutate via the action.
-  /\bfind\b[^|;&]*\s-(delete|exec|execdir|ok|fprint)\b/,
+  // `find` write/exec actions: the COMPLETE exec family (`-exec`, `-execdir`, `-ok`, `-okdir`),
+  // `-delete`, and the `-f*` FILE-WRITE family (`-fls`, `-fprint`, `-fprint0`, `-fprintf`).
+  // `exec(dir)?` / `ok(dir)?` cover the `dir` twins WITHOUT the no-boundary pitfall (a `\b` cannot
+  // sit between `ok` and `dir`, so a bare `ok\b` missed `-okdir`). `f(print0?|printf|ls)` covers all
+  // four `-f*` writes WITHOUT the trailing-\b pitfall (`\b` cannot sit between `fprint` and the
+  // trailing `f`, so a bare `fprint)\b` missed `-fprintf`; `-fls`/`-fprint0` were absent). The
+  // read-only `-f*` primaries `-fstype`/`-follow` and the stdout actions `-print`/`-print0`/
+  // `-printf`/`-ls` are NOT matched (no `f` prefix on `-print*`/`-ls`; `-fstype`/`-follow` are not
+  // in the alternation; `-ls` and `-okdir` differ in the `ok` vs `l` lead).
+  /\bfind\b[^|;&]*\s-(delete|exec(dir)?|ok(dir)?|f(print0?|printf|ls))\b/,
 ];
 
 // Whether a raw Bash command string looks write-shaped (any deny pattern matches). Non-string
@@ -179,12 +187,24 @@ const PROTOTYPE_GIT_READONLY_SUBCMDS: ReadonlySet<string> = new Set([
 ]);
 
 // `find` action tokens that turn a read-only traversal into a write (or arbitrary exec).
+// Covers the COMPLETE findutils EXEC family (`-exec`, `-execdir`, `-ok`, `-okdir` — each runs an
+// arbitrary command; `-okdir` is the interactive twin of `-execdir`), `-delete`, and the COMPLETE
+// `-f*` FILE-WRITE family (`-fls`, `-fprint`, `-fprint0`, `-fprintf` — each takes a FILE argument
+// and writes it). Omitting any (the Medium escape) let e.g. `find . -fls out.txt` or
+// `find . -okdir cat {} ;` slip through the fail-closed prototype allowlist. NOTE the read-only
+// `-f*` primaries (`-fstype` TEST, `-follow` option) and the stdout actions (`-print`, `-print0`,
+// `-printf`, `-ls`) are deliberately NOT here — they do not write a file, and exact-equality
+// matching keeps them allowed.
 const FIND_WRITE_ACTIONS: ReadonlySet<string> = new Set([
   "-exec",
   "-execdir",
-  "-delete",
   "-ok",
+  "-okdir",
+  "-delete",
+  "-fls",
   "-fprint",
+  "-fprint0",
+  "-fprintf",
 ]);
 
 // Whitespace tokenizer (quote-naive — splits on runs of whitespace). Good enough for the

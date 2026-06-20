@@ -30,6 +30,7 @@ import {
   toSnapshot2,
   inAcceptanceWindow,
   rehydrateState2,
+  PlanValidationError,
 } from "./plan-tree";
 import type {
   PlanTreeState2,
@@ -572,6 +573,39 @@ describe("gen-2 full split run", () => {
     }).state;
     // Mutation: default to an empty/auto child list on approval → no throw → RED.
     expect(() => reduce2(s, { type: "DECOMPOSITION_APPROVED", path: [] })).toThrow();
+  });
+
+  it("CHILDREN_PARSED with two siblings of EQUAL nn throws a PlanValidationError (deny-for-redraft, not a wedge)", () => {
+    // INVARIANT: sibling nn must be unique — every navigation primitive (nodeAtPath/replaceAt/
+    // advanceAfterSummary) resolves nn to the FIRST match, so a duplicate-nn pair silently aliases
+    // two siblings and wedges the run mid-execution. The parse boundary REJECTS it. It must throw
+    // PlanValidationError SPECIFICALLY (not a bare Error) so the orchestrator's instanceof catch
+    // routes it to deny-the-held-ExitPlanMode-for-redraft (run stays alive) instead of FATAL.
+    let s = genesis2();
+    s = reduce2(s, { type: "NODE_RECON_DONE", path: [] }).state;
+    s = reduce2(s, { type: "SIZER_DONE", path: [], outcome: sizer("split", 2) }).state;
+    // FALSIFY: drop the duplicate-nn check in CHILDREN_PARSED → no throw → RED.
+    expect(() =>
+      reduce2(s, {
+        type: "CHILDREN_PARSED",
+        path: [],
+        children: [
+          { nn: nnOf(1), title: "First" },
+          { nn: nnOf(1), title: "Also one" },
+        ],
+      }),
+    ).toThrow(PlanValidationError);
+    // DISTINCT nn at the same boundary is accepted (the check is duplicate-only, not a blanket reject).
+    expect(() =>
+      reduce2(s, {
+        type: "CHILDREN_PARSED",
+        path: [],
+        children: [
+          { nn: nnOf(1), title: "First" },
+          { nn: nnOf(2), title: "Second" },
+        ],
+      }),
+    ).not.toThrow();
   });
 });
 
