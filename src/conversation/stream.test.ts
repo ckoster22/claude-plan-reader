@@ -554,3 +554,46 @@ describe("ConversationModel — appendUserMessage echoes a user node in stream o
     expect(order()).toEqual(["text:a", "user", "text:b"]);
   });
 });
+
+// ---- PART C: quota_exceeded is INERT in the reducer (Phase 2) ----------------------------------
+//
+// The non-fatal `quota_exceeded` agent-stream frame carries the orchestrator's reset signal but the
+// PURE reducer treats it as a no-op: no timeline node, no `complete` flip, no change to the working/
+// active indicator state. (The waiting banner + auto-resume are owned by the orchestrator observer
+// in a LATER phase — NOT this reducer.)
+
+import type { QuotaExceeded } from "./types";
+
+function quotaExceeded(seq: number, over: Partial<QuotaExceeded> = {}): QuotaExceeded {
+  return {
+    seq,
+    kind: "quota_exceeded",
+    resetAt: 1_700_000_000_000,
+    source: "rate_limit_event",
+    ...over,
+  };
+}
+
+describe("ConversationModel — quota_exceeded is inert in the pure reducer", () => {
+  it("adds NO timeline node, does NOT flip complete, does NOT change working/active state", () => {
+    const m = new ConversationModel();
+    m.appendStream(sysInit({ seq: 1 }));
+    m.appendStream(statusMsg(2, "thinking…"));
+
+    // Snapshot the state BEFORE the quota frame.
+    const before = m.derive();
+    expect(before.nodes).toHaveLength(0);
+    expect(before.complete).toBe(false);
+    expect(before.working).toEqual({ label: "thinking…" });
+
+    m.appendStream(quotaExceeded(3, { source: "thrown_error", resetAt: 1_800_000_000_000 }));
+
+    const after = m.derive();
+    // FALSIFY: make the `quota_exceeded` case push a render node → after.nodes grows → RED.
+    expect(after.nodes).toHaveLength(0);
+    // FALSIFY: make the case set `complete = true` → this goes RED.
+    expect(after.complete).toBe(false);
+    // FALSIFY: make the case clear active / reset latestStatusLabel → working goes null/changes → RED.
+    expect(after.working).toEqual({ label: "thinking…" });
+  });
+});

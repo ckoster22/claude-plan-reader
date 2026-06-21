@@ -2622,6 +2622,9 @@ window.addEventListener("DOMContentLoaded", () => {
         attachStrip: document.querySelector<HTMLElement>("#composer-attachments"),
         attachBtn: document.querySelector<HTMLElement>("#composer-attach"),
         fileInput: document.querySelector<HTMLInputElement>("#composer-file-input"),
+        // Auto-resume-after-quota select (Phase 6). The composer self-persists its value on change;
+        // the chosen budget is read at Start by the orchestrator's defaultDeps adapter.
+        autoResume: document.querySelector<HTMLSelectElement>("#composer-auto-resume"),
       },
       status: {
         pill: document.querySelector<HTMLElement>("#sdk-status"),
@@ -3328,12 +3331,33 @@ window.addEventListener("DOMContentLoaded", () => {
   // its OWN listeners for these events (stream rendering); these are SEPARATE listeners purely for the
   // review-state purge. agent-error purges only when fatal (a non-fatal error keeps the seam alive).
   void listen<AgentExit>("agent-exit", () => {
+    // PHASE 6 (DA-I5) — QUOTA-PAUSE RECONCILIATION. A quota wall makes the sidecar gracefulExit(0), so
+    // this agent-exit can be a QUOTA PAUSE exit, not a genuine end-of-run. During a pause the run is
+    // NOT over — the orchestrator will respawn a session and re-issue the interrupted turn (which may
+    // be mid-ExitPlanMode review). So this listener must NOT destructively tear that state down:
+    //   • SKIP purgeInprocReviews() — a held in-process ExitPlanMode review must survive the pause so
+    //     the resumed turn can still resolve it. (purgeInprocReviews exists to drop reviews whose SDK
+    //     seam is permanently dead; during a pause the seam is coming back.)
+    //   • SKIP the live-run placeholder clear — the placeholder belongs to the still-paused run.
+    // Quota-paused is detected via the orchestrator's quotaPaused() probe, which is SYNCHRONOUSLY
+    // correct (DA-I5): the conversation facade's agent-stream listener calls the handle's
+    // markQuotaPausePending() the instant a quota_exceeded frame is seen, so quotaPaused() is true
+    // from that tick onward — through the microtask-deferred QUOTA_PAUSED dispatch and the auto-resume
+    // — NOT only after the deferred dispatch drains. This closes the same-tick race where a
+    // quota_exceeded frame and an agent-exit arrive in the SAME tick: without the pending flag,
+    // quotaPaused() would still read false here and we would destructively purgeInprocReviews() during
+    // a pause, dropping a held in-process ExitPlanMode review the resumed turn still needs.
+    // shouldClearPlaceholderOnExit ALREADY no-ops while the active orchestration's treeId matches the
+    // placeholder's, but we gate explicitly so the intent is unambiguous and the purge is skipped too.
+    if (isOrchestrationActive() && getOrchestrator().quotaPaused()) return;
     purgeInprocReviews();
     // Live-run placeholder clear (Bug A fix) — the SAFE variant. agent-exit reports an SDK SESSION
     // ending, which is NOT 1:1 with the placeholder's run: notifyDone deregisters the orchestrator
-    // BEFORE onDone fires and the SDK session outlives done, so a previous session's late exit can
-    // arrive AFTER a fresh next run has started (and minted its own placeholder). The clear
-    // decision lives in the pure shouldClearPlaceholderOnExit (see its truth table + tests):
+    // BEFORE onDone fires. notifyDone now ends the SDK session on natural completion, so the exit is
+    // prompt (it follows onDone closely) rather than arbitrarily late. The clear decision still lives
+    // in the pure shouldClearPlaceholderOnExit because that logic stays defensively correct
+    // regardless of exit timing — a slow drain could still, rarely, overlap a fast next start (which
+    // has minted its own placeholder). See its truth table + tests:
     // clear ONLY a placeholder no ACTIVE orchestration claims.
     if (
       shouldClearPlaceholderOnExit(

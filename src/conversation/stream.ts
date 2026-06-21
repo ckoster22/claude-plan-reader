@@ -152,6 +152,26 @@ export interface NoticeNode {
   message: string;
 }
 
+// A quota auto-resume banner row — a PURE render node owned by the orchestrator observer wiring (NOT
+// the agent-stream reducer; the `quota_exceeded` frame stays inert). It NEVER flips session/complete
+// state. There is at most ONE in the tree at a time: a second pause UPDATES the single node in place
+// (state waiting -> exhausted) rather than appending a duplicate (the model keys it as a singleton).
+//   - "waiting":   the session paused mid-turn, auto-resume is armed; the renderer draws a live
+//                  wall-clock countdown to `resetAt` and the "auto-resume armed · N left" pill. NO
+//                  Resume button (resuming before the quota refreshes is impossible).
+//   - "exhausted": the once-per-session auto-resume budget was already spent; the renderer draws the
+//                  next reset time + a Cancel-session affordance ONLY (no countdown, no auto-resume).
+// `resetAt` is epoch-MILLISECONDS (already normalized by the orchestrator — never re-scaled here).
+// `remaining` is the auto-resume attempts left (only meaningful for "waiting"; 0 for "exhausted").
+export interface QuotaBannerNode {
+  type: "quota-banner";
+  seq: number;
+  state: "waiting" | "exhausted";
+  resetAt: number;
+  remaining: number;
+  source: string;
+}
+
 // A subagent group: an accent-bordered container keyed by agent_id, holding nested nodes.
 // When a `subagent_started` frame is seen for this group's id, its identity + task are attached so
 // the renderer draws a labeled header ("Subagent · {subagentType} — {description}"); absent that
@@ -184,7 +204,8 @@ export type RenderNode =
   | ResultNode
   | ErrorNode
   | ExitNode
-  | NoticeNode;
+  | NoticeNode
+  | QuotaBannerNode;
 
 export type TopNode = RenderNode | SubagentGroupNode;
 
@@ -267,6 +288,22 @@ export type ModelEvent =
       __event: "permission_resolved";
       seq: number;
       id: string;
+    }
+  | {
+      // The quota-banner singleton (Phase 5). Appended/updated by the orchestrator observer wiring on
+      // onQuotaPaused/onQuotaExhausted; cleared on onQuotaResumed. There is at most ONE in the event
+      // list at a time — the model methods (appendQuotaBanner / updateQuotaBanner / clearQuotaBanner)
+      // mutate THIS single accumulated event rather than pushing a second, so a pause-then-exhaust
+      // transition updates the node in place and never duplicates. `state` "cleared" tombstones it so
+      // a resumed banner produces NO node on derive (the singleton is logically removed). `seq` is
+      // `lastWireSeq + 0.5` so the banner sorts after every frame seen so far (the paused turn's last
+      // frame) but before the next wire frame (the resumed turn's reply). `resetAt` is epoch-ms.
+      __event: "quota_banner";
+      seq: number;
+      state: "waiting" | "exhausted" | "cleared";
+      resetAt: number;
+      remaining: number;
+      source: string;
     };
 
 // The pure model. Accumulates raw events; derives the tree on demand.
@@ -360,10 +397,67 @@ export class ConversationModel {
     this.events.push({ __event: "permission_resolved", seq, id });
   }
 
+  // The single accumulated quota-banner event, or null when none. The banner is a SINGLETON — at most
+  // one node in the tree at a time — so we hold its event by reference and mutate it in place (a
+  // waiting -> exhausted transition, or a resumed clear) rather than pushing a second event that would
+  // derive into a duplicate row. Held separately from `events` (it is also pushed into `events` so it
+  // sorts into the timeline) only to support the in-place update/clear.
+  private quotaBanner: Extract<ModelEvent, { __event: "quota_banner" }> | null = null;
+
+  // Append OR update the quota banner as a SINGLETON. The first call creates the event (placed at
+  // `lastWireSeq + 0.5`, after the paused turn's last frame but before the resumed reply); subsequent
+  // calls UPDATE the same event in place (e.g. waiting -> exhausted), so the banner is never
+  // duplicated. The `state` "cleared" tombstone is set via clearQuotaBanner (onQuotaResumed), not here.
+  appendQuotaBanner(info: {
+    state: "waiting" | "exhausted";
+    resetAt: number;
+    remaining: number;
+    source: string;
+  }): void {
+    if (this.quotaBanner) {
+      // Update the existing singleton in place — no new event, no duplicate node.
+      this.quotaBanner.state = info.state;
+      this.quotaBanner.resetAt = info.resetAt;
+      this.quotaBanner.remaining = info.remaining;
+      this.quotaBanner.source = info.source;
+      return;
+    }
+    const ev: Extract<ModelEvent, { __event: "quota_banner" }> = {
+      __event: "quota_banner",
+      seq: this.lastWireSeq + 0.5,
+      state: info.state,
+      resetAt: info.resetAt,
+      remaining: info.remaining,
+      source: info.source,
+    };
+    this.quotaBanner = ev;
+    this.events.push(ev);
+  }
+
+  // Update the quota banner to a new state (e.g. waiting -> exhausted) — an alias for appendQuotaBanner
+  // when one is known to exist, retained for call-site clarity. If none exists yet it creates one (so a
+  // direct exhausted-without-prior-pause is still a single node).
+  updateQuotaBanner(info: {
+    state: "waiting" | "exhausted";
+    resetAt: number;
+    remaining: number;
+    source: string;
+  }): void {
+    this.appendQuotaBanner(info);
+  }
+
+  // Clear (tombstone) the quota banner — the onQuotaResumed counterpart. The singleton's `state` is set
+  // to "cleared" so derive() produces NO node for it (the banner is logically removed) while the event
+  // stays in `events` (harmless; it contributes nothing). Idempotent / inert when no banner exists.
+  clearQuotaBanner(): void {
+    if (this.quotaBanner) this.quotaBanner.state = "cleared";
+  }
+
   // Reset (new session).
   reset(): void {
     this.events = [];
     this.lastWireSeq = -1;
+    this.quotaBanner = null;
   }
 
   // Derive the renderable tree from the accumulated events. Pure (no mutation of `events`).
@@ -438,6 +532,13 @@ export class ConversationModel {
           case "status":
             // Label-only progress signal — update the live indicator (does NOT add a timeline node).
             latestStatusLabel = ev.label;
+            break;
+          case "quota_exceeded":
+            // INERT here. A non-fatal quota notice that travels via agent-stream (NOT agent-error).
+            // It adds NO timeline node, does NOT flip `complete`, and does NOT clear/seed `working`
+            // or `active`. The waiting banner + auto-resume are owned by the orchestrator observer
+            // in a LATER phase — this reducer stays a pure inert pass-through so the exhaustive
+            // discriminated-union switch remains sound.
             break;
           case "subagent_started":
             // Record the subagent's identity + task, keyed by its tool_use_id (= the group key). This
@@ -611,6 +712,23 @@ export class ConversationModel {
           node: { type: "system", seq: ev.seq, text: ev.text },
           parent: null,
         });
+      } else if (ev.__event === "quota_banner") {
+        // The quota-banner singleton — a PURE render row. Never touches session state (no complete/
+        // active/exited flip). A "cleared" tombstone (onQuotaResumed) produces NO node, so the banner
+        // is logically removed; "waiting"/"exhausted" each derive the single banner node.
+        if (ev.state !== "cleared") {
+          placed.push({
+            node: {
+              type: "quota-banner",
+              seq: ev.seq,
+              state: ev.state,
+              resetAt: ev.resetAt,
+              remaining: ev.remaining,
+              source: ev.source,
+            },
+            parent: null,
+          });
+        }
       } else {
         // exit — the session ended; the working indicator must hide.
         exited = true;

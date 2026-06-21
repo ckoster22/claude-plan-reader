@@ -42,6 +42,7 @@ import { cliPlanRedirectSettings } from "./cli-plans";
 import { decideStart } from "./session-start";
 import { decideResume, resumeOption, RESUME_FALLBACK_REASON } from "./session-resume";
 import { isRenderableText } from "./frames";
+import { decideRateLimitFrame, parseResetFromError, isUsageLimitText, decideResultQuota } from "./quota";
 import { planningAgents } from "./agents/planningAgents";
 import { makeGracefulExit } from "./shutdown";
 // The platform package carries the bundled `claude` CLI. Imported as a `file`
@@ -211,6 +212,13 @@ function liftUserMessage(text: string, images?: InboundImage[]): SDKUserMessage 
 // ---------------------------------------------------------------------------
 
 let seq = 0;
+
+// PHASE 1 — the most-recent `SDKRateLimitInfo` seen on a `rate_limit_event`, retained across messages.
+// The result-carrier quota path (a usage-limit `result` with no structured field of its own) reuses a
+// recent structured `resetsAt` from here via decideResultQuota → extractResetAt. Stored for ALL
+// statuses; reuse is gated on `status === "rejected"` inside extractResetAt (which returns null
+// otherwise), so a stale `allowed`/`allowed_warning` info never feeds a false reset time.
+let lastRateLimitInfo: unknown = null;
 
 function nextFrame(kind: string, extra: Record<string, unknown>): Record<string, unknown> {
   return { seq: seq++, kind, ...extra };
@@ -400,6 +408,16 @@ function normalize(msg: SDKMessage): Array<Record<string, unknown>> {
         total_cost_usd?: number;
         session_id?: string;
       };
+      // PHASE 1 — RESULT-CARRIER QUOTA DETECTION. A usage/session limit has NO dedicated subtype: it
+      // arrives as an `is_error:true` result whose only payload is the human limit string. When this
+      // result IS that wall, DROP the plain result (Decision B) and emit a `quota_exceeded` frame
+      // instead — driving the same pause + auto-resume + gracefulExit(0) path the rate_limit_event
+      // carrier uses. The reset time prefers a recent structured `resetsAt` (lastRateLimitInfo), then
+      // the string clock, then sentinel 0 (degraded → host routes to EXHAUSTED).
+      if ((m.is_error ?? false) && isUsageLimitText(m.result)) {
+        const { resetAt, source } = decideResultQuota(m.result, lastRateLimitInfo);
+        return [nextFrame("quota_exceeded", { resetAt, source })];
+      }
       return [
         nextFrame("result", {
           subtype: m.subtype ?? null,
@@ -411,6 +429,25 @@ function normalize(msg: SDKMessage): Array<Record<string, unknown>> {
           session_id: m.session_id ?? null,
         }),
       ];
+    }
+
+    case "rate_limit_event": {
+      // A rate-limit notice. When the limit is REJECTED (the quota wall) AND a reset time is
+      // determinable, emit a NON-fatal `quota_exceeded` frame so the host can PAUSE + auto-resume
+      // instead of dying — travels via the normal stream (NOT an `error` kind), so the Rust `_ =>`
+      // Stream arm relays it with no Rust change. The emit loop drives gracefulExit(0) when it sees
+      // this kind (the SDK iterator is dead once the quota throws/ends; keeping the sidecar idle
+      // would pin the OAuth-bearing `claude` grandchild). Otherwise (allowed / allowed_warning /
+      // rejected-but-no-reset) keep TODAY's label-only `status` behavior unchanged.
+      const info = (msg as unknown as { rate_limit_info?: unknown }).rate_limit_info;
+      // PHASE 1 — retain the latest info so a following result-carrier quota can reuse its structured
+      // `resetsAt`. Stored for ALL statuses; reuse is gated on status==="rejected" in extractResetAt.
+      lastRateLimitInfo = info;
+      const decision = decideRateLimitFrame(info);
+      if (decision.quota) {
+        return [nextFrame("quota_exceeded", { resetAt: decision.resetAt, source: decision.source })];
+      }
+      return statusFrames(statusLabelFor("rate_limit_event") ?? "waiting (rate limit)");
     }
 
     default: {
@@ -594,13 +631,41 @@ async function runSession(start: StartCmd): Promise<void> {
 
   try {
     for await (const msg of q) {
+      // PHASE 0 — RAW-FRAME TRACE (GATE A capture). With AGENT_TRACE set, log every raw SDK message
+      // verbatim to STDERR (logErr — off the fd-1 JSON-lines `emit` channel, so it never corrupts the
+      // host's frame stream). Used to capture the exact shape of a real usage-limit `result` /
+      // `rate_limit_event` before building quota detection. No file writes.
+      if (process.env.AGENT_TRACE) logErr("[raw]", JSON.stringify(msg));
+      let quotaPaused = false;
       for (const frame of normalize(msg)) {
         emit(frame);
+        // A `quota_exceeded` frame means the session hit the quota wall. The SDK iterator is now
+        // effectively dead; exit GRACEFULLY (0) so the SDK reaper closes the `claude` grandchild
+        // and the queue drains — never a bare process.exit (which would re-orphan it). The host
+        // records the pause + schedules auto-resume off the frame's resetAt.
+        if ((frame as { kind?: string }).kind === "quota_exceeded") quotaPaused = true;
+      }
+      if (quotaPaused) {
+        await gracefulExit("quota exceeded", 0);
+        return;
       }
     }
   } catch (e) {
     const text = String(e);
     const isAuth = /auth|token|unauthor|401|oauth/i.test(text);
+    // Quota-wall backstop: the rate_limit_event may not precede the throw. If this is NOT an auth
+    // error AND a reset time is parseable from the error text, emit a NON-fatal `quota_exceeded`
+    // frame (same contract as the normalize path) and exit GRACEFULLY (0) — driving the SDK reaper
+    // so the `claude` grandchild is not re-orphaned. Otherwise the existing fatal path is unchanged:
+    // auth → "auth", everything else → "sdk", both fatal with exit(1).
+    if (!isAuth) {
+      const resetAt = parseResetFromError(text);
+      if (resetAt !== null) {
+        emit({ seq: seq++, kind: "quota_exceeded", resetAt, source: "thrown_error" });
+        await gracefulExit("quota exceeded (thrown)", 0);
+        return;
+      }
+    }
     emit({
       seq: seq++,
       kind: "error",

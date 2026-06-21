@@ -68,6 +68,11 @@ function makeFakeHandle(startResult: boolean): OrchestratorHandle & { start: Ret
     teardown: noop,
     orchestrationActive: vi.fn(() => false),
     resuming: vi.fn(() => false),
+    // Phase 6: the agent-exit listener reads quotaPaused() + (conditionally) calls notifyAgentExit().
+    quotaPaused: vi.fn(() => false),
+    // DA-I5: the agent-stream listener calls markQuotaPausePending() on a quota_exceeded frame.
+    markQuotaPausePending: vi.fn(() => {}),
+    notifyAgentExit: vi.fn(() => {}),
     dispatch: noop,
   } as never;
 }
@@ -1805,5 +1810,275 @@ describe("controller — composer re-enabled after session end + resume-on-send"
     expect(calls("send_agent_message")).toHaveLength(0);
     // The field is left intact (no clear on a non-dispatch).
     expect(els.messageInput.value).toBe("hello?");
+  });
+
+  // BUGFIX (history-view Send dead). The user's ACTUAL failure: a plan completed, they came back to it
+  // AFTER THE FACT, SELECTED it from the sidebar (→ loadHistoryForPlan), went to the Conversation tab,
+  // typed, and hit Send — nothing happened. NO run was started this launch, so lastCwd/lastSessionId
+  // were never captured by the start thunk or any agent-stream frame. loadHistoryForPlan ALREADY reads
+  // the plan's cwd + session_id (to replay the transcript) but did not capture them as the resume
+  // target, so Send's none-branch hit `if (lastCwd === null) return;` and silently dead-ended.
+  it("after SELECTING a completed plan (loadHistoryForPlan), Send RESUMES that plan's session", async () => {
+    const els = makeEls();
+    const handle = await initConversation(els, () => {});
+    await flush();
+
+    // No run started this launch — lastCwd/lastSessionId are null. The user opens an already-completed
+    // plan from the sidebar: read_plan_transcript resolves a FOUND transcript carrying the plan's cwd +
+    // session_id (exactly what the live backend + mock shim return).
+    mockInvoke.mockImplementationOnce(() =>
+      Promise.resolve({
+        found: true,
+        path: "/Users/u/.claude/projects/enc/sess-history.jsonl",
+        cwd: "/repos/finished-project",
+        session_id: "sess-history",
+        lines: [
+          JSON.stringify({
+            type: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "Plan complete." }] },
+          }),
+        ],
+      }),
+    );
+    await handle.loadHistoryForPlan("finished-plan");
+    await flush();
+    // The pane is in history view; the textarea is typable (force-enabled).
+    expect(els.messageInput.disabled).toBe(false);
+
+    // Type + Send. This MUST resume the SELECTED plan's session — not silently return.
+    H.invokeCalls = [];
+    els.messageInput.value = "now do the next thing";
+    els.sendBtn.click();
+    await flush();
+
+    // FALSIFY: do NOT capture res.cwd/res.session_id into lastCwd/lastSessionId in loadHistoryForPlan →
+    // Send's none-branch hits `if (lastCwd === null) return;` → zero start_agent_session/send → RED.
+    const starts = calls("start_agent_session");
+    expect(starts).toHaveLength(1);
+    expect(starts[0].cwd).toBe("/repos/finished-project");
+    expect(starts[0].resumeSessionId).toBe("sess-history");
+    const sends = calls("send_agent_message");
+    expect(sends).toEqual([{ text: "now do the next thing" }]);
+    // The typed text cleared on a successful dispatch (no orphan / not stuck).
+    expect(els.messageInput.value).toBe("");
+  });
+
+  // Co-requisite UX (no silent dead-end): a selected plan that has NO resumable session_id must not
+  // leave an enabled-but-dead Send. read_plan_transcript can resolve found:false (unresolved cwd) — in
+  // that case there is nothing to resume into, so Send stays a no-op AND the field is preserved. We
+  // assert it does NOT spuriously open a session under a null/garbage cwd.
+  it("after selecting a plan with NO resumable session, Send does not open a session", async () => {
+    const els = makeEls();
+    const handle = await initConversation(els, () => {});
+    await flush();
+
+    // read_plan_transcript resolves found:false (no resolvable transcript / no session id).
+    mockInvoke.mockImplementationOnce(() =>
+      Promise.resolve({ found: false, path: null, cwd: null, session_id: null, lines: [] }),
+    );
+    await handle.loadHistoryForPlan("unresolved-plan");
+    await flush();
+
+    H.invokeCalls = [];
+    els.messageInput.value = "hello?";
+    els.sendBtn.click();
+    await flush();
+    // No resume target captured (found:false) → Send is a no-op, field preserved.
+    expect(calls("start_agent_session")).toHaveLength(0);
+    expect(calls("send_agent_message")).toHaveLength(0);
+    expect(els.messageInput.value).toBe("hello?");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Phase 6 — quota-pause race fix (DA-C1) + notifyAgentExit wiring, tested AT THE index.ts BOUNDARY.
+//
+// These are CROSS-BOUNDARY seams: a same-tick agent-stream(quota_exceeded) → agent-exit ordering, and
+// the agent-exit listener calling getOrchestrator().notifyAgentExit() while an orchestration is active.
+// MEMORY warns that mocked orchestrator unit tests can hide exactly these boundary bugs, so we drive
+// the REAL index.ts listeners with a fake orchestrator handle whose quotaPaused()/notifyAgentExit() we
+// control + spy. SessionState is observed through the DERIVED controls: "paused"/"live" ⇒ New-plan
+// disabled + Stop (cancelBtn) enabled; "none" ⇒ New-plan enabled + Stop disabled.
+// ---------------------------------------------------------------------------------------------
+
+// Build a fake orchestrator handle with a controllable quotaPaused() probe + a spy notifyAgentExit().
+// `quotaPausedReturns` simulates the DEFERRED reducer state: it is FALSE at exit time (the real
+// QUOTA_PAUSED dispatch runs in a later microtask), so ONLY the synchronous index.ts flag can save
+// the session. ingestStream is a noop (the orchestrator owns the pause; index.ts only forwards).
+function makeQuotaHandle(opts: { quotaPausedReturns: boolean }): {
+  handle: OrchestratorHandle;
+  notifyAgentExit: ReturnType<typeof vi.fn>;
+} {
+  const noop = vi.fn(async () => {});
+  const notifyAgentExit = vi.fn(() => {});
+  const handle = {
+    start: vi.fn(async () => true),
+    resume: vi.fn(async () => false),
+    snapshot: vi.fn(() => ({}) as never),
+    approve: noop,
+    requestChanges: noop,
+    answerClarify: noop,
+    approvePrototype: noop,
+    refinePrototype: noop,
+    approveAcceptance: noop,
+    divergeAcceptance: noop,
+    refineAcceptance: noop,
+    ingestStream: noop,
+    ingestPermission: noop,
+    cancel: noop,
+    subscribe: vi.fn(() => () => {}),
+    teardown: noop,
+    orchestrationActive: vi.fn(() => true),
+    resuming: vi.fn(() => false),
+    quotaPaused: vi.fn(() => opts.quotaPausedReturns),
+    // DA-I5: a no-op here so the same-tick test still proves the CLOSURE flag (not this handle method)
+    // holds the session paused while quotaPaused() reads its hardcoded-false value.
+    markQuotaPausePending: vi.fn(() => {}),
+    notifyAgentExit,
+    dispatch: noop,
+  } as unknown as OrchestratorHandle;
+  return { handle, notifyAgentExit };
+}
+
+const quotaFrame = (resetAt: number) => ({
+  seq: 1,
+  kind: "quota_exceeded" as const,
+  resetAt,
+  source: "rate_limit_event" as const,
+});
+const exitFrame = () => ({ code: 0, signal: null });
+
+describe("controller — Phase 6 quota-pause race + notifyAgentExit wiring", () => {
+  it("RACE FIX: agent-stream(quota_exceeded) then a SAME-TICK agent-exit lands SessionState 'paused', NOT 'none'", async () => {
+    const els = makeEls();
+    // quotaPaused() returns FALSE — exactly the deferred-dispatch window the synchronous flag must
+    // cover. Register as the active orchestration so isOrchestrationActive() is true.
+    const { handle } = makeQuotaHandle({ quotaPausedReturns: false });
+    __setOrchestratorForTest(handle);
+    __setActiveOrchestratorForTest(handle);
+    await initConversation(els, () => {});
+    await flush();
+
+    // The quota frame sets the SYNCHRONOUS pending flag (before the deferred void ingestStream).
+    fire("agent-stream", quotaFrame(Date.now() + 60_000));
+    // ...immediately followed (same tick, before the ingest microtask runs) by the exit.
+    fire("agent-exit", exitFrame());
+
+    // The session must be PAUSED (a live state): New-plan stays disabled, Stop stays enabled.
+    // FALSIFY: remove the synchronous `quotaPausePending` flag (rely on quotaPaused() alone, which is
+    // false here) → the exit lands "none" → newPlanBtn.disabled false / cancelBtn.disabled true → RED.
+    expect(els.newPlanBtn.disabled).toBe(true);
+    expect(els.cancelBtn.disabled).toBe(false);
+  });
+
+  it("notifyAgentExit WIRING: agent-exit while an orchestration is active calls getOrchestrator().notifyAgentExit()", async () => {
+    const els = makeEls();
+    const { handle, notifyAgentExit } = makeQuotaHandle({ quotaPausedReturns: true });
+    __setOrchestratorForTest(handle);
+    __setActiveOrchestratorForTest(handle);
+    await initConversation(els, () => {});
+    await flush();
+
+    fire("agent-exit", exitFrame());
+
+    // The exit MUST be forwarded to the orchestrator so the auto-resume respawn can proceed (the prior
+    // sidecar exit is the precondition for re-startSession). FALSIFY: drop the notifyAgentExit() call
+    // in the agent-exit listener → this spy is never called → RED (auto-resume would silently never fire).
+    expect(notifyAgentExit).toHaveBeenCalledTimes(1);
+  });
+
+  it("a genuine agent-exit with NO pending pause (no orchestration) lands SessionState 'none'", async () => {
+    const els = makeEls();
+    // No fake orchestrator installed and no active guard → isOrchestrationActive() is false,
+    // quotaPaused() is the real (fresh) singleton's false. No quota frame fired → no pending flag.
+    await initConversation(els, () => {});
+    await flush();
+
+    fire("agent-exit", exitFrame());
+
+    // Plain end-of-run: state none → New-plan enabled, Stop disabled. FALSIFY: make the exit listener
+    // ALWAYS land "paused" → newPlanBtn.disabled true / cancelBtn.disabled false → RED.
+    expect(els.newPlanBtn.disabled).toBe(false);
+    expect(els.cancelBtn.disabled).toBe(true);
+  });
+
+  // BUGFIX (post-completion New-plan + Send dead). End-to-end at the index.ts boundary: a completed
+  // plan emits a `result` frame (→ idle) and then — because notifyDone now ends the SDK session — an
+  // `agent-exit` (→ none). After that the user MUST be able to (a) open a new plan and (b) Send a
+  // follow-up that resumes the just-completed conversation. Before the fix the controller stuck at
+  // "idle": New-plan stayed disabled + openComposer no-op'd, and Send's none-branch never engaged.
+  it("after a completed run (result → agent-exit) New-plan is usable AND Send resumes the finished session", async () => {
+    dialogOpen.mockResolvedValueOnce("/work/dir" as never);
+    const fake = makeFakeHandle(true);
+    __setOrchestratorForTest(fake);
+
+    const els = makeEls();
+    const handle = await initConversation(els, () => {});
+    await flush();
+
+    // Start a real run so lastCwd is captured.
+    els.composer.chooseDirBtn!.click();
+    await flush();
+    els.composer.request!.value = "build a thing";
+    els.composer.startBtn!.click();
+    await flush();
+
+    // The run streams (active), surfaces a session id, then COMPLETES: a `result` frame (turn done →
+    // idle), then the agent-exit notifyDone now produces (session ended → none).
+    fire("agent-stream", {
+      seq: 1, kind: "system_init", model: "m", cwd: "/work/dir", tools: [], skills: [],
+      slash_commands: [], permission_mode: "default", session_id: "sess-done",
+    });
+    await flush();
+    fire("agent-stream", {
+      seq: 2, kind: "result", subtype: "success", is_error: false, result: "",
+      num_turns: 1, duration_ms: 1, total_cost_usd: 0, session_id: "sess-done",
+    });
+    await flush();
+    // Stuck-idle reproduction guard: after the `result` the controller is "idle" (live), so New-plan
+    // is still disabled. The agent-exit (driven by notifyDone ending the session) is what frees it.
+    expect(els.newPlanBtn.disabled).toBe(true);
+
+    fire("agent-exit", { code: 0, signal: null });
+    await flush();
+
+    // (a) NEW-PLAN IS USABLE: the button is enabled AND openComposer actually opens the modal (it is
+    // NOT the isLive() no-op). FALSIFY: keep the SDK session alive on notifyDone → no agent-exit → the
+    // controller stays "idle" → newPlanBtn.disabled stays true and the modal stays hidden → RED.
+    expect(els.newPlanBtn.disabled).toBe(false);
+    handle.openComposer();
+    await flush();
+    expect(els.modal.classList.contains("hidden")).toBe(false);
+    // Close the modal again so the Send-resume assertion runs from a clean surface.
+    els.composer.cancelBtn!.click();
+
+    // (b) SEND RESUMES: a follow-up Send dispatches a turn (re-opens the finished session via
+    // resumeSessionId, then sends) rather than silently returning. FALSIFY: leave the controller at
+    // "idle" → Send takes the LIVE path or (if treated none with no retained cwd) no-ops → no
+    // start_agent_session with resumeSessionId → RED.
+    H.invokeCalls = [];
+    els.messageInput.value = "keep going please";
+    els.sendBtn.click();
+    await flush();
+    const resumeOpens = calls("start_agent_session");
+    expect(resumeOpens).toHaveLength(1);
+    expect(resumeOpens[0]).toMatchObject({ cwd: "/work/dir", resumeSessionId: "sess-done" });
+    expect(calls("send_agent_message")).toEqual([{ text: "keep going please" }]);
+  });
+
+  it("quotaPaused() TRUE at exit time (no synchronous flag needed) also lands 'paused'", async () => {
+    const els = makeEls();
+    // Simulate the case where the orchestrator's QUOTA_PAUSED dispatch already ran (probe true) and no
+    // quota frame preceded this exit — the probe alone must still hold the session paused.
+    const { handle } = makeQuotaHandle({ quotaPausedReturns: true });
+    __setOrchestratorForTest(handle);
+    __setActiveOrchestratorForTest(handle);
+    await initConversation(els, () => {});
+    await flush();
+
+    fire("agent-exit", exitFrame());
+
+    expect(els.newPlanBtn.disabled).toBe(true);
+    expect(els.cancelBtn.disabled).toBe(false);
   });
 });

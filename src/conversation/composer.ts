@@ -9,6 +9,7 @@ import { chooseDirectory } from "./wd-picker";
 import type { StartingMode } from "./types";
 import { createImageAttachments, type ImageAttachments } from "./attachments";
 import type { AttachedImage } from "./images";
+import { initAutoResumeSetting } from "../auto-resume-setting";
 
 const LAST_DIR_KEY = "plan-reader-last-agent-dir";
 
@@ -60,6 +61,11 @@ export interface ComposerElements {
   attachStrip?: HTMLElement | null;
   attachBtn?: HTMLElement | null;
   fileInput?: HTMLInputElement | null;
+  // Auto-resume-after-quota select (Phase 6). Optional so older tests/callers compile. When present,
+  // init() wires it via initAutoResumeSetting (self-persists to localStorage on change); the chosen
+  // value is read at session START by the orchestrator's defaultDeps adapter (resolveAutoResumeBudget),
+  // NOT by the composer — the composer only needs to surface + persist the control.
+  autoResume?: HTMLSelectElement | null;
 }
 
 // Injection seam for the Start action (tests stub it).
@@ -149,6 +155,13 @@ export class Composer {
     // Multimodal: build the image-attachment controller (paste/drop/file-pick → chips). Null when the
     // surface has no attach elements (older callers) — Start then forwards no images.
     this.attachments = this.attachmentsFactory(this.els);
+
+    // Auto-resume-after-quota select (Phase 6): reflect the persisted choice + self-persist on change.
+    // No-op when the element is absent (older callers). The composer's DirStorage (get/set) satisfies
+    // the setting's storage seam structurally, so the choice persists through the SAME store the
+    // last-dir memory uses. The VALUE is consumed at START by the orchestrator's defaultDeps adapter
+    // (resolveAutoResumeBudget reads localStorage directly), not here.
+    initAutoResumeSetting(this.els.autoResume ?? null, this.storage);
   }
 
   // Open the modal, pre-filling the remembered last directory. Mode is always "plan" (Build removed).

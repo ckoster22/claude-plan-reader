@@ -27,6 +27,7 @@ import type {
   ToolNode,
   ToolStatus,
   QuestionRequestNode,
+  QuotaBannerNode,
 } from "./stream";
 import type { AskUserQuestionAnswers } from "./types";
 
@@ -36,6 +37,12 @@ import type { AskUserQuestionAnswers } from "./types";
 // pure-render tests that only inspect DOM structure.
 export interface RenderHandlers {
   onSubmitQuestion?: (id: string, answers: AskUserQuestionAnswers) => void;
+  // Invoked when the user clicks "Cancel session" in an EXHAUSTED quota banner (the once-per-session
+  // auto-resume budget is spent — no auto-resume will happen, so the only affordance is to end the
+  // session). The controller maps it to the SAME full-stop path the Stop button uses (orchestrator
+  // cancel() when an orchestration owns the seam, else cancel_agent_run + end_agent_session). Omitted
+  // in pure-render tests that only inspect DOM structure.
+  onCancelSession?: () => void;
 }
 
 // HTML-profile sanitize config for assistant-text bubbles. Distinct from mermaid.ts's SVG
@@ -494,6 +501,165 @@ function renderTextBubble(
   return bubble;
 }
 
+// ---- Quota-banner countdown: a SINGLE live wall-clock interval (leak-guarded) ----------------
+//
+// The countdown is driven by ONE module-level setInterval that, every tick, recomputes the TRUE
+// remaining time as `resetAt - Date.now()` (wall-clock — NOT a stored decrementing counter, which
+// would freeze/drift while the WebView is occluded/suspended and resume from a stale value). Each
+// renderTree() call rebuilds the DOM (replaceChildren), so any prior interval/listener would point at
+// detached nodes — we therefore CLEAR the prior interval + visibilitychange listener at the top of
+// every render and re-arm at most one for the waiting banner present in the new tree. This guarantees
+// EXACTLY ONE live interval ever exists, so intervals never leak across rebuilds/teardowns.
+let countdownTimer: ReturnType<typeof setInterval> | null = null;
+let countdownVisHandler: (() => void) | null = null;
+
+// Clear the single live countdown interval + visibilitychange listener (idempotent). Called at the top
+// of every renderTree (before re-arming) and on teardown, so no stale interval survives a rebuild.
+function teardownCountdown(): void {
+  if (countdownTimer !== null) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+  if (countdownVisHandler !== null) {
+    document.removeEventListener("visibilitychange", countdownVisHandler);
+    countdownVisHandler = null;
+  }
+}
+
+// EXPORTED teardown for the controller (index.ts) to call on pane teardown — clears the lone interval
+// so it never ticks against a torn-down pane. A bare alias of teardownCountdown.
+export function teardownQuotaCountdown(): void {
+  teardownCountdown();
+}
+
+// Format a millisecond remaining-duration as HH:MM:SS, clamped at 0 (00:00:00). Wall-clock driven —
+// the caller passes `resetAt - Date.now()`, so a negative (past-reset) value clamps to zero.
+export function formatCountdown(remainingMs: number): string {
+  const secs = Math.max(0, Math.floor(remainingMs / 1000));
+  const h = String(Math.floor(secs / 3600)).padStart(2, "0");
+  const m = String(Math.floor((secs % 3600) / 60)).padStart(2, "0");
+  const s = String(secs % 60).padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
+// Format an epoch-ms reset time as a human clock time (e.g. "6:00 PM"). Locale-aware, hour:minute only.
+// Returns "" for the degraded sentinel (resetAt <= 0, an undeterminable reset) so the banner falls back
+// to its "…when your quota refreshes" copy instead of printing a bogus epoch-1970 clock.
+function formatResetClock(resetAt: number): string {
+  if (!(Number.isFinite(resetAt) && resetAt > 0)) return "";
+  try {
+    return new Date(resetAt).toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+// Render the quota banner (waiting OR exhausted). The WAITING variant arms the lone wall-clock
+// interval (driving the `.qb-countdown` element) + a visibilitychange recompute; the EXHAUSTED variant
+// arms NO interval (no countdown — the budget is spent) and wires the Cancel-session button.
+function renderQuotaBanner(node: QuotaBannerNode, handlers?: RenderHandlers): HTMLElement {
+  const banner = document.createElement("div");
+  banner.className = "conv-quota-banner";
+  banner.dataset.state = node.state;
+
+  const head = document.createElement("div");
+  head.className = "conv-qb-head";
+  const dot = document.createElement("span");
+  dot.className = "conv-qb-dot";
+  dot.setAttribute("aria-hidden", "true");
+  head.appendChild(dot);
+  const headText = document.createElement("span");
+  headText.className = "conv-qb-head-text";
+  head.appendChild(headText);
+  banner.appendChild(head);
+
+  const sub = document.createElement("div");
+  sub.className = "conv-qb-sub";
+  banner.appendChild(sub);
+
+  if (node.state === "waiting") {
+    banner.classList.add("conv-quota-banner-waiting");
+    headText.textContent = "Usage limit reached — waiting for quota to refresh";
+    sub.textContent =
+      "The session paused mid-turn. There's nothing to do — resuming before the quota resets isn't possible. The app will pick the turn back up automatically the moment your quota refreshes.";
+
+    // The live wall-clock countdown element. Seeded with the current true remaining; the lone interval
+    // (armed below) keeps it current. NO Resume button — resuming before refresh is impossible.
+    const countdown = document.createElement("div");
+    countdown.className = "conv-qb-countdown";
+    countdown.textContent = formatCountdown(node.resetAt - Date.now());
+    banner.appendChild(countdown);
+
+    const refreshAt = document.createElement("div");
+    refreshAt.className = "conv-qb-refresh-at";
+    const clock = formatResetClock(node.resetAt);
+    refreshAt.textContent = clock ? `Resets at ${clock}` : "Resets when your quota refreshes";
+    banner.appendChild(refreshAt);
+
+    // The auto-resume note (the "will auto-resume" reassurance with a spinner).
+    const autoNote = document.createElement("div");
+    autoNote.className = "conv-qb-auto-note";
+    const spin = document.createElement("span");
+    spin.className = "conv-qb-spin";
+    spin.setAttribute("aria-hidden", "true");
+    autoNote.appendChild(spin);
+    const autoText = document.createElement("span");
+    autoText.textContent = "Will auto-resume the in-flight turn when quota refreshes";
+    autoNote.appendChild(autoText);
+    banner.appendChild(autoNote);
+
+    // The "auto-resume armed · N attempt(s) left" pill.
+    const pill = document.createElement("div");
+    pill.className = "conv-qb-pill";
+    const n = node.remaining;
+    pill.textContent = `⟳ Auto-resume armed · ${n} attempt${n === 1 ? "" : "s"} left this session`;
+    banner.appendChild(pill);
+
+    // ---- Arm the SINGLE wall-clock countdown interval + visibilitychange recompute. ----
+    // (renderTree already cleared any prior interval before calling us, so this is the only live one.)
+    const tick = (): void => {
+      // Recompute TRUE remaining each tick from wall-clock — never decrement a stored counter (so an
+      // occluded/suspended WebView shows the correct value the instant it wakes).
+      countdown.textContent = formatCountdown(node.resetAt - Date.now());
+    };
+    countdownTimer = setInterval(tick, 1000);
+    countdownVisHandler = () => {
+      // On un-occlusion the displayed value may be stale (the interval was throttled/suspended) —
+      // recompute immediately so it corrects without waiting for the next tick.
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", countdownVisHandler);
+  } else {
+    // EXHAUSTED: the once-per-session auto-resume budget is spent — no countdown, no auto-resume.
+    banner.classList.add("conv-quota-banner-exhausted");
+    headText.textContent = "Usage limit reached again — auto-resume already used";
+    sub.textContent =
+      "This session already auto-resumed once, so it won't wait or resume again. Cancel this session and start a new plan when your quota refreshes.";
+
+    const refreshAt = document.createElement("div");
+    refreshAt.className = "conv-qb-refresh-at";
+    const clock = formatResetClock(node.resetAt);
+    refreshAt.textContent = clock ? `Next reset at ${clock}` : "Next reset when your quota refreshes";
+    banner.appendChild(refreshAt);
+
+    // Cancel-session affordance ONLY (no Resume — resuming is impossible; no countdown — no wait).
+    const actions = document.createElement("div");
+    actions.className = "conv-qb-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "conv-qb-cancel";
+    cancel.textContent = "Cancel session";
+    cancel.addEventListener("click", () => handlers?.onCancelSession?.());
+    actions.appendChild(cancel);
+    banner.appendChild(actions);
+  }
+
+  return banner;
+}
+
 // Render a single top-level OR nested node (everything except a subagent group, which is
 // top-level only and handled in renderTree).
 function renderNode(node: RenderNode, handlers?: RenderHandlers): HTMLElement {
@@ -583,6 +749,8 @@ function renderNode(node: RenderNode, handlers?: RenderHandlers): HTMLElement {
       row.textContent = node.message;
       return row;
     }
+    case "quota-banner":
+      return renderQuotaBanner(node, handlers);
     default: {
       const _x: never = node;
       return _x;
@@ -600,6 +768,11 @@ export function renderTree(
   handlers?: RenderHandlers,
 ): void {
   container.replaceChildren();
+  // Leak guard: tear down any prior countdown interval + visibilitychange listener BEFORE rebuilding.
+  // replaceChildren() above detached the old banner node, so its interval would tick against a dead
+  // element; renderQuotaBanner re-arms exactly one for a waiting banner present in THIS tree. This
+  // keeps the invariant "at most one live countdown interval" across every rebuild.
+  teardownCountdown();
   // Ids of subagent groups present in this tree — used to SUPPRESS the redundant standalone Task/Agent
   // tool_use row (the group header is now the primary display of that subagent's identity + task, so
   // showing both the "Agent {…json…} running" row AND the labeled group is duplicative). The group's

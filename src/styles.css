@@ -29,6 +29,7 @@
   --conv-on-accent: #ffffff;     /* text/icon on an --accent fill (terracotta) */
   --conv-shadow: rgba(0, 0, 0, 0.28); /* composer card drop shadow */
   --conv-tool-run-bg: #fff6f1;   /* running tool-row accent wash (Dense Chat) */
+  --conv-warn: #d99a3b;          /* quota-waiting amber: pulsing dot, countdown, auto-resume note */
   /* Reading-pane base text size. Theme-independent (one declaration here, NOT
      duplicated in the dark block). Every .md font-size is `em`-relative to this
      so the whole reading pane scales as one system. Stepped by the A−/A+
@@ -67,6 +68,7 @@
   --conv-on-accent: #ffffff;
   --conv-shadow: rgba(0, 0, 0, 0.5);
   --conv-tool-run-bg: #241a14;   /* running tool-row accent wash (Dense Chat), dark variant */
+  --conv-warn: #e8b15c;          /* quota-waiting amber, dark variant (brightened for legibility) */
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
@@ -450,6 +452,66 @@ body {
   font-family: var(--ui); font-size: 12px; font-weight: 500; color: var(--text);
 }
 .toast.hidden { display: none; }
+
+/* ---- Quota auto-resume banner (Phase 5) ----
+   An inline conversation-pane banner driven by the orchestrator's quota observer. WAITING shows an
+   amber pulsing dot + a live wall-clock countdown + an "auto-resume armed" pill (no Resume button);
+   EXHAUSTED shows the accent (terracotta) tone + a Cancel-session button only. The waiting amber is the
+   semantic warning color --conv-warn (declared in BOTH :root and the dark block); everything else uses
+   tokens so dark mode re-themes for free. */
+.conv-quota-banner {
+  margin: 8px 0 4px; padding: 16px; border-radius: 10px;
+  border: 1px solid var(--conv-warn); background: var(--accent-soft);
+  font-family: var(--ui);
+}
+.conv-quota-banner-exhausted { border-color: var(--accent); }
+.conv-qb-head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+.conv-qb-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--conv-warn);
+  animation: conv-qb-pulse 1.8s infinite;
+}
+.conv-quota-banner-exhausted .conv-qb-dot { background: var(--accent); animation: none; }
+@keyframes conv-qb-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--conv-warn) 50%, transparent); }
+  70%  { box-shadow: 0 0 0 8px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .conv-qb-dot { animation: none; } }
+.conv-qb-sub { color: var(--text-dim); font-size: 12px; margin-top: 6px; }
+.conv-qb-countdown {
+  font-family: var(--mono); font-size: 28px; font-weight: 700;
+  letter-spacing: 1px; margin: 10px 0 2px; color: var(--conv-warn);
+}
+.conv-qb-refresh-at { color: var(--text-dim); font-size: 11px; }
+.conv-qb-auto-note {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 12px; font-size: 12px; color: var(--conv-warn);
+}
+.conv-qb-spin {
+  width: 12px; height: 12px; flex: 0 0 auto;
+  border: 2px solid color-mix(in srgb, var(--conv-warn) 30%, transparent); border-top-color: var(--conv-warn);
+  border-radius: 50%; animation: conv-qb-spin 1s linear infinite;
+}
+@keyframes conv-qb-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .conv-qb-spin { animation: none; } }
+.conv-qb-pill {
+  display: inline-flex; align-items: center; gap: 5px; margin-top: 8px;
+  font-size: 10px; color: var(--text-dim);
+  background: var(--bg-window); border: 1px solid var(--border);
+  border-radius: 99px; padding: 2px 8px;
+}
+.conv-qb-actions { margin-top: 12px; display: flex; gap: 8px; }
+.conv-qb-cancel {
+  font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-window); color: var(--text);
+  font-family: var(--ui);
+}
+.conv-qb-cancel:hover { border-color: var(--accent); color: var(--accent); }
+
 .review-bar-label {
   font-family: var(--ui); font-size: 12px; font-weight: 600; color: var(--accent);
 }

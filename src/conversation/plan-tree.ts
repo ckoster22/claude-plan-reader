@@ -287,6 +287,18 @@ export interface RecursiveLedger {
   acceptance_?:
     | { verdict: "approved"; decided_ms: number }
     | { verdict: "diverged"; reason: string; decided_ms: number };
+  // QUOTA AUTO-RESUME BUDGET (the usage-limit pause/resume feature). PRESENT iff the run was started
+  // with an auto-resume budget (the composer's quota-resume choice → QUOTA_BUDGET_SET at START): a
+  // FINITE count of how many times a quota pause may auto-resume itself before the run must exhaust.
+  // `budget` is the original allotment (for display/audit); `remaining` is the live countdown that
+  // QUOTA_RESUMED decrements. OPTIONAL + additive (schema STAYS 2): an old/legacy state.json without
+  // it deserializes to undefined. THE FAIL-CLOSED DEFAULT lives in the reducer, NOT here: an ABSENT
+  // field (no budget was ever set — the resume() path, a legacy ledger) is treated as remaining 0, so
+  // a quota pause with no budget goes STRAIGHT to exhausted and NEVER auto-resumes. "Once" is a UI
+  // default only; the unset-ledger default is always 0. Pause itself is NOT stored here — it is
+  // in-memory orchestrator state (same-process scope), so a killed run never resumes from a stale
+  // "paused" flag.
+  auto_resume_?: { budget: number; remaining: number };
 }
 
 // THE UNIFIED APPROVAL GATE (gen 2): ONE shape for ALL held-ExitPlanMode gates — the root
@@ -370,6 +382,9 @@ export function toLedger2(state: PlanTreeState2): RecursiveLedger {
     // resumed/reopened ledger keeps the recorded audit trail. Deep-copied; absent ⇒ omitted (the
     // no-baseline path never sets it, so this stays byte-identical to today there).
     acceptance_: state.acceptance_ ? { ...state.acceptance_ } : undefined,
+    // Carry the quota auto-resume budget through persistence (deep-copied so the ledger never aliases
+    // live state). Absent ⇒ omitted (no budget was set — byte-identical to today's no-quota behavior).
+    auto_resume_: state.auto_resume_ ? { ...state.auto_resume_ } : undefined,
   };
 }
 
@@ -725,6 +740,26 @@ export type PlanTreeEvent2 =
   // PERSISTS so a killed run leaves a resumable id on disk (the id is never carried by a later node
   // transition). Idempotent: a re-dispatched same id is a no-op (no change, no persist effect).
   | { type: "SESSION_INITIALIZED"; sessionId: string }
+  // QUOTA AUTO-RESUME ARC (usage-limit pause/resume). These are RUN-LEVEL events (no path — they
+  // address the run's auto-resume budget, like SESSION_INITIALIZED addresses the run's session id),
+  // and like every gen-2 event the reducer reads NO clock: every timestamp rides its event.
+  //   - QUOTA_BUDGET_SET: dispatched at START from the composer's quota-resume choice. Sets
+  //     auto_resume_ = { budget, remaining: budget } — the run's auto-resume allotment. NOT dispatched
+  //     on the resume() path (a resumed run has no fresh choice — it keeps its persisted budget, or
+  //     fails closed at 0 if none was set).
+  //   - QUOTA_PAUSED: a usage-limit quota_exceeded frame arrived; the run is paused until `resetAt`
+  //     (epoch ms — the provider's reset time, ridden on the event). `source` names the limit that
+  //     tripped (display/audit only). The reducer DECIDES whether this pause can auto-resume:
+  //     remaining > 0 ⇒ notifyQuotaPaused (a countdown to auto-resume); remaining === 0 (or no budget)
+  //     ⇒ notifyQuotaExhausted (no auto-resume left).
+  //   - QUOTA_RESUMED: the orchestrator's auto-resume timer fired (or the user resumed manually);
+  //     decrement remaining by one (down to the floor 0). `nowMs` rides the event (no clock read).
+  //   - QUOTA_EXHAUSTED: a terminal exhaust signal (the run cannot auto-resume further). Emits
+  //     notifyQuotaExhausted; the budget is left as-is (already 0 in the auto-resume flow).
+  | { type: "QUOTA_BUDGET_SET"; budget: number }
+  | { type: "QUOTA_PAUSED"; resetAt: number; source: string }
+  | { type: "QUOTA_RESUMED"; nowMs: number }
+  | { type: "QUOTA_EXHAUSTED"; resetAt: number; source: string }
   | { type: "FATAL"; message: string };
 
 // ---- gen-2 effects (the reducer DECIDES; the driver EXECUTES) ----------------------------------
@@ -763,6 +798,14 @@ export type Effect2 =
   | { kind: "notifySummaryWritten"; path: NodePath; summaryPath: PlanTreeFilePath }
   // Surface that the whole tree is done.
   | { kind: "notifyDone" }
+  // QUOTA AUTO-RESUME — surface that the run is PAUSED on a usage limit and WILL auto-resume. The
+  // driver starts a countdown to `resetAt` and arms the auto-resume timer; `remaining` is the
+  // post-pause auto-resume count it may display ("N auto-resumes left"); `source` names the limit.
+  | { kind: "notifyQuotaPaused"; resetAt: number; remaining: number; source: string }
+  // QUOTA AUTO-RESUME — surface that the run is PAUSED with NO auto-resume left (budget exhausted, or
+  // never set — the fail-closed default). The driver surfaces a paused-until-`resetAt` state but does
+  // NOT auto-resume; only a manual user action continues the run. `source` names the limit.
+  | { kind: "notifyQuotaExhausted"; resetAt: number; source: string }
   // Surface a fatal error.
   | { kind: "notifyFatal"; message: string };
 
@@ -817,6 +860,9 @@ function initial2(treeId: string, request: string, nowMs: number): PlanTreeState
     baseline_: undefined,
     // No acceptance verdict yet — set only when the forced acceptance gate resolves.
     acceptance_: undefined,
+    // No quota auto-resume budget yet — set by QUOTA_BUDGET_SET (dispatched at START from the
+    // composer's quota-resume choice). Absent ⇒ the fail-closed reducer default (remaining 0).
+    auto_resume_: undefined,
     pendingApproval: null,
     pendingClarify: null,
     pendingPrototype: null,
@@ -836,6 +882,7 @@ function clone2(state: PlanTreeState2): PlanTreeState2 {
     sdk_session_id: state.sdk_session_id,
     baseline_: state.baseline_ ? { ...state.baseline_ } : undefined,
     acceptance_: state.acceptance_ ? { ...state.acceptance_ } : undefined,
+    auto_resume_: state.auto_resume_ ? { ...state.auto_resume_ } : undefined,
     pendingApproval: state.pendingApproval,
     pendingClarify: state.pendingClarify,
     pendingPrototype: state.pendingPrototype,
@@ -1691,6 +1738,66 @@ export function reduce2(
       break;
     }
 
+    case "QUOTA_BUDGET_SET": {
+      // Set the run's auto-resume budget (dispatched at START from the composer's quota-resume
+      // choice). budget == remaining at the start of the run; QUOTA_RESUMED decrements remaining as
+      // auto-resumes are spent. NOT a node transition — the tree is untouched. Persist so a killed
+      // run resumes with its budget intact.
+      next.auto_resume_ = { budget: event.budget, remaining: event.budget };
+      effects.push({ kind: "persist" });
+      break;
+    }
+
+    case "QUOTA_PAUSED": {
+      // A quota pause arrived. THE DECISION — fully driven by `remaining`, with the FAIL-CLOSED
+      // default: an ABSENT auto_resume_ (no QUOTA_BUDGET_SET was ever dispatched — the resume() path,
+      // a legacy ledger) is treated as remaining 0, so the pause goes STRAIGHT to exhausted and NEVER
+      // auto-resumes. Only a set budget with remaining > 0 yields an auto-resuming pause. The reducer
+      // does NOT decrement here (the decrement rides QUOTA_RESUMED when the resume actually happens) —
+      // and stores NO "paused" flag (pause is in-memory orchestrator state, same-process scope). No
+      // ledger field changes, so no persist effect.
+      // DEGRADED-RESET GUARD: a non-finite or <= 0 resetAt (the sentinel a result-carrier quota emits
+      // when the reset time is undeterminable) MUST force the exhausted path REGARDLESS of budget — a
+      // resume timer to epoch 0 fires immediately, back into the wall = a new loop. Only a usable
+      // (finite, > 0) reset may consult the budget.
+      const usableReset = Number.isFinite(event.resetAt) && event.resetAt > 0;
+      const remaining = usableReset && next.auto_resume_ ? next.auto_resume_.remaining : 0;
+      if (remaining > 0) {
+        effects.push({
+          kind: "notifyQuotaPaused",
+          resetAt: event.resetAt,
+          remaining,
+          source: event.source,
+        });
+      } else {
+        effects.push({ kind: "notifyQuotaExhausted", resetAt: event.resetAt, source: event.source });
+      }
+      break;
+    }
+
+    case "QUOTA_RESUMED": {
+      // An auto-resume (or manual resume) happened — spend one from the budget. Clamp at the floor 0
+      // (a resume with no budget left is a defensive no-op on the count). Persist the decremented
+      // budget so a kill mid-window leaves the spent count on disk. `nowMs` rides the event (no clock
+      // read) for the driver's bookkeeping; the reducer does not store it.
+      if (next.auto_resume_ && next.auto_resume_.remaining > 0) {
+        next.auto_resume_ = {
+          budget: next.auto_resume_.budget,
+          remaining: next.auto_resume_.remaining - 1,
+        };
+        effects.push({ kind: "persist" });
+      }
+      break;
+    }
+
+    case "QUOTA_EXHAUSTED": {
+      // A terminal exhaust signal: the run cannot auto-resume further. Surface it; the budget is left
+      // as-is (already 0 in the auto-resume flow — no ledger change, so no persist). NOT a node
+      // transition.
+      effects.push({ kind: "notifyQuotaExhausted", resetAt: event.resetAt, source: event.source });
+      break;
+    }
+
     case "FATAL": {
       effects.push({ kind: "notifyFatal", message: event.message });
       // FATAL does not mutate the ledger — it surfaces the error; the driver decides teardown.
@@ -1739,6 +1846,9 @@ export function rehydrateState2(ledger: RecursiveLedger): PlanTreeState2 {
     // undefined ⇒ the gate was never resolved (a run paused at the acceptance window re-presents the
     // gate from the tree shape + baseline_, not from a persisted gate).
     acceptance_: ledger.acceptance_ ? { ...ledger.acceptance_ } : undefined,
+    // Rehydrate the quota auto-resume budget from disk so a resumed run keeps its remaining count
+    // (deep-copied; absent ⇒ undefined ⇒ the fail-closed reducer default, never auto-resumes).
+    auto_resume_: ledger.auto_resume_ ? { ...ledger.auto_resume_ } : undefined,
     pendingApproval: null,
     pendingClarify: null,
     pendingPrototype: null,

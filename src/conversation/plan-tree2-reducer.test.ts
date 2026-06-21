@@ -377,6 +377,7 @@ describe("gen-2 prototype-review gate", () => {
     // stamped; JSON.stringify omits them while undefined so old state.json stays back-compatible.
     expect(Object.keys(ledger).sort()).toEqual([
       "acceptance_",
+      "auto_resume_",
       "baseline_",
       "created_ms",
       "root",
@@ -1455,13 +1456,15 @@ describe("gen-2 projections / persisted shape", () => {
 
     const ledger = toLedger2(s);
     // THE PERSISTED SHAPE PIN: schema 2 is {schema, tree_id, created_ms, updated_ms, root,
-    // sdk_session_id, baseline_, acceptance_} and NOTHING else — pointer/subplans are gone; transient
-    // gates never serialize. (sdk_session_id is the additive resume-support field; baseline_ the
-    // additive working-reference field; acceptance_ the Phase-5 additive acceptance-verdict field —
-    // all undefined here, omitted by JSON.stringify.)
+    // sdk_session_id, baseline_, acceptance_, auto_resume_} and NOTHING else — pointer/subplans are
+    // gone; transient gates never serialize. (sdk_session_id is the additive resume-support field;
+    // baseline_ the additive working-reference field; acceptance_ the Phase-5 additive
+    // acceptance-verdict field; auto_resume_ the additive quota auto-resume budget — all undefined
+    // here, omitted by JSON.stringify.)
     // Mutation: leak pendingApproval/pendingAcceptance (or a pointer field) into toLedger2 → RED.
     expect(Object.keys(ledger).sort()).toEqual([
       "acceptance_",
+      "auto_resume_",
       "baseline_",
       "created_ms",
       "root",
@@ -1479,6 +1482,167 @@ describe("gen-2 projections / persisted shape", () => {
     expect(snap.activePath).toEqual(p(1));
     expect(snap.writePolicy).toBe("plan");
     expect(snap.done).toBe(false);
+  });
+});
+
+// ---- PHASE 3: quota auto-resume budget + pause/resume/exhaust events ----------------------------
+//
+// The PURE-reducer state machine for the usage-limit quota pause/resume feature, backed by the
+// persisted per-tree auto_resume_ budget. Every test is constructed to go RED under inversion; the
+// FAIL-CLOSED default (an unset budget NEVER auto-resumes) is the headline invariant. The reducer
+// reads NO clock — every timestamp rides its event (the START.nowMs precedent).
+
+describe("gen-2 quota auto-resume budget", () => {
+  it("ROUND-TRIP: a ledger WITH auto_resume_ survives toLedger2 → JSON → rehydrate; WITHOUT it deserializes to undefined", () => {
+    // WITH the field: set a budget on a genesis run, persist, rehydrate — the budget survives intact.
+    const withBudget = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 3 }).state;
+    expect(withBudget.auto_resume_).toEqual({ budget: 3, remaining: 3 });
+    const onDisk = JSON.parse(JSON.stringify(toLedger2(withBudget)));
+    // FALSIFY: drop auto_resume_ from toLedger2 → the persisted ledger omits it → undefined here → RED.
+    expect(onDisk.auto_resume_).toEqual({ budget: 3, remaining: 3 });
+    const rehydrated = rehydrateState2(onDisk);
+    // FALSIFY: drop auto_resume_ from rehydrateState2 → undefined here → RED.
+    expect(rehydrated.auto_resume_).toEqual({ budget: 3, remaining: 3 });
+
+    // WITHOUT the field (an old/legacy ledger that never had a budget): absent ⇒ undefined.
+    const legacy: RecursiveLedger = toLedger2(genesis2());
+    expect(legacy.auto_resume_).toBeUndefined();
+    const legacyOnDisk: RecursiveLedger = JSON.parse(JSON.stringify(legacy));
+    // JSON.stringify omits the undefined key entirely (old-ledger compatibility).
+    expect("auto_resume_" in legacyOnDisk).toBe(false);
+    expect(rehydrateState2(legacyOnDisk).auto_resume_).toBeUndefined();
+  });
+
+  it("QUOTA_BUDGET_SET{budget:1} sets auto_resume_ = {budget:1, remaining:1} and persists", () => {
+    const out = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 1 });
+    // FALSIFY: set remaining to budget-1 (or 0) → RED. remaining STARTS at the full budget.
+    expect(out.state.auto_resume_).toEqual({ budget: 1, remaining: 1 });
+    expect(out.effects.map((e) => e.kind)).toEqual(["persist"]);
+    // The tree is untouched (budget is run-level, not a node transition).
+    expect(out.state.root.state).toEqual(genesis2().root.state);
+  });
+
+  it("after BUDGET_SET(1): QUOTA_PAUSED emits notifyQuotaPaused{remaining:1} (NOT exhausted)", () => {
+    const s = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 1 }).state;
+    const out = reduce2(s, { type: "QUOTA_PAUSED", resetAt: 5000, source: "five-hour limit" });
+    // FALSIFY: route a budgeted pause to notifyQuotaExhausted → the paused pin goes RED.
+    expect(out.effects).toContainEqual({
+      kind: "notifyQuotaPaused",
+      resetAt: 5000,
+      remaining: 1,
+      source: "five-hour limit",
+    });
+    expect(out.effects.map((e) => e.kind)).not.toContain("notifyQuotaExhausted");
+    // QUOTA_PAUSED does NOT decrement (the decrement rides QUOTA_RESUMED) and does NOT persist
+    // (no ledger change — pause is in-memory orchestrator state).
+    expect(out.state.auto_resume_).toEqual({ budget: 1, remaining: 1 });
+    expect(out.effects.map((e) => e.kind)).not.toContain("persist");
+  });
+
+  it("BUDGET_SET(1) → QUOTA_RESUMED (remaining→0) → a SECOND QUOTA_PAUSED → notifyQuotaExhausted", () => {
+    let s = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 1 }).state;
+    // First pause auto-resumes (remaining 1 > 0) ...
+    expect(reduce2(s, { type: "QUOTA_PAUSED", resetAt: 1, source: "x" }).effects.map((e) => e.kind)).toContain(
+      "notifyQuotaPaused",
+    );
+    // ... the resume spends the single budget unit.
+    s = reduce2(s, { type: "QUOTA_RESUMED", nowMs: 100 }).state;
+    expect(s.auto_resume_).toEqual({ budget: 1, remaining: 0 });
+    // The SECOND pause has remaining 0 → exhausted (no auto-resume left).
+    const out = reduce2(s, { type: "QUOTA_PAUSED", resetAt: 2, source: "five-hour limit" });
+    // FALSIFY: keep emitting notifyQuotaPaused at remaining 0 → the exhausted pin goes RED.
+    expect(out.effects).toContainEqual({
+      kind: "notifyQuotaExhausted",
+      resetAt: 2,
+      source: "five-hour limit",
+    });
+    expect(out.effects.map((e) => e.kind)).not.toContain("notifyQuotaPaused");
+  });
+
+  it("DEGRADED resetAt:0 with NON-ZERO budget → notifyQuotaExhausted (no auto-resume into the wall)", () => {
+    // A degraded result-carrier quota (undeterminable reset → sentinel 0). Even WITH budget remaining,
+    // a resetAt of 0 must FORCE exhausted: a resume timer to epoch 0 would fire immediately, back into
+    // the wall = a new loop. FALSIFY: route purely on budget (drop the usableReset guard) → remaining 1
+    // → notifyQuotaPaused → RED.
+    const s = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 2 }).state;
+    expect(s.auto_resume_).toEqual({ budget: 2, remaining: 2 });
+    const out = reduce2(s, { type: "QUOTA_PAUSED", resetAt: 0, source: "result_error" });
+    expect(out.effects).toContainEqual({
+      kind: "notifyQuotaExhausted",
+      resetAt: 0,
+      source: "result_error",
+    });
+    expect(out.effects.map((e) => e.kind)).not.toContain("notifyQuotaPaused");
+    // Budget is NOT spent here (the decrement rides QUOTA_RESUMED, which never happens for a degraded
+    // pause): the ledger is unchanged.
+    expect(out.state.auto_resume_).toEqual({ budget: 2, remaining: 2 });
+  });
+
+  it("DEGRADED non-finite resetAt (NaN/Infinity) with budget → notifyQuotaExhausted", () => {
+    const s = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 3 }).state;
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      const out = reduce2(s, { type: "QUOTA_PAUSED", resetAt: bad, source: "result_error" });
+      expect(out.effects.map((e) => e.kind)).toContain("notifyQuotaExhausted");
+      expect(out.effects.map((e) => e.kind)).not.toContain("notifyQuotaPaused");
+    }
+  });
+
+  it("FAIL-CLOSED (the most important invariant): NO budget set → QUOTA_PAUSED → notifyQuotaExhausted IMMEDIATELY", () => {
+    // A fresh genesis run with NO QUOTA_BUDGET_SET dispatched (auto_resume_ absent — the resume()
+    // path / legacy ledgers). An unset budget MUST default to 0 and NEVER auto-resume.
+    const s = genesis2();
+    expect(s.auto_resume_).toBeUndefined();
+    const out = reduce2(s, { type: "QUOTA_PAUSED", resetAt: 7000, source: "weekly limit" });
+    // FALSIFY (the headline break): make the reducer's fail-closed default 1 instead of 0 — an unset
+    // budget would then route to notifyQuotaPaused, and BOTH assertions below go RED.
+    expect(out.effects).toContainEqual({
+      kind: "notifyQuotaExhausted",
+      resetAt: 7000,
+      source: "weekly limit",
+    });
+    expect(out.effects.map((e) => e.kind)).not.toContain("notifyQuotaPaused");
+    // No budget was conjured into existence.
+    expect(out.state.auto_resume_).toBeUndefined();
+  });
+
+  it("QUOTA_RESUMED decrements remaining (and persists); clamps at 0", () => {
+    let s = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 2 }).state;
+    const first = reduce2(s, { type: "QUOTA_RESUMED", nowMs: 1 });
+    // FALSIFY: drop the decrement → remaining stays 2 → RED.
+    expect(first.state.auto_resume_).toEqual({ budget: 2, remaining: 1 });
+    expect(first.effects.map((e) => e.kind)).toEqual(["persist"]);
+    s = first.state;
+    s = reduce2(s, { type: "QUOTA_RESUMED", nowMs: 2 }).state;
+    expect(s.auto_resume_).toEqual({ budget: 2, remaining: 0 });
+    // A resume at remaining 0 is a defensive no-op: no decrement below the floor, no persist.
+    const clamped = reduce2(s, { type: "QUOTA_RESUMED", nowMs: 3 });
+    expect(clamped.state.auto_resume_).toEqual({ budget: 2, remaining: 0 });
+    expect(clamped.effects.map((e) => e.kind)).toEqual([]);
+  });
+
+  it("QUOTA_EXHAUSTED surfaces notifyQuotaExhausted (no ledger change, no persist)", () => {
+    const s = reduce2(genesis2(), { type: "QUOTA_BUDGET_SET", budget: 1 }).state;
+    const out = reduce2(s, { type: "QUOTA_EXHAUSTED", resetAt: 8000, source: "five-hour limit" });
+    expect(out.effects).toContainEqual({
+      kind: "notifyQuotaExhausted",
+      resetAt: 8000,
+      source: "five-hour limit",
+    });
+    expect(out.effects.map((e) => e.kind)).not.toContain("persist");
+    // The budget is left as-is.
+    expect(out.state.auto_resume_).toEqual({ budget: 1, remaining: 1 });
+  });
+
+  it("assertCoherent2 passes for a tree that has been through QUOTA_PAUSED (pause is not a node-state)", () => {
+    // A full split run paused mid-flight: the pause is run-level (in-memory), so the exactly-one-active
+    // tree invariant is untouched. Drive a split to its first child, pause, and assert coherence.
+    let s = reduce2(splitToFirstChild(2), { type: "QUOTA_BUDGET_SET", budget: 1 }).state;
+    const out = reduce2(s, { type: "QUOTA_PAUSED", resetAt: 1, source: "x" });
+    // FALSIFY: if QUOTA_PAUSED mutated a node into an illegal shape, assertCoherent2 (which runs
+    // inside reduce2) would already have thrown — pin it directly too.
+    expect(() => assertCoherent2(out.state.root)).not.toThrow();
+    // The active node is unchanged by the pause (child 01 still active).
+    expect(activePathOf(out.state.root)).toEqual(p(1));
   });
 });
 

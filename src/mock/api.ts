@@ -36,7 +36,13 @@ import {
   resetState,
 } from "./state";
 import { emitMockEvent } from "./event";
-import { emitGate, clearGate } from "./orchestrator";
+import {
+  emitGate,
+  clearGate,
+  emitQuotaPaused,
+  emitQuotaExhausted,
+  emitQuotaResumed,
+} from "./orchestrator";
 import {
   MOCK_REVIEW,
   MOCK_RESUME_RESUMABLE,
@@ -96,6 +102,11 @@ export interface MockApi {
   //               button reveals the inline #resume-confirm row (hazard + Confirm/Cancel) WITHOUT resuming.
   showResume(kind: "resumable" | "blocked" | "hazardous"): void;
   hideResume(): void;
+  // ---- quota auto-resume banner (Phase 5) ----
+  // Drive the inline conversation-pane quota banner: "waiting" (live countdown + armed pill, no Resume
+  // button), "exhausted" (next-reset + Cancel-session only), "resumed" (clears the banner + appends the
+  // resumed notice). Stages a short scene first so the pane has content. Token-free.
+  showQuota(state: "waiting" | "exhausted" | "resumed"): void;
   // ---- reading-pane variants (Phase 3) ----
   openDoc(variant: DocVariant): Promise<void>;
   // ---- history replay + empty states (Phase 3) ----
@@ -382,6 +393,24 @@ export function playScene(name: SceneName | string, delayMs = 0): boolean {
   return true;
 }
 
+// ---- quota auto-resume banner driver (Phase 5) ----------------------------------------------
+
+// Drive the inline quota-banner in the Conversation pane through the REAL index.ts quota wiring (which
+// subscribes to getOrchestrator() — the mock fake handle — in mock mode). We stage a short scene IN
+// PLACE (so the conversation pane has content + the live model is subscribed), then fan the matching
+// quota observer callback; index.ts's onQuotaPaused/onQuotaExhausted/onQuotaResumed appends/clears the
+// SINGLE banner node + rerenders, exactly as the live app does. Token-free.
+//   - "waiting":   armed banner with the live wall-clock countdown + "armed · N left" pill.
+//   - "exhausted": next-reset + Cancel-session only.
+//   - "resumed":   clears the waiting banner + appends the "Resumed after a quota threshold" notice.
+function showQuota(state: "waiting" | "exhausted" | "resumed"): void {
+  reset();
+  stagePlayScene("assistantText");
+  if (state === "waiting") emitQuotaPaused(1);
+  else if (state === "exhausted") emitQuotaExhausted();
+  else emitQuotaResumed();
+}
+
 // ---- review bar drivers ---------------------------------------------------------------------
 
 // VIEWING / SUMMARY (external review): seed mock list_pending_reviews with the fixture, then emit a
@@ -575,6 +604,7 @@ export function installMockApi(): void {
     clearReview,
     showResume,
     hideResume,
+    showQuota,
     openDoc,
     showHistory,
     showEmptyConversation,

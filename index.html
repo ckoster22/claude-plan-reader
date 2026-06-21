@@ -413,6 +413,18 @@
             <button class="conv-btn" id="composer-choose-dir" type="button">Choose…</button>
           </div>
 
+          <!-- Auto-resume after quota (Phase 6). When an orchestrated run hits an Anthropic usage
+               limit, "Once" lets the orchestrator auto-resume the interrupted turn a single time once
+               the quota refreshes; "Off" keeps today's fatal behavior. Persisted to
+               plan-reader-auto-resume (initAutoResumeSetting, src/auto-resume-setting.ts); read at
+               Start and threaded into QUOTA_BUDGET_SET. Default "once". -->
+          <label class="conv-field-label" for="composer-auto-resume">Auto-resume after quota</label>
+          <select class="conv-dir-field" id="composer-auto-resume"
+                  aria-label="Auto-resume after quota">
+            <option value="once">Once</option>
+            <option value="off">Off</option>
+          </select>
+
           <!-- Starting mode is fixed to "plan" for now (Build removed). Sessions always begin in plan
                mode; the ONLY path to acceptEdits is the post-review #review-approve handler in main.ts
                (set_agent_permission_mode). The composer no longer offers a Plan/Build toggle. -->

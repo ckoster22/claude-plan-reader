@@ -292,6 +292,7 @@ describe("scenes — AgentStream union exhaustiveness guard", () => {
     status: "uncovered",
     permission_denied: "scene",
     resume_fallback: "uncovered",
+    quota_exceeded: "uncovered",
   } as const satisfies Record<AgentStream["kind"], "scene" | "core" | "uncovered">;
 
   // The explicit allowlist of NOT-driven kinds, each with a one-line reason. MUST stay in lockstep with
@@ -301,6 +302,8 @@ describe("scenes — AgentStream union exhaustiveness guard", () => {
       "throttled in-place working signal; the deck drives the working indicator via session state, not a status frame.",
     resume_fallback:
       "non-fatal SDK resume-miss notice; the mock never resumes a (non-existent) prior SDK session.",
+    quota_exceeded:
+      "non-fatal quota/rate-limit notice; the mock never exhausts a (non-existent) usage quota.",
   };
 
   // Every classified kind (the tsc-validated key universe). Object.keys(COVERAGE) is exactly the real
@@ -388,8 +391,8 @@ describe("scenes — AgentStream union exhaustiveness guard", () => {
     for (const k of uncovered) {
       expect(KNOWN_UNCOVERED[k]?.trim().length ?? 0).toBeGreaterThan(0);
     }
-    // Confirm the expected uncovered set (status / resume_fallback — permission_denied is now driven by
-    // the permissionDenied scene, so it is "scene", not "uncovered").
-    expect(uncovered).toEqual(["resume_fallback", "status"]);
+    // Confirm the expected uncovered set (quota_exceeded / status / resume_fallback — permission_denied
+    // is now driven by the permissionDenied scene, so it is "scene", not "uncovered").
+    expect(uncovered).toEqual(["quota_exceeded", "resume_fallback", "status"]);
   });
 });

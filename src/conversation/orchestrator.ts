@@ -25,6 +25,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { resolveModelOptions } from "../model-picker";
+import { resolveAutoResumeBudget } from "../auto-resume-setting";
 import { diag } from "./diag";
 import {
   reduce2,
@@ -772,6 +773,40 @@ export function resumedDecompositionChangesPrompt(feedback: string): string {
   ].join("\n");
 }
 
+// QUOTA RESUME (Phase 7) — the note prepended to EVERY auto-resume prompt re-issued after a quota
+// pause refreshed. Exported so the per-variant quotaResumePrompt tests can pin it and a silent drop
+// is caught. RE-EMISSION CONTRACT (the carry-forward fix from the Phase-4 DA review): the interrupted
+// turn's PARTIAL accumulated buffer is DISCARDED, not continued (fireResume re-arms the captured
+// variant with `buffer: ""`). So the resumed turn must produce the COMPLETE, self-contained artifact
+// FRESH — never "continue from the middle" — because there is no retained partial to graft onto.
+// Concatenating a stale partial with a continuation would corrupt the downstream artifact
+// (recon.md / INTENT.md / summary), which is exactly what this contract forbids.
+export const QUOTA_RESUME_NOTE = [
+  "RESUMING AFTER A QUOTA PAUSE. The previous turn was interrupted partway through when an Anthropic",
+  "usage/quota limit was reached. The quota has now refreshed and the session is being resumed.",
+  "The partial output from the interrupted turn was DISCARDED — do NOT try to continue it from where",
+  "it stopped. Instead, produce the COMPLETE, self-contained output for this turn FRESH, as a full",
+  "re-emission. The full instructions for the turn follow.",
+].join("\n");
+
+// QUOTA RESUME (Phase 7) — the generic fallback used when no clean per-variant turn was captured
+// (the pause hit while `idle`/`resuming`): there is no specific artifact to re-emit, so just nudge
+// the conversation to produce the complete result for whatever step it was on.
+export const QUOTA_RESUME_GENERIC = [
+  "RESUMING AFTER A QUOTA PAUSE. The previous turn was interrupted when an Anthropic usage/quota",
+  "limit was reached. The quota has now refreshed and the session is being resumed. Continue where",
+  "you left off and produce the complete result for the current step.",
+].join("\n");
+
+// QUOTA RESUME (Phase 7) — wrap an original per-variant turn prompt with the re-emission note above.
+// Exported (and pure) so the per-variant prompt assertions can construct the EXACT expected string by
+// passing each builder's output (reconPrompt(...), subReconPrompt(...), summaryPrompt(...), …). The
+// driver-local quotaResumePrompt below threads its closure context into the matching builder, then
+// calls this to attach the note.
+export function quotaResumeWrap(originalTurnPrompt: string): string {
+  return [QUOTA_RESUME_NOTE, "", originalTurnPrompt].join("\n");
+}
+
 // PHASE 4 — nested decomposition draft: a NON-ROOT split node drafts its own decomposition, scoped
 // to its mandate (the nested-master preamble travels with it), then holds via ExitPlanMode exactly
 // like the root's master draft. Child headers are PER-LEVEL `### Sub-Plan NN:` numbers (the full
@@ -1075,6 +1110,22 @@ export interface OrchestratorDeps {
   // single persist path through this, so every ledger write carries a fresh timestamp and tests
   // assert monotonicity without sleeping.
   now?(): number;
+  // PHASE 4 — INJECTABLE WAKE SEAM (optional — defaults to document.visibilitychange in defaultDeps):
+  // a WebView occluded for the duration of a quota wait suspends its in-page timers (the occluded-
+  // window timer-suspension hazard — see MEMORY). When the window un-occludes the quota timer that
+  // SHOULD have fired during the wait may still be pending. This seam delivers a "the page just woke"
+  // signal so the quota machinery can recompute remaining time against the WALL CLOCK and resume
+  // immediately if the reset already passed. Returns an unsubscribe fn (called at teardown). Tests
+  // inject a fake that captures the callback so they can drive a wake without a real DOM event.
+  onWake?(fn: () => void): () => void;
+  // PHASE 6 — INJECTABLE AUTO-RESUME BUDGET SEAM (optional). start() resolves the run's quota
+  // auto-resume budget through this and dispatches QUOTA_BUDGET_SET at the START boundary (the
+  // resolveModelOptions precedent: the impure localStorage read lives ONLY in defaultDeps, keeping
+  // the dep interface narrow). Returns {budget}: 0 ("off") never auto-resumes; 1 ("once") grants a
+  // single auto-resume. Absent (older fakes / the resume() path never calls it) ⇒ start() dispatches
+  // NO QUOTA_BUDGET_SET, leaving the reducer's fail-closed 0 default (no auto-resume). The resume()
+  // path NEVER reads this — it inherits the persisted ledger budget.
+  resolveAutoResumeBudget?(): { budget: number };
 }
 
 // Bind the dependency interface to the real Tauri commands (the same `invoke` the rest of the code
@@ -1130,6 +1181,22 @@ export function defaultDeps(): OrchestratorDeps {
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     now: () => Date.now(),
+    // PHASE 4 — fire `fn` whenever the document becomes visible again (the page un-occludes).
+    // visibilitychange (not focus) is the WebView suspension boundary; we filter to the visible
+    // edge so a hide event does not fire the wake. Guarded for non-DOM environments (tests inject
+    // their own seam, but defaultDeps must not throw if document is absent).
+    onWake: (fn) => {
+      if (typeof document === "undefined") return () => {};
+      const handler = (): void => {
+        if (document.visibilityState === "visible") fn();
+      };
+      document.addEventListener("visibilitychange", handler);
+      return () => document.removeEventListener("visibilitychange", handler);
+    },
+    // PHASE 6 — resolve the composer's auto-resume choice (reads localStorage directly, key-omission
+    // discipline) into the per-run budget start() dispatches as QUOTA_BUDGET_SET. The dep interface
+    // stays narrow; this impure read lives ONLY here (the resolveModelOptions precedent).
+    resolveAutoResumeBudget: () => resolveAutoResumeBudget(),
   };
 }
 
@@ -1162,6 +1229,23 @@ export interface OrchestratorObserver {
   onDone?(snap: PlanTreeSnapshot2): void;
   // A fatal error occurred (terminal). The driver tears down after dispatching this.
   onFatal?(message: string): void;
+  // PHASE 4 — QUOTA AUTO-RESUME SURFACE (NON-terminal). The run hit a usage/rate-limit quota wall
+  // and PAUSED (it is NOT torn down — `active` stays true). The orchestrator has scheduled a
+  // wall-clock-aware timer to `resetAt` and will auto-resume the interrupted turn when it fires.
+  //   - `resetAt` is epoch-MILLISECONDS (when the quota refreshes).
+  //   - `remaining` is the auto-resume budget left AFTER this pause (always > 0 when paused — at 0
+  //     the reducer routes to onQuotaExhausted instead).
+  //   - `source` is the detection carrier (rate-limit event vs. thrown error).
+  // Phase 5 binds this to the countdown banner; Phase 8 to a desktop notification.
+  onQuotaPaused?(info: { resetAt: number; remaining: number; source: string }): void;
+  // PHASE 4 — the run hit a quota wall but the auto-resume budget is SPENT (remaining 0, or no
+  // budget was ever granted — fail-closed). NO timer is scheduled; the only affordance is Cancel.
+  // The run stays paused/active (not torn down) so the user can read the next reset time.
+  onQuotaExhausted?(info: { resetAt: number; source: string }): void;
+  // PHASE 4 — the quota refreshed and the interrupted turn was auto-resumed (the in-memory pause is
+  // cleared; the run is live again). Fired after the resume prompt is re-issued. Phase 5 clears the
+  // banner on this; Phase 8 fires a "resumed" notification.
+  onQuotaResumed?(): void;
 }
 
 // The frozen handle main.ts / the renderer hold to drive the orchestration.
@@ -1248,6 +1332,28 @@ export interface OrchestratorHandle {
   // tagger consults this (via isOrchestratorResuming()) AT INGEST to mark that aborted result as a
   // deliberate interrupt rather than a genuine failure.
   resuming(): boolean;
+  // PHASE 4 / DA-I5 — SYNCHRONOUS QUOTA-PAUSE PROBE (mirrors resuming()): true between a
+  // quota_exceeded pause and its auto-resume (or cancel/exhaust-then-cancel). It is synchronously
+  // correct: it returns true from the INSTANT markQuotaPausePending() is called (the agent-stream
+  // listener calls it the moment a quota_exceeded frame is seen), through the microtask-deferred
+  // QUOTA_PAUSED dispatch that installs the established pause, until the pause resolves. BOTH
+  // agent-exit listeners (index.ts AND main.ts) consult it to land "paused" on a same-tick exit
+  // rather than tearing the session down / purging held reviews. Read-only.
+  quotaPaused(): boolean;
+  // DA-I5 — SYNCHRONOUS pause-pending latch. The agent-stream listener calls this the instant a
+  // quota_exceeded frame is seen, BEFORE the fire-and-forget ingestStream schedules the
+  // (microtask-deferred) QUOTA_PAUSED dispatch. It makes quotaPaused() synchronously true so a
+  // same-tick agent-exit is classified as a PAUSE by both listeners. Subsumed once the established
+  // pause installs; cleared when the pause resolves (resume/cancel/teardown/terminal). Idempotent.
+  markQuotaPausePending(): void;
+  // PHASE 4 — PRIOR-SESSION EXIT SIGNAL. The orchestrator does NOT subscribe to the `agent-exit`
+  // Tauri event (index.ts / main.ts own that listener); they forward it here. While a quota pause is
+  // armed, this records that the prior (paused) sidecar session has actually exited — the precondition
+  // for re-opening a session (the Rust one-session-per-launch guard rejects a second `start` until the
+  // prior child is reaped). If the resume timer already fired and was WAITING on this exit, receiving
+  // it kicks the deferred resume. A no-op when no pause is armed. Idempotent. (Phase 6 wires the call
+  // site; the auto-resume path tolerates it never arriving in tests via the same guard.)
+  notifyAgentExit(): void;
   // INTERNAL FUNNEL (not part of the public UI contract): feed a reducer event directly. The handle
   // methods call this; the live agent-stream listener (later sub-plan) will too, and tests script a
   // run through it. Exposed so events with no public method (NODE_RECON_DONE, SIZER_DONE, …) are
@@ -1415,6 +1521,60 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
   // throwing frame). Cleared when a result consumes the armed variant, when a new arm replaces it,
   // and at every terminal (Stop / FATAL / done via markTerminal).
   let turnWatchdog: unknown = null;
+  // PHASE 4 — QUOTA AUTO-RESUME in-memory state (transient, NEVER persisted — same boundary as the
+  // sequencer/watchdog; only the auto-resume BUDGET rides the ledger). Non-null between a
+  // quota_exceeded pause and its resume/cancel. Captures:
+  //   - resetAt: epoch-ms the quota refreshes (the timer target + the wall-clock re-check anchor);
+  //   - remaining: the auto-resume budget left (carried from notifyQuotaPaused — always > 0 here;
+  //     an exhausted pause records `exhausted: true` and schedules no timer);
+  //   - source: the detection carrier (for the observer/banner);
+  //   - awaitingVariant: the in-flight turn captured AT PAUSE TIME, re-armed verbatim on resume so
+  //     the resumed turn advances the SAME sequencer step the wall interrupted;
+  //   - exhausted: budget spent — no timer, Cancel-only surface;
+  //   - priorExited: has the paused sidecar session's `agent-exit` been observed yet? The resume
+  //     cannot re-`startSession` until the prior child is reaped (the Rust one-session guard). Set
+  //     by notifyAgentExit(); fireResume defers (re-checks on exit) when false.
+  //   - backstopAttempts: how many times fireResume has armed the bounded prior-exit backstop timer
+  //     while deferring on !priorExited. notifyAgentExit() is the PRIMARY path that proceeds the
+  //     deferred resume; this counter bounds the FALLBACK (a lost agent-exit must not hang the run
+  //     forever) — after QUOTA_PRIOR_EXIT_BACKSTOP_MAX arms the resume proceeds anyway (the Rust
+  //     one-session guard will reject + surface if the child truly is still alive). Reset whenever a
+  //     fresh pause is armed.
+  let quotaPause:
+    | {
+        resetAt: number;
+        remaining: number;
+        source: string;
+        awaitingVariant: Awaiting;
+        exhausted: boolean;
+        priorExited: boolean;
+        backstopAttempts: number;
+      }
+    | null = null;
+  // DA-I5 (integration fix) — SYNCHRONOUS quota-pause-pending flag. The QUOTA_PAUSED dispatch that
+  // installs `quotaPause` runs in a LATER microtask than the agent-stream listener that sees the
+  // quota_exceeded frame (it goes through enqueueIngest), so `quotaPause` is NOT yet set on a
+  // same-tick agent-stream(quota_exceeded) + agent-exit delivery. BOTH agent-exit listeners
+  // (index.ts AND main.ts) must classify that exit as a PAUSE, not an end-of-run. index.ts had a
+  // private closure flag; main.ts could not read it. This flag — set synchronously via the handle's
+  // markQuotaPausePending() the instant the frame is seen — makes the SHARED quotaPaused() probe
+  // synchronously correct for both. It is SUBSUMED once `quotaPause` is installed (quotaPaused()
+  // ORs both), and is CLEARED at every place the pause is resolved: QUOTA_RESUMED (fireResume),
+  // cancel()/teardown/markTerminal, and any NON-quota terminal — so it can never linger and
+  // mis-classify a later genuine exit as paused.
+  let quotaPausePending = false;
+  // The live quota resume-timer handle (one slot — at most one pause is armed at a time). Cleared on
+  // resume, cancel, teardown, and every terminal (mirror clearTurnWatchdog) so a paused timer can
+  // never fire into a dead run.
+  let quotaTimer: unknown = null;
+  // The unsubscribe fn for the wake seam (document.visibilitychange), wired once at start/resume and
+  // torn down with the run. Null when no wake subscription is live.
+  let quotaWakeOff: (() => void) | null = null;
+  // BRIDGE: the awaiting variant captured in the quota_exceeded ingest branch, read by the
+  // notifyQuotaPaused/notifyQuotaExhausted effect handlers (which run synchronously inside the
+  // QUOTA_PAUSED dispatch). Set just before that dispatch and cleared just after — never observed
+  // outside that single synchronous window.
+  let pendingQuotaCapture: Awaiting | null = null;
   // TEST-ONLY OBSERVABILITY: how many ingest-impl thunks the queue actually DEQUEUED and INVOKED (each
   // impl bumps this at its very top, BEFORE the terminal guard). Lets the error-isolation test prove a
   // throw in one frame did NOT poison the queue — the next frame's thunk still ran up to the guard —
@@ -1503,6 +1663,15 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
     // fire against a NEW hold would be a false fatal; the !active guard also covers it, defense in
     // depth).
     clearTurnWatchdog();
+    // PHASE 4 — a paused quota timer must never fire into a dead run (a late fire would call
+    // startSession on a torn-down session). Clear the in-memory pause + its timer at every terminal
+    // (mirror clearTurnWatchdog). The wake subscription is torn down here too so a visibilitychange
+    // after teardown cannot re-enter fireResume. (Both are idempotent no-ops when no pause is armed.)
+    clearQuotaPause();
+    if (quotaWakeOff) {
+      quotaWakeOff();
+      quotaWakeOff = null;
+    }
     // Tear down the combined apply-and-approve latch with the session: a flag left set across a
     // terminal could auto-resolve a future run's first gate. (Reset alongside prototypeRound in
     // start()/resume() too; this covers cancel()/FATAL/Stop where those resets don't run.)
@@ -1720,7 +1889,18 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
         return;
       }
       case "notifyDone": {
+        // NATURAL COMPLETION is terminal — and like cancel()/notifyFatal it must END the SDK session,
+        // not merely flip `active` false. Leaving the session alive in the sidecar starves index.ts of
+        // the `agent-exit` that drives applySessionState("none"): the controller stays stuck at "idle"
+        // forever, so "+ New plan" stays disabled and Send's none-branch resume seam never engages —
+        // both affordances die after a plan completes (user must restart the app). Ending the session
+        // emits agent-exit → none, which re-enables New-plan and arms the resume-on-Send path. The
+        // resume target (lastCwd/lastSessionId in index.ts) is RETAINED across the end on purpose, so
+        // the follow-up Send reopens the SAME conversation via resumeSessionId. wasActive-guarded so a
+        // repeated notifyDone never re-ends (mirrors notifyFatal).
+        const wasActive = active;
         markTerminal("notifyDone");
+        if (wasActive) await endSdkSession();
         const snap = state ? toSnapshot2(state) : null;
         if (snap) for (const o of observers) o.onDone?.(snap);
         return;
@@ -1736,6 +1916,42 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
         markTerminal(`notifyFatal: ${eff.message}`);
         if (wasActive) await endSdkSession();
         for (const o of observers) o.onFatal?.(eff.message);
+        return;
+      }
+      case "notifyQuotaPaused": {
+        // PHASE 4 — the run paused with auto-resume budget remaining. Install the in-memory pause
+        // capturing the in-flight turn (bridged from the ingest branch via pendingQuotaCapture; idle
+        // if absent — defensive), then schedule the wall-clock-aware resume timer. The observer/banner
+        // (Phase 5) and notification (Phase 8) consume onQuotaPaused.
+        quotaPause = {
+          resetAt: eff.resetAt,
+          remaining: eff.remaining,
+          source: eff.source,
+          awaitingVariant: pendingQuotaCapture ?? { tag: "idle" },
+          exhausted: false,
+          priorExited: false,
+          backstopAttempts: 0,
+        };
+        scheduleQuotaTimer();
+        for (const o of observers) o.onQuotaPaused?.({ resetAt: eff.resetAt, remaining: eff.remaining, source: eff.source });
+        return;
+      }
+      case "notifyQuotaExhausted": {
+        // PHASE 4 — the run hit a quota wall but the auto-resume budget is spent (fail-closed at 0).
+        // Install the pause as EXHAUSTED (no timer scheduled — Cancel is the only affordance) so the
+        // synchronous quotaPaused() probe still reads true (the session stays "paused", not torn down)
+        // and the wall-clock reset time is retained for the banner. Surface via onQuotaExhausted.
+        quotaPause = {
+          resetAt: eff.resetAt,
+          remaining: 0,
+          source: eff.source,
+          awaitingVariant: pendingQuotaCapture ?? { tag: "idle" },
+          exhausted: true,
+          priorExited: false,
+          backstopAttempts: 0,
+        };
+        clearQuotaTimer();
+        for (const o of observers) o.onQuotaExhausted?.({ resetAt: eff.resetAt, source: eff.source });
         return;
       }
     }
@@ -1820,6 +2036,17 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
   // seconds), so this is a BACKSTOP against a lost/failed interrupt — short enough to fail loud,
   // generous enough for a slow tool-abort wind-down.
   const RESUME_RESULT_TIMEOUT_MS = 30_000;
+
+  // PHASE 6 BACKSTOP (DA carry-forward) — bound the fireResume "!priorExited" defer so a lost/never-
+  // delivered agent-exit cannot hang a quota-paused run forever. The PRIMARY proceed path is
+  // notifyAgentExit() (the agent-exit listener forwards it the instant the prior sidecar exits). When
+  // the resume timer fires but the exit has not landed, fireResume defers AND arms a backstop timer
+  // that re-enters fireResume after QUOTA_PRIOR_EXIT_BACKSTOP_MS. After QUOTA_PRIOR_EXIT_BACKSTOP_MAX
+  // such arms (≈ MAX × MS of waiting) the resume PROCEEDS regardless: the Rust one-session-per-launch
+  // guard will reject the respawn and surface a fatal if the child genuinely is still alive, which is
+  // strictly better than a silent forever-hang. Injectable/testable via the same scheduleTimer seam.
+  const QUOTA_PRIOR_EXIT_BACKSTOP_MS = 5_000;
+  const QUOTA_PRIOR_EXIT_BACKSTOP_MAX = 6;
 
   // PHASE 5 (DA P4 follow-up) — THE GENERALIZED TURN TIMEOUT for the `summary` and `parent-review`
   // awaiting variants (ONE constant for both — documented choice). These are REAL generation turns
@@ -1922,6 +2149,210 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
     }, RESUME_RESULT_TIMEOUT_MS);
   };
 
+  // ---- PHASE 4: quota auto-resume timer + wall-clock-aware resume -----------------------------
+  //
+  // PHASE 7 — the resume-context prompt re-issued when the quota refreshes. Builds the COMPLETE,
+  // self-contained original turn prompt for the captured variant (using the same closure context a
+  // never-interrupted turn would have) and wraps it with QUOTA_RESUME_NOTE (the re-emission contract:
+  // the discarded-partial buffer means the model must re-emit the whole artifact fresh, never continue
+  // the fragment). The pure module-level builders (reconPrompt, subReconPrompt, sizerPrompt,
+  // summaryPrompt, parentReviewPrompt, resumedLeafContinuePrompt) are reused verbatim so the resumed
+  // turn's instructions are byte-identical to the original — only the note differs. idle/resuming (no
+  // clean captured turn) fall back to QUOTA_RESUME_GENERIC. Signature is STABLE (fireResume calls it).
+  const quotaResumePrompt = (awaitingVariant: Awaiting, path: NodePath): string => {
+    switch (awaitingVariant.tag) {
+      case "intent":
+        // The intent turn re-confirms the user's intent (visual clarifier). confirmedIntent is not
+        // yet captured (the turn that produces it was interrupted), so re-issue the original ask.
+        return quotaResumeWrap(intentPrompt(request));
+      case "recon":
+        // Root recon (path []) threads confirmedIntent; a sub-recon threads the node's mandate +
+        // prior sibling summaries + any parent adjust note — exactly like the live/resume sends.
+        return quotaResumeWrap(
+          path.length === 0
+            ? reconPrompt(request, confirmedIntent)
+            : subReconPrompt(path, mandateFor(path), priorSummaries(parentPathOf(path)), adjustNoteFor(path)),
+        );
+      case "sizer":
+        return quotaResumeWrap(sizerPrompt());
+      case "exec":
+        // The exec turn implements an already-approved plan; partial edits may already be on disk, so
+        // the faithful complete re-issue is the AUDIT-AND-CONTINUE prompt (inspect the tree, finish the
+        // remaining steps) keyed to this node's plan file — NOT a from-scratch restart.
+        return quotaResumeWrap(resumedLeafContinuePrompt(planName2(path)));
+      case "summary":
+        return quotaResumeWrap(summaryPrompt(path, hasBaseline()));
+      case "parent-review": {
+        // Re-emit the parent's NO-TOOLS review turn: the reviewed child's summary + the FROZEN
+        // remaining sibling mandates + the ADJUST/NONE protocol, exactly as the live/resume send. The
+        // remaining siblings are the parent's still-PENDING children (mirrors the resume `review`
+        // branch). The captured variant carries both paths, so no disk/state probe is required for the
+        // ids; remaining-sibling discovery reads the live tree (already in-memory at resume time).
+        const reviewedChild = awaitingVariant.reviewedChild;
+        const parentPath = awaitingVariant.parentPath;
+        const childSummary = summaries.get(pathKey(reviewedChild)) ?? "";
+        const parentNode = state ? nodeAtPath(state.root, parentPath) : null;
+        const remaining =
+          parentNode && parentNode.state.stage === "split"
+            ? parentNode.state.children
+                .filter((c) => c.state.stage === "open" && c.state.phase === "pending")
+                .map((c) => {
+                  const sibPath: NodePath = [...parentPath, c.nn];
+                  return { path: sibPath, mandate: mandateFor(sibPath) };
+                })
+            : [];
+        return quotaResumeWrap(parentReviewPrompt(reviewedChild, childSummary, remaining));
+      }
+      case "idle":
+      case "resuming":
+      default:
+        return QUOTA_RESUME_GENERIC;
+    }
+  };
+
+  const clearQuotaTimer = (): void => {
+    if (quotaTimer !== null) {
+      cancelTimer(quotaTimer);
+      quotaTimer = null;
+    }
+  };
+
+  // Clear the entire in-memory pause (timer + state + the synchronous pending flag). Called on
+  // resume (fireResume → QUOTA_RESUMED), cancel/teardown, and every terminal (markTerminal) — a
+  // paused timer must never fire into a dead/resumed run, AND the synchronous pause-pending flag
+  // must not survive the pause's resolution (else a later genuine exit would mis-classify as paused).
+  const clearQuotaPause = (): void => {
+    clearQuotaTimer();
+    quotaPause = null;
+    quotaPausePending = false;
+  };
+
+  // Schedule (or RE-schedule) the resume timer for the currently-armed pause. The delay is computed
+  // from the WALL CLOCK at schedule time (max(0, resetAt - now)) so a re-schedule after an early
+  // fire targets the true remaining delta. No-op when no (non-exhausted) pause is armed.
+  const scheduleQuotaTimer = (): void => {
+    if (!quotaPause || quotaPause.exhausted) return;
+    // BELT-AND-SUSPENDERS (degraded-reset): never schedule a resume to a non-positive/non-finite
+    // resetAt — that is the sentinel a degraded result-carrier quota carries, and a timer to epoch 0
+    // would fire immediately back into the wall. The reducer already routes these to exhausted (no
+    // timer); this is defense in depth in case a degraded pause is ever installed non-exhausted.
+    if (!(quotaPause.resetAt > 0)) return;
+    clearQuotaTimer();
+    const delay = Math.max(0, quotaPause.resetAt - nowFn());
+    diag(`scheduleQuotaTimer: resetAt=${quotaPause.resetAt} delay=${delay}ms remaining=${quotaPause.remaining}`);
+    quotaTimer = scheduleTimer(() => {
+      quotaTimer = null;
+      void enqueueIngest(() => fireResume());
+    }, delay);
+  };
+
+  // THE WALL-CLOCK-AWARE AUTO-RESUME. Runs serialized through enqueueIngest (the established
+  // timer-fired path) so it cannot interleave with a live frame. Guards, in order:
+  //   1. terminal / no-pause / exhausted → drop (a late timer into a dead or already-resumed run);
+  //   2. budget remaining must be > 0 (defense in depth — exhausted pauses arm no timer);
+  //   3. WALL-CLOCK re-check: if the timer fired EARLY (coalesced, or the page was occluded and the
+  //      timer was delivered short), now() < resetAt ⇒ NEVER resume early — re-schedule the true
+  //      remaining delta and return;
+  //   4. PRIOR-EXIT guard: the prior (paused) sidecar session must have exited (notifyAgentExit seen)
+  //      before re-`startSession` — else the Rust one-session-per-launch guard rejects the respawn.
+  //      When not yet seen, DEFER: leave the pause armed (priorExited false); notifyAgentExit() will
+  //      re-enter fireResume once the exit lands. (In the live app the sidecar gracefulExit(0)s right
+  //      after emitting quota_exceeded, so the exit reliably follows; this guard makes the order safe.)
+  const fireResume = async (): Promise<void> => {
+    if (!active || !quotaPause || quotaPause.exhausted) return;
+    if (quotaPause.remaining <= 0) return;
+    // BELT-AND-SUSPENDERS (degraded-reset): a non-positive/non-finite resetAt is the undeterminable
+    // sentinel — treat as exhausted, never resume (a resume to epoch 0 lands straight back in the wall).
+    if (!(quotaPause.resetAt > 0)) return;
+    const nowMs = nowFn();
+    if (nowMs < quotaPause.resetAt) {
+      diag(`fireResume: early (now=${nowMs} < resetAt=${quotaPause.resetAt}) — re-scheduling`);
+      scheduleQuotaTimer();
+      return;
+    }
+    if (!quotaPause.priorExited) {
+      // The prior sidecar has not exited yet. notifyAgentExit() is the PRIMARY path that proceeds this
+      // deferred resume the instant the exit lands. But a lost/never-delivered exit must not hang the
+      // run forever — arm a BOUNDED backstop timer that re-enters fireResume. After the bounded number
+      // of arms, PROCEED anyway (fall through below): the Rust one-session guard rejects + surfaces a
+      // fatal if the child is genuinely still alive, which beats a silent forever-hang.
+      if (quotaPause.backstopAttempts < QUOTA_PRIOR_EXIT_BACKSTOP_MAX) {
+        quotaPause.backstopAttempts++;
+        diag(
+          `fireResume: prior session has not exited yet — deferring (backstop ${quotaPause.backstopAttempts}/${QUOTA_PRIOR_EXIT_BACKSTOP_MAX}); notifyAgentExit() or backstop will re-check`,
+        );
+        // Reuse the (now-fired, null) quotaTimer slot so clearQuotaPause/cancel/teardown clears it.
+        clearQuotaTimer();
+        quotaTimer = scheduleTimer(() => {
+          quotaTimer = null;
+          void enqueueIngest(() => fireResume());
+        }, QUOTA_PRIOR_EXIT_BACKSTOP_MS);
+        return;
+      }
+      diag(
+        `fireResume: prior session STILL not exited after ${QUOTA_PRIOR_EXIT_BACKSTOP_MAX} backstop attempts — proceeding anyway (Rust one-session guard will reject + surface if the child is still alive)`,
+      );
+      // Fall through to the respawn — do NOT defer again.
+    }
+    const pause = quotaPause;
+    // Re-open the session resuming the prior transcript — the SAME shape resume() uses. Resolving the
+    // session id off `state` (the ledger's self-persisted sdk_session_id); a missing id ⇒ a fresh
+    // session (the sidecar's expired-transcript fallback emits resume_fallback, tolerated below).
+    const resumeSessionId = state?.sdk_session_id;
+    const policy = state ? writePolicyFor2(state.root) : "plan";
+    diag(`fireResume: resuming session (policy=${policy}, resumeSessionId=${resumeSessionId ?? "none"})`);
+    // Clear the in-memory pause + timer BEFORE the awaitable respawn so a wake/exit racing this
+    // resume cannot re-enter fireResume and double-start. The QUOTA_RESUMED dispatch (decrementing
+    // the budget) lands after the prompt is re-issued.
+    clearQuotaPause();
+    // ARM-BEFORE-SEND: re-arm the captured awaiting variant so the resumed turn's `result` advances
+    // the SAME sequencer step the wall interrupted (start() discipline — a result delivered as the
+    // send resolves is never swallowed). A captured `idle`/`resuming` re-arms idle (nothing to
+    // advance; the generic continue prompt nudges the conversation forward).
+    //
+    // PHASE 7 BUFFER-CONTRACT (the carry-forward fix from the Phase-4 DA review): RESET `buffer: ""`
+    // on the re-arm — matching EVERY other re-arm site in the file (fireResume was the lone exception).
+    // The interrupted turn's partially-accumulated buffer is DISCARDED, not carried forward, so the
+    // post-resume capture holds ONLY the fresh, complete re-emission (quotaResumePrompt instructs a
+    // full re-emit, not a continue-from-the-middle). Carrying the stale partial would concatenate it
+    // with the continuation and corrupt the downstream artifact (recon.md / INTENT.md / summary).
+    awaiting =
+      pause.awaitingVariant.tag === "resuming" || pause.awaitingVariant.tag === "idle"
+        ? { tag: "idle" }
+        : { ...pause.awaitingVariant, buffer: "" };
+    const capturedPath =
+      "path" in pause.awaitingVariant
+        ? (pause.awaitingVariant.path as NodePath)
+        : ([] as NodePath);
+    await deps.startSession({
+      cwd,
+      permissionMode: policy,
+      ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
+    });
+    await deps.sendMessage(quotaResumePrompt(pause.awaitingVariant, capturedPath));
+    await dispatch({ type: "QUOTA_RESUMED", nowMs: nowFn() });
+    for (const o of observers) o.onQuotaResumed?.();
+  };
+
+  // Wire the wake seam ONCE per run (start/resume). On a wake (the page un-occluded), if a non-
+  // exhausted pause is armed and the reset already passed during the suspension, kick fireResume
+  // immediately — the in-page timer that should have fired may have been suspended. Routed through
+  // enqueueIngest (the timer-fired serialization) so it cannot interleave with a live frame.
+  // fireResume's own wall-clock re-check is the backstop: a wake BEFORE resetAt re-schedules rather
+  // than resuming early. Idempotent: a second install tears down the prior subscription first.
+  const installWakeSeam = (): void => {
+    if (quotaWakeOff) {
+      quotaWakeOff();
+      quotaWakeOff = null;
+    }
+    if (!deps.onWake) return;
+    quotaWakeOff = deps.onWake(() => {
+      if (!active || !quotaPause || quotaPause.exhausted) return;
+      diag("onWake: page visible; re-checking quota reset against wall clock");
+      void enqueueIngest(() => fireResume());
+    });
+  };
+
   // ---- the live turn-completion sequencer ----------------------------------------------------
   //
   // THE SEQUENCER (see the `Awaiting` union above): the `result` branch acts ONLY when `awaiting` is
@@ -1977,6 +2408,29 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
       }
       return;
     }
+    if (frame.kind === "quota_exceeded") {
+      // PHASE 4 — THE QUOTA WALL. A non-fatal quota_exceeded frame arrived (the sidecar detected a
+      // usage/rate-limit exhaustion, emitted this, and is gracefulExit(0)ing its child). PAUSE the
+      // run instead of letting it die:
+      //   • CAPTURE the in-flight turn (`awaiting`) so the resume re-arms the SAME sequencer step;
+      //   • CLEAR the turn watchdog — the wait is unbounded (hours), so the silence-timer must not
+      //     FATAL the paused run; the resumed turn re-arms its own watchdog;
+      //   • DISARM `awaiting` to idle for the duration of the pause (no live turn is in flight; a
+      //     stray result during the wait must be swallowed, never advance the sequencer);
+      //   • RESET priorExited tracking (the paused session has not exited yet);
+      //   • DISPATCH QUOTA_PAUSED — the reducer routes to notifyQuotaPaused (budget remains) or
+      //     notifyQuotaExhausted (fail-closed: no budget ⇒ remaining 0). The notify* effect handler
+      //     installs the in-memory pause + schedules the timer (paused) or no timer (exhausted).
+      // NOT terminal — `active` stays true through the pause.
+      diag(`quota_exceeded: pausing run; resetAt=${frame.resetAt} source=${frame.source} awaiting=${awaiting.tag}`);
+      const captured: Awaiting = awaiting;
+      clearTurnWatchdog();
+      awaiting = { tag: "idle" };
+      pendingQuotaCapture = captured;
+      await dispatch({ type: "QUOTA_PAUSED", resetAt: frame.resetAt, source: frame.source });
+      pendingQuotaCapture = null;
+      return;
+    }
     if (frame.kind === "assistant_text") {
       // Append to the CURRENT variant's buffer only; drop while idle OR resuming (no cross-step
       // merge — resume-turn chatter must never leak into the deferred step's capture).
@@ -1990,6 +2444,32 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
     // result is NOT idle anymore — it lands while `{tag:"resuming"}` holds the deferred next step,
     // and is consumed by the `resuming` branch below.)
     if (awaiting.tag === "idle") return;
+
+    // PHASE 0 — SESSION-LIMIT LOOP-STOP GUARD. A genuine FAILED turn (`is_error`) in an ARMED step
+    // must TERMINATE the run, never be consumed as a normal turn boundary that advances/re-prompts
+    // the next phase (the infinite "Run failed: You've hit your session limit…" loop). But the
+    // orchestrator DELIBERATELY produces `is_error` results during normal operation: post-
+    // decomposition-approval it interrupts the in-flight turn, which emits a terminal `result`
+    // (subtype "error_during_execution", `deliberateInterrupt` stamped by index.ts) that the
+    // `resuming` branch below consumes as its boundary. So this guard EXCLUDES:
+    //   • the `resuming` tag (the deliberate-interrupt boundary is consumed there);
+    //   • `frame.deliberateInterrupt` (the host-side verdict index.ts stamped — the cleanest, most
+    //     reliable signal, persisted on the stored frame so rebuilds re-read it);
+    //   • subtype "error_during_execution" (what an orchestrator-initiated interrupt always emits —
+    //     a belt-and-suspenders second exclusion in case the annotation is ever absent).
+    // (`idle` is already excluded by the swallow rule above.) Everything else with `is_error` is a
+    // genuine failure: disarm, FATAL (full teardown via notifyFatal→endSdkSession), and return.
+    if (
+      frame.is_error &&
+      awaiting.tag !== "resuming" &&
+      !frame.deliberateInterrupt &&
+      frame.subtype !== "error_during_execution"
+    ) {
+      diag(`result(is_error) in armed turn "${awaiting.tag}" — FATAL (no advance): ${frame.result}`);
+      awaiting = { tag: "idle" };
+      await dispatch({ type: "FATAL", message: frame.result ?? "Run failed" });
+      return;
+    }
 
     switch (awaiting.tag) {
       case "resuming": {
@@ -2323,9 +2803,10 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
             }
           }
         }
-        // If done, the reducer already fired notifyDone — nothing to send. (notifyDone keeps the
-        // SDK session itself alive exactly as gen 1 did — markTerminal deregisters but does not
-        // end the session; the user's Stop / a new start owns that.)
+        // If done, the reducer already fired notifyDone — nothing to send. (notifyDone now ENDS the
+        // SDK session via endSdkSession — like cancel()/notifyFatal — so index.ts receives agent-exit
+        // and transitions to "none", re-enabling New-plan and arming the resume-on-Send seam. The
+        // retained lastCwd/lastSessionId let a follow-up Send reopen the SAME conversation.)
         return;
       }
       case "parent-review": {
@@ -3096,6 +3577,9 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
       assertedPolicy = "prototype";
       active = true;
       activeOrchestrator = handle;
+      // PHASE 4 — wire the wake seam for the lifetime of the run (torn down at markTerminal). A
+      // quota pause armed mid-run uses it to recover from WebView timer suspension during a long wait.
+      installWakeSeam();
       diag("start(): active set true, activeOrchestrator registered");
       // CLEANUP-ON-THROW: everything past this point can reject (the START dispatch's
       // resetPlanTreeDir effect is the first awaitable — a disk failure lands here), and the guard
@@ -3109,6 +3593,16 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
         const treeId = newTreeId();
         // Genesis: build the fresh tree (persists state.json). START now lands in `clarifying-intent`.
         await dispatch({ type: "START", treeId, request, nowMs: nowFn() });
+        // PHASE 6 — QUOTA AUTO-RESUME BUDGET. Resolve the composer's choice (impure localStorage read
+        // confined to defaultDeps) and stamp it onto the fresh ledger via QUOTA_BUDGET_SET. Dispatched
+        // AT START (after the genesis ledger exists, before the first turn) so a quota wall mid-run
+        // already has its budget. Only when the seam is present: an absent resolveAutoResumeBudget
+        // (older fakes / a deliberately-narrow dep) leaves the reducer's fail-closed 0 default — no
+        // auto-resume. The resume() path NEVER reaches here, so it inherits the persisted budget.
+        if (deps.resolveAutoResumeBudget) {
+          const { budget } = deps.resolveAutoResumeBudget();
+          await dispatch({ type: "QUOTA_BUDGET_SET", budget });
+        }
         // Open the single SDK session in the derived genesis policy ("prototype" — see the
         // assertedPolicy note above), then send the INTENT prompt and arm "intent" so the first
         // turn-completion `result` advances the sequencer (intent → recon/prototype-review → …).
@@ -3204,6 +3698,8 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
       assertedPolicy = policy;
       active = true;
       activeOrchestrator = handle;
+      // PHASE 4 — wire the wake seam for the resumed run too (a resumed run can hit a quota wall).
+      installWakeSeam();
       diag(`resume(): active set true, activeOrchestrator registered (policy=${policy}, phase=${activePhaseLabel(state.root)})`);
       // CLEANUP-ON-THROW (mirrors start()): everything past here can reject (session open, disk
       // reads, the resume action's send). The guard is armed, so a rejection would otherwise wedge the
@@ -3640,6 +4136,29 @@ export function createOrchestrator(deps: OrchestratorDeps = defaultDeps()): Orch
     orchestrationActive: () => active,
 
     resuming: () => awaiting.tag === "resuming",
+
+    quotaPaused: () => quotaPause !== null || quotaPausePending,
+
+    markQuotaPausePending: () => {
+      // DA-I5 — set synchronously by the agent-stream listener the instant a quota_exceeded frame is
+      // seen, BEFORE the microtask-deferred QUOTA_PAUSED dispatch installs `quotaPause`. Makes
+      // quotaPaused() synchronously-correct for the same-tick agent-exit both listeners (index.ts +
+      // main.ts) consult. Cleared whenever the pause resolves (clearQuotaPause: QUOTA_RESUMED,
+      // cancel/teardown/markTerminal).
+      quotaPausePending = true;
+    },
+
+    notifyAgentExit: () => {
+      // The prior (paused) sidecar session exited. Only meaningful while a non-exhausted pause is
+      // armed: record the exit and, if the resume timer already fired and was waiting on it, kick the
+      // deferred resume (serialized through enqueueIngest, the timer-fired path). No-op otherwise
+      // (a genuine end-of-run exit, or an exit while no pause is armed). Idempotent.
+      if (!quotaPause || quotaPause.exhausted) return;
+      if (quotaPause.priorExited) return;
+      quotaPause.priorExited = true;
+      diag("notifyAgentExit: prior paused session exited; re-checking deferred resume");
+      void enqueueIngest(() => fireResume());
+    },
 
     dispatch: (event) => dispatch(event),
   };

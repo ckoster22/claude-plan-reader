@@ -49,12 +49,18 @@ const mockOverrides: UserConfig = {
       "@tauri-apps/api/window": shim("window.ts"),
       "@tauri-apps/plugin-opener": shim("opener.ts"),
       "@tauri-apps/plugin-dialog": shim("dialog.ts"),
+      "@tauri-apps/plugin-notification": shim("notification.ts"),
     },
   },
   // Exclude the real Tauri packages from dep pre-bundling so esbuild can't pre-bundle them and
   // bypass the alias.
   optimizeDeps: {
-    exclude: ["@tauri-apps/api", "@tauri-apps/plugin-opener", "@tauri-apps/plugin-dialog"],
+    exclude: [
+      "@tauri-apps/api",
+      "@tauri-apps/plugin-opener",
+      "@tauri-apps/plugin-dialog",
+      "@tauri-apps/plugin-notification",
+    ],
   },
   // A distinct port from the real dev server (1420) so the two never collide.
   server: {

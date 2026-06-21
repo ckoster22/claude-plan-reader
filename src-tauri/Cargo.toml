@@ -34,6 +34,12 @@ tauri-plugin-shell = "=2.3.5"
 # touch agent.rs. The capability identifier is verified against this crate's permission
 # schema (see src-tauri/capabilities/default.json).
 tauri-plugin-dialog = "2"
+# Desktop notifications (Phase 8) — fires an OS notification on the two quota events
+# (limit reached / auto-resumed) via the frontend `@tauri-apps/plugin-notification`.
+# Additive plugin init in lib.rs (`.plugin(tauri_plugin_notification::init())`); the
+# capability identifier `notification:default` is added to
+# src-tauri/capabilities/default.json.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # File-watch stack — pinned to reproducible versions (verified against crates.io 2026-05).

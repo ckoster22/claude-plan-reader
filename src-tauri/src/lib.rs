@@ -3647,6 +3647,11 @@ pub fn run() {
         // `@tauri-apps/plugin-dialog` `open({directory:true})`). Additive only —
         // does NOT touch agent.rs.
         .plugin(tauri_plugin_dialog::init())
+        // Desktop notifications (Phase 8): the notification plugin backs the
+        // frontend `@tauri-apps/plugin-notification` wrapper (src/notify.ts),
+        // which fires an OS notification on the two quota events (limit reached /
+        // auto-resumed). Additive only — does NOT touch agent.rs.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Agent SDK driver (Sub-Plan 01): one session per launch, stored in
             // Mutex<Option<AgentDriver>>. Managed unconditionally so the State

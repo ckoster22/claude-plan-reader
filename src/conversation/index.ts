@@ -11,7 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ConversationModel, WORKING_SEED_LABEL, WAITING_INPUT_LABEL } from "./stream";
 import { parseTranscript, applyTranscriptToModel } from "./history";
-import { renderTree } from "./render";
+import { renderTree, teardownQuotaCountdown } from "./render";
 import { createMinimap } from "./minimap";
 import { Composer } from "./composer";
 import { StatusController } from "./status";
@@ -19,6 +19,7 @@ import { getOrchestrator, isOrchestrationActive, isOrchestratorResuming } from "
 import { createImageAttachments, type ImageAttachments } from "./attachments";
 import { imagesToDataUrls } from "./images";
 import { diag } from "./diag";
+import { notifyQuotaPaused, notifyQuotaExhausted, notifyQuotaResumed } from "../notify";
 import type {
   AgentStream,
   ToolPermissionRequested,
@@ -205,14 +206,30 @@ export async function initConversation(
   // "none"   — no backend agent session is live (never started / ended / fully stopped).
   // "active" — a backend session is live AND a turn is generating (streaming / awaiting a permission).
   // "idle"   — a backend session is live but NO turn is active (after a `result`, or after Pause).
+  // "paused" — QUOTA WALL (Phase 6): the sidecar hit a usage limit and gracefulExit(0)ed, but the
+  //            ORCHESTRATOR is auto-resume-armed and owns the run (active stays true on its side). The
+  //            backend SDK session is GONE (the child exited), yet the run is NOT torn down — the
+  //            orchestrator will respawn a session at the reset time. Treated as "live" so New-plan
+  //            stays blocked and Stop/Cancel stays enabled; Pause/Resume are disabled (the
+  //            orchestrator owns auto-resume — a manual resume before the quota refresh is impossible).
   //
   // This one value gates EVERY liveness-derived control. No consumer keeps its own copy: New-plan,
   // Stop/Pause/Resume, the status pill's building/idle face, and the composer modal are all DERIVED
   // from it in applySessionState() below, called on every transition. That makes the impossible states
   // — "New-plan modal open while a session is live", "pill building while none", "Resume enabled while
   // active" — unrepresentable rather than guarded after the fact.
-  type SessionState = "none" | "active" | "idle";
+  type SessionState = "none" | "active" | "idle" | "paused";
   let session: SessionState = "none";
+
+  // PHASE 6 — SYNCHRONOUS QUOTA-PAUSE RACE FLAG (DA-C1). The orchestrator's QUOTA_PAUSED dispatch
+  // runs in a LATER microtask (via enqueueIngest) than the agent-stream listener's fire-and-forget
+  // `void ingestStream(...)`, and the sidecar's agent-exit can land in the SAME tick as the
+  // quota_exceeded frame. So at agent-exit time the queue-deferred `quotaPaused()` probe is NOT yet
+  // true — relying on it alone would tear the session down to "none" before the pause is recorded.
+  // This SYNCHRONOUS flag is set in the agent-stream listener the instant a quota_exceeded frame is
+  // seen (BEFORE the void ingestStream), and read by the agent-exit listener to land "paused" instead
+  // of "none". It is cleared once the orchestrator confirms it owns the pause (or the run ends).
+  let quotaPausePending = false;
 
   // Idle-waiting override (see ConversationHandle.setIdleWaitingHint): while ON and the session is
   // idle, rerender() shows WAITING_INPUT_LABEL instead of hiding the working indicator. Set from
@@ -239,7 +256,7 @@ export async function initConversation(
   // does nothing). This is the ONLY place that mutates `session`.
   const applySessionState = (next: SessionState): void => {
     session = next;
-    const live = isLive(session); // a child exists (active OR idle)
+    const live = isLive(session); // a session/run exists (active, idle, OR quota-paused)
 
     // Live takeover: a session going live ALWAYS reclaims the pane from any history/empty source and
     // invalidates any in-flight history load (the historyGen bump fails its post-await freshness
@@ -261,14 +278,18 @@ export async function initConversation(
     const orchActive = isOrchestrationActive();
 
     // Derive the controls PURELY from state — they cannot disagree.
-    // Stop: enabled ⇔ a session exists (active or idle). (cancelBtn === stopBtn — same element.)
+    // Stop: enabled ⇔ a session/run exists (active, idle, OR quota-paused — Cancel must stay reachable
+    // during a pause so the user can abandon the wait). (cancelBtn === stopBtn — same element.)
     const stopEl = els.stopBtn ?? els.cancelBtn;
     if (stopEl) stopEl.disabled = !live;
-    // Pause: enabled ⇔ a turn is actively generating AND no orchestration owns the turns.
+    // Pause: enabled ⇔ a turn is actively generating AND no orchestration owns the turns. Quota-paused
+    // is NOT active, so Pause stays disabled (there is no live turn to pause; the orchestrator owns it).
     if (els.pauseBtn) els.pauseBtn.disabled = !active || orchActive;
     // Resume: enabled ⇔ the session is idle (alive, no active turn) AND no orchestration owns the turns.
+    // Quota-paused is NOT idle, so Resume stays disabled — the orchestrator owns auto-resume and a
+    // manual resume before the quota refresh is impossible (the SDK child is gone until the reset).
     if (els.resumeBtn) els.resumeBtn.disabled = !idle || orchActive;
-    // New-plan: disabled ⇔ a session exists (live blocks a new plan).
+    // New-plan: disabled ⇔ a session/run exists (live — incl. quota-paused — blocks a new plan).
     if (els.newPlanBtn) els.newPlanBtn.disabled = live;
     // Free-text composer: the textarea is ALWAYS typable, including after Stop / natural session-end
     // (state "none"). The next Send then RESUMES the prior session id (same conversation context) by
@@ -416,7 +437,10 @@ export async function initConversation(
     if (paneSource.kind === "history") {
       const tree = paneSource.model.derive();
       tree.working = null;
-      renderTree(els.stream, tree, { onSubmitQuestion: submitQuestion });
+      renderTree(els.stream, tree, {
+        onSubmitQuestion: submitQuestion,
+        onCancelSession: stopSession,
+      });
       if (wasAtBottom) els.stream.scrollTop = els.stream.scrollHeight;
       minimap.rebuild();
       return;
@@ -443,7 +467,10 @@ export async function initConversation(
       // never lingers in the idle/none states.
       tree.working = null;
     }
-    renderTree(els.stream, tree, { onSubmitQuestion: submitQuestion });
+    renderTree(els.stream, tree, {
+      onSubmitQuestion: submitQuestion,
+      onCancelSession: stopSession,
+    });
     // Re-pin to the bottom only if the user was already there (sticky follow). Scrolling up to read
     // history suppresses this, and scrolling back to the bottom resumes it on the next frame.
     if (wasAtBottom) els.stream.scrollTop = els.stream.scrollHeight;
@@ -463,6 +490,22 @@ export async function initConversation(
       // the conversation, so re-reads simply re-confirm the same value.
       if (e.payload.kind === "system_init" || e.payload.kind === "result") {
         if (e.payload.session_id) lastSessionId = e.payload.session_id;
+      }
+      // PHASE 6 RACE FIX (DA-C1): a quota_exceeded frame means the sidecar is about to gracefulExit(0)
+      // and an agent-exit will follow — possibly in the SAME tick. Set the SYNCHRONOUS pause flag NOW,
+      // BEFORE the fire-and-forget `void ingestStream(...)` below schedules the orchestrator's
+      // (microtask-deferred) QUOTA_PAUSED dispatch. The agent-exit listener reads THIS flag (not the
+      // not-yet-true `quotaPaused()` probe) to land "paused" instead of tearing down to "none".
+      if (e.payload.kind === "quota_exceeded") {
+        quotaPausePending = true;
+        // DA-I5 (integration fix): ALSO promote the pending state onto the orchestrator handle so the
+        // OTHER agent-exit listener (main.ts, which guards its destructive purgeInprocReviews() +
+        // placeholder clear) shares ONE synchronously-correct quotaPaused() probe. main.ts cannot read
+        // THIS closure flag; markQuotaPausePending() makes quotaPaused() true the same tick, so a
+        // same-tick agent-exit no longer purges a held in-process review during a quota pause. The
+        // closure flag is RETAINED (its reset timing is load-bearing for the index same-tick test,
+        // whose fake handle has a hardcoded-false quotaPaused()).
+        if (isOrchestrationActive()) getOrchestrator().markQuotaPausePending();
       }
       // Deliberate-interrupt tagging (BEFORE rerender so the first paint is already muted): the
       // orchestrator's post-decomposition-approval interrupt surfaces as an is_error `result` with
@@ -556,9 +599,38 @@ export async function initConversation(
 
   unlisteners.push(
     await listen<AgentExit>("agent-exit", (e) => {
+      // PHASE 6 (DA-C1 race + notifyAgentExit wiring). A quota wall makes the sidecar gracefulExit(0),
+      // so this agent-exit can be a QUOTA PAUSE exit, NOT a genuine end-of-run. Two things must happen
+      // and the order matters:
+      //
+      //   (1) If a quota pause is pending — the SYNCHRONOUS `quotaPausePending` flag set in the
+      //       agent-stream listener this tick, OR the orchestrator's `quotaPaused()` probe already true
+      //       — the run is NOT over: land "paused" (a live state: New-plan blocked, Cancel enabled) and
+      //       do NOT tear down. We must NOT read ONLY `quotaPaused()`: the orchestrator's QUOTA_PAUSED
+      //       dispatch runs in a LATER microtask than this synchronous listener, so on a same-tick exit
+      //       it is not true yet — the synchronous flag is what closes the race.
+      //
+      //   (2) Whenever an orchestration is active, FORWARD the exit to the orchestrator via
+      //       notifyAgentExit(): the auto-resume respawn must wait for the prior sidecar to exit (the
+      //       Rust one-session-per-launch guard rejects a second start until the prior child is reaped).
+      //       Without this call the deferred fireResume never proceeds and auto-resume silently never
+      //       fires. It is a no-op when no pause is armed (a genuine end-of-run exit), so it is safe to
+      //       call on every orchestration exit.
       model.appendExit(e.payload, synthSeq++);
-      // The backend session ended — transition to none (idempotent: harmless if an explicit Cancel
-      // already moved us to none). applySessionState forces the pill out of building.
+      const pausing = quotaPausePending || getOrchestrator().quotaPaused();
+      // Forward the exit to the orchestrator FIRST (so a deferred resume that was waiting on the exit
+      // can proceed) while an orchestration owns the run. Guarded so a non-orchestrated single-shot
+      // session's exit never touches the orchestrator.
+      if (isOrchestrationActive()) getOrchestrator().notifyAgentExit();
+      if (pausing) {
+        // QUOTA PAUSE: keep the run alive. The orchestrator owns the auto-resume timer; the banner
+        // (driven by the onQuotaPaused observer) is already up. Do NOT applySessionState("none").
+        applySessionState("paused");
+        rerender();
+        return;
+      }
+      // Genuine end-of-run: transition to none (idempotent: harmless if an explicit Cancel already
+      // moved us to none). applySessionState forces the pill out of building.
       applySessionState("none");
       rerender();
     }),
@@ -570,6 +642,51 @@ export async function initConversation(
     }),
   );
 
+  // ---- Quota auto-resume banner (Phase 5) ----
+  // Subscribe to the orchestrator's quota observer callbacks (fired by the Phase 4 timer/auto-resume
+  // machinery) and drive the SINGLE quota-banner node. We CONSUME these callbacks verbatim — we never
+  // re-derive the quota state from the inert `quota_exceeded` stream frame. The banner is a pure render
+  // row: none of these touch session/complete state (the orchestrator already owns liveness during a
+  // pause). The subscription is torn down in teardown() via the returned unsubscribe.
+  const unsubQuota = getOrchestrator().subscribe({
+    // Quota hit, auto-resume armed: a live countdown to `resetAt` (epoch-ms) + "armed · N left" pill.
+    // appendQuotaBanner creates OR updates the singleton, so a re-pause never duplicates the banner.
+    onQuotaPaused: ({ resetAt, remaining, source }) => {
+      model.appendQuotaBanner({ state: "waiting", resetAt, remaining, source });
+      rerender();
+      // Phase 8 — desktop notification (scenario 1: usage limit reached). Fire-and-forget; the
+      // wrapper degrades silently if notifications are unavailable/denied, so it can never disturb
+      // the banner/auto-resume flow.
+      notifyQuotaPaused(resetAt);
+    },
+    // Quota hit but the auto-resume budget is spent: replace the banner with the exhausted state (next
+    // reset time + Cancel-session only). updateQuotaBanner flips the SAME singleton waiting -> exhausted.
+    onQuotaExhausted: ({ resetAt, source }) => {
+      model.updateQuotaBanner({ state: "exhausted", resetAt, remaining: 0, source });
+      rerender();
+      // Phase 8 — desktop notification (scenario 1: usage limit reached, exhausted variant).
+      // Fire-and-forget; silent degradation.
+      notifyQuotaExhausted(resetAt);
+    },
+    // The session auto-resumed (quota refreshed): clear the waiting banner and append a notice so the
+    // conversation has a permanent record that it picked back up after the quota threshold. Also clear
+    // the synchronous race flag — the pause is over, so the NEXT agent-exit (whenever the resumed run
+    // finally ends) must land "none", not be mis-read as a still-pending pause.
+    onQuotaResumed: () => {
+      quotaPausePending = false;
+      model.clearQuotaBanner();
+      model.appendNotice("Resumed after a quota threshold was reached", synthSeq++);
+      // The resumed run is live again: a fresh SDK session is being opened + the interrupted turn
+      // re-issued. Reflect that as an active session so New-plan stays blocked / Stop stays enabled
+      // and the pill leaves the paused face.
+      applySessionState("active");
+      rerender();
+      // Phase 8 — desktop notification (scenario 2: conversation auto-resumed). Fire-and-forget;
+      // silent degradation.
+      notifyQuotaResumed();
+    },
+  });
+
   // ---- Stop (full-stop: interrupt the turn AND end the session) ----
   // Stop is the today's-Cancel behavior: it interrupts the in-flight turn AND kills the child so the
   // one-session slot is released and a new plan can start (the reported bug was leaving the sidecar
@@ -580,9 +697,15 @@ export async function initConversation(
   //   3. transition SessionState -> none locally (idempotent), so the controls + pill update now.
   // Gated: a no-op unless a session exists (active OR idle), so it never calls cancel_agent_run with
   // no session (which the backend rejects).
-  const stopEl = els.stopBtn ?? els.cancelBtn;
-  stopEl?.addEventListener("click", () => {
+  // The full-stop path, shared by the Stop button AND the EXHAUSTED quota banner's Cancel-session
+  // button (both mean "interrupt the turn AND end the session" → state none). Routes through the
+  // orchestrator's cancel() when an orchestration owns the seam, else the legacy raw invokes. Gated:
+  // a no-op unless a session is live, so it never calls cancel_agent_run with no session.
+  const stopSession = (): void => {
     if (!isLive(session)) return;
+    // PHASE 6: a Cancel from the quota-paused state ends the run for good — drop the synchronous pause
+    // flag so the (already-seen / future) agent-exit is not mis-read as a still-pending pause.
+    quotaPausePending = false;
     applySessionState("none");
     // Sub-Plan 03: when a multiplan orchestration owns the seam, route Stop through the orchestrator's
     // cancel() (it does cancelRun + endSession + purge of any held permission + deregister from the
@@ -597,7 +720,9 @@ export async function initConversation(
     }
     void invoke("cancel_agent_run").catch((err) => console.error("cancel_agent_run failed", err));
     void invoke("end_agent_session").catch((err) => console.error("end_agent_session failed", err));
-  });
+  };
+  const stopEl = els.stopBtn ?? els.cancelBtn;
+  stopEl?.addEventListener("click", stopSession);
 
   // ---- Pause (interrupt the turn ONLY — session stays alive) ----
   // Pause interrupts the generating turn WITHOUT ending the session, leaving it idle so the user can
@@ -807,6 +932,22 @@ export async function initConversation(
         rerender();
         return;
       }
+      // (6a) RESUME-TARGET CAPTURE (history-view Send fix). A run that is selected from the sidebar
+      // AFTER it completed never went live this launch, so neither the composer start thunk (lastCwd)
+      // nor any agent-stream frame (lastSessionId) captured a resume target — leaving Send's none-branch
+      // to hit `if (lastCwd === null) return;` and silently dead-end despite a force-enabled composer.
+      // The transcript we just resolved ALREADY carries the plan's originating cwd + SDK session id; we
+      // capture them HERE as the post-end resume target so a follow-up Send re-opens (resumes) THIS
+      // plan's session. Guards: only when a real cwd is present (without it there is nothing to resume
+      // into — Send correctly stays a no-op); session_id may legitimately be null (an unresolved/expired
+      // session), in which case Send re-opens a FRESH session under the same cwd (the sidecar's
+      // expired-transcript fallback). We do NOT clobber an already-captured live/just-ended target: this
+      // branch only runs while session === "none" AND no orchestration owns the pane (re-checked above),
+      // i.e. exactly when there is no live resume target to preserve.
+      if (res.cwd) {
+        lastCwd = res.cwd;
+        lastSessionId = res.session_id ?? null;
+      }
       // (6) Replay the transcript into a FRESH model. If it yields no renderable nodes, show the
       // no-content empty state; otherwise the history model drives the pane.
       const replayModel = new ConversationModel();
@@ -833,6 +974,14 @@ export async function initConversation(
       // Detach the minimap's scroll/resize/mutation observers (no-op when the controller is the null
       // stub). Done first so no observer fires mid-teardown.
       minimap.destroy();
+      // Stop the lone quota-countdown interval so it never ticks against the torn-down pane.
+      teardownQuotaCountdown();
+      // Unsubscribe the quota observer (idempotent; harmless if the orchestrator already cleared it).
+      try {
+        unsubQuota();
+      } catch (err) {
+        console.error("quota unsubscribe failed", err);
+      }
       for (const un of unlisteners) {
         try {
           un();

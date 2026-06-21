@@ -13,6 +13,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MODEL_PRESET_KEY } from "../model-picker";
+import { AUTO_RESUME_KEY } from "../auto-resume-setting";
 
 const invokeMock = vi.fn((..._args: unknown[]) => Promise.resolve(undefined));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -79,6 +80,34 @@ describe("defaultDeps().startSession forwards the resolved picker model/effort t
       model: "claude-opus-4-8",
       effort: "high",
     });
+  });
+});
+
+describe("defaultDeps().resolveAutoResumeBudget reads the persisted composer choice (Phase 6)", () => {
+  beforeEach(() => {
+    Object.defineProperty(globalThis, "localStorage", {
+      value: fakeStorage(),
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  it("resolves the persisted 'off' choice to budget 0", () => {
+    localStorage.setItem(AUTO_RESUME_KEY, "off");
+    const deps = defaultDeps();
+    // FALSIFY: drop the resolveAutoResumeBudget wiring in defaultDeps → seam undefined → RED.
+    expect(deps.resolveAutoResumeBudget!()).toEqual({ budget: 0 });
+  });
+
+  it("resolves the persisted 'once' choice to budget 1", () => {
+    localStorage.setItem(AUTO_RESUME_KEY, "once");
+    const deps = defaultDeps();
+    expect(deps.resolveAutoResumeBudget!()).toEqual({ budget: 1 });
+  });
+
+  it("falls back to the UI default (once → budget 1) when nothing is persisted", () => {
+    const deps = defaultDeps();
+    expect(deps.resolveAutoResumeBudget!()).toEqual({ budget: 1 });
   });
 });
 

@@ -1802,6 +1802,33 @@ describe("orchestrator — forced acceptance gate (baseline present)", () => {
     expect(ledger.acceptance_).toEqual({ verdict: "approved", decided_ms: expect.any(Number) });
   });
 
+  // BUGFIX (post-completion New-plan + Send dead): on natural completion notifyDone must END the SDK
+  // session (cancelRun + endSession) exactly as cancel()/notifyFatal do, NOT merely flip `active`
+  // false. Leaving the SDK session alive starves index.ts of the `agent-exit` that drives
+  // applySessionState("none"); the controller stays stuck at "idle" forever, so New-plan stays
+  // disabled and Send's none-branch resume seam never engages. Ending the session emits agent-exit →
+  // none, which re-enables New-plan and arms the resume-on-Send path (lastCwd/lastSessionId are
+  // retained across the end on purpose).
+  it("notifyDone (natural completion) ENDS the SDK session so index.ts gets agent-exit → none", async () => {
+    const { deps, rec } = makeDeps();
+    const h = createOrchestrator(deps);
+    const obsRec = makeObserver();
+    h.subscribe(obsRec.obs);
+    await driveBaselineRunToCompletionSeam(h);
+    // Pre-finalize: the run is at the acceptance gate, session still live, nothing torn down yet.
+    expect(rec.endSession).toBe(0);
+
+    await h.approveAcceptance(); // fires the deferred finalize → notifyDone
+
+    // The run finished AND the SDK session was ended (cancel-the-turn + end-the-session), so the
+    // sidecar will emit agent-exit and index.ts will transition to "none".
+    // FALSIFY: revert notifyDone to a plain markTerminal() (no endSdkSession) → endSession stays 0 → RED.
+    expect(obsRec.done).toBe(1);
+    expect(rec.cancelRun).toBe(1);
+    expect(rec.endSession).toBe(1);
+    expect(isOrchestrationActive()).toBe(false);
+  });
+
   it("divergeAcceptance(reason) finalizes the run AND persists the divergence reason on the ledger", async () => {
     const { deps, rec } = makeDeps();
     const h = createOrchestrator(deps);

@@ -4102,3 +4102,84 @@ For the record, the following were confirmed present and correctly documented:
   `plan-review-cancelled` (control-dir watcher over `~/.claude/plan-reader/requests/`),
   `agent-stream`, `agent-error`, `agent-exit`, `tool-permission-requested`, `agent-auth-required`
   (Agent-SDK driver, `src-tauri/src/agent.rs`).
+
+---
+
+## Quota-exceeded auto-resume (additive, non-breaking)
+
+The app detects when Claude's usage/rate-limit quota is hit and (in later phases) parks the run
+behind a countdown banner, then auto-resumes once the quota window resets. None of the §1/§2/§3 or
+prior additive surfaces are altered. This section adds **one new `agent-stream` kind**; the banner,
+the ledger budget, and the orchestrator timer/auto-resume are added by **later phases** and
+documented separately as they land.
+
+### New `agent-stream` kind: `quota_exceeded`
+
+| kind | fields (beyond `seq`/`kind`) | source |
+|------|------------------------------|--------|
+| `quota_exceeded` | `resetAt` (epoch-**milliseconds**), `source` (`"rate_limit_event" \| "thrown_error"`) | the sidecar emits this when the SDK reports the quota was hit, by **either** carrier: a rate-limit progress event (`source: "rate_limit_event"`) **or** a thrown quota error (`source: "thrown_error"`). `resetAt` is the moment the quota window resets, already normalized to epoch-**ms** by the sidecar (the frontend must NOT re-scale it). The `source` enum distinguishes the two detection carriers. |
+
+**Non-fatal — travels via `agent-stream`, NOT `agent-error`.** This is load-bearing: routing it on
+`agent-stream` means the Rust read task's catch-all `_ =>` Stream arm relays it unchanged (**no Rust
+change required**), and — unlike a fatal `agent-error` — it does **not** tear the session down. The
+session stays alive so a later phase can auto-resume it in place once `resetAt` passes.
+
+The pure conversation reducer (`src/conversation/stream.ts`) treats `quota_exceeded` as **inert**: it
+adds **no** timeline node, does **not** flip `complete`, and does **not** change the working/active
+indicator state. The countdown **banner** and the **auto-resume** timer are owned by the
+**orchestrator** observer (a later phase), NOT by the reducer.
+
+### Phase 5 — the countdown banner (additive DOM contract)
+
+The banner is a **single** pure render node (`QuotaBannerNode`, `type:"quota-banner"`) appended to the
+live `ConversationModel` by the **orchestrator quota observer** wired in `src/conversation/index.ts`
+(it subscribes `onQuotaPaused` / `onQuotaExhausted` / `onQuotaResumed` via `getOrchestrator()`). It is a
+**singleton**: a re-pause UPDATES the same node in place (waiting → exhausted), never appending a
+duplicate; `onQuotaResumed` clears it and appends a `.conv-notice` row reading **"Resumed after a quota
+threshold was reached"**. The node never flips session/`complete` state.
+
+Model methods on `ConversationModel`: `appendQuotaBanner({state,resetAt,remaining,source})` (create or
+update the singleton), `updateQuotaBanner(...)` (alias), `clearQuotaBanner()` (tombstone → no node).
+
+Rendered into `#conversation-stream` by `src/conversation/render.ts` (`renderQuotaBanner`). DOM selectors
+(all `.conv-*`, token-styled in `styles.css`):
+
+| selector | role |
+|----------|------|
+| `.conv-quota-banner` | banner root. `data-state` is `"waiting"` or `"exhausted"`. |
+| `.conv-quota-banner-waiting` / `.conv-quota-banner-exhausted` | state modifier classes. |
+| `.conv-qb-head` + `.conv-qb-dot` + `.conv-qb-head-text` | header row; amber **pulsing** dot (waiting), static accent dot (exhausted). |
+| `.conv-qb-sub` | explanatory sub-text. |
+| `.conv-qb-countdown` | **waiting only** — live `HH:MM:SS` countdown. |
+| `.conv-qb-refresh-at` | reset clock-time ("Resets at …" / "Next reset at …"). |
+| `.conv-qb-auto-note` + `.conv-qb-spin` | **waiting only** — "will auto-resume" reassurance + spinner. |
+| `.conv-qb-pill` | **waiting only** — "⟳ Auto-resume armed · N attempt(s) left this session". |
+| `.conv-qb-actions` + `.conv-qb-cancel` | **exhausted only** — the **Cancel session** button (the ONLY affordance; there is **never** a Resume button). |
+
+**Countdown is wall-clock-driven.** A **single** module-level `setInterval` in `render.ts` recomputes
+`resetAt - Date.now()` each 1s tick (clamped at `00:00:00`) — NOT a stored decrementing counter — so an
+occluded/suspended WebView shows the correct value the instant it wakes; a `visibilitychange` listener
+recomputes immediately on un-occlusion. The interval + listener are torn down at the top of every
+`renderTree()` (before re-arming) and via the exported `teardownQuotaCountdown()` (called from the
+controller's `teardown()`), guaranteeing **at most one** live interval — no leak across rebuilds.
+
+The exhausted **Cancel session** button is wired to the `onCancelSession` render handler, which the
+controller maps to the SAME full-stop path as the Stop button (orchestrator `cancel()` when an
+orchestration owns the seam, else `cancel_agent_run` + `end_agent_session`).
+
+### Same-tick agent-exit / quota-pause race (additive)
+
+`OrchestratorHandle.quotaPaused(): boolean` is the **synchronously-correct** pause probe BOTH
+`agent-exit` listeners consult (the conversation facade in `src/conversation/index.ts` and main.ts's
+review-purge listener): when it is true on an `agent-exit`, the run is a **quota pause**, not an
+end-of-run — index.ts lands SessionState `"paused"` (not `"none"`) and main.ts SKIPS its destructive
+`purgeInprocReviews()` + live-run placeholder clear (a held in-process ExitPlanMode review must
+survive the pause). Because the orchestrator's `QUOTA_PAUSED` dispatch runs in a **later microtask**
+(via `enqueueIngest`) than the `agent-stream(quota_exceeded)` frame, the established pause is not yet
+installed on a same-tick `quota_exceeded` + `agent-exit` delivery. `OrchestratorHandle.markQuotaPausePending(): void`
+closes that race: the conversation facade's `agent-stream` listener calls it **synchronously** the
+instant a `quota_exceeded` frame is seen (before the fire-and-forget `ingestStream`), so
+`quotaPaused()` reads true from that tick onward (it ORs the pending flag with the established pause).
+The pending flag is cleared wherever the pause resolves — `QUOTA_RESUMED` (auto-resume),
+`cancel()`/`teardown()`, and every terminal (`markTerminal`) — so it never lingers to mis-classify a
+later genuine exit as paused.

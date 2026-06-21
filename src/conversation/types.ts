@@ -126,6 +126,20 @@ export interface ResumeFallback {
   reason: string;
 }
 
+// `quota_exceeded` — emitted by the sidecar (Phase 1) when the SDK reports the usage/rate-limit
+// quota was hit, either via a rate-limit progress event or a thrown quota error. NON-fatal: it
+// travels via `agent-stream` (NEVER `agent-error`), so the session is NOT torn down — a later
+// phase's orchestrator owns the waiting banner + auto-resume when the quota resets.
+//   - `resetAt` is epoch-MILLISECONDS (already normalized by the sidecar — do NOT re-scale).
+//   - `source` distinguishes the two detection carriers: a rate-limit progress event vs. a thrown
+//     quota error.
+export interface QuotaExceeded {
+  seq: number;
+  kind: "quota_exceeded";
+  resetAt: number;
+  source: "rate_limit_event" | "thrown_error" | "result_error";
+}
+
 // The discriminated union of every committed agent-stream kind.
 export type AgentStream =
   | SystemInit
@@ -137,7 +151,8 @@ export type AgentStream =
   | PermissionDenied
   | StatusMsg
   | SubagentStarted
-  | ResumeFallback;
+  | ResumeFallback
+  | QuotaExceeded;
 
 // ---- the other four Tauri events (not agent-stream) ---------------------------------------
 

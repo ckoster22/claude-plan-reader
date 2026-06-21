@@ -74,12 +74,21 @@ const handle: OrchestratorHandle = {
   },
   orchestrationActive: () => active,
   resuming: () => false,
+  quotaPaused: () => false,
+  markQuotaPausePending: () => {},
+  notifyAgentExit: () => {},
   dispatch: noopAsync,
 };
 
 // Install this fake as the orchestrator singleton. Idempotent. MUST be called before main.ts's
 // getOrchestrator().subscribe(...) runs (this module evaluates at mock boot, before DOMContentLoaded).
 export function installMockOrchestrator(): void {
+  // Clear any observers left over from a prior test/boot — each DOMContentLoaded subscribes index.ts's
+  // observer afresh, and without this they accumulate on the module-level singleton (so a fanned quota
+  // callback would fire N times across N boots). A clean set keeps per-test fan-out deterministic.
+  observers.clear();
+  lastSnapshot = null;
+  active = false;
   __setOrchestratorForTest(handle);
 }
 
@@ -112,6 +121,28 @@ export function emitPlaceholderSnapshot(): void {
   const snap = placeholderSnapshot();
   lastSnapshot = snap;
   for (const o of observers) o.onSnapshot?.(snap);
+}
+
+// Quota-banner drivers (Phase 5): fan the quota observer callbacks to every subscriber (index.ts's
+// real quota wiring is one of them in mock mode, since it subscribes via getOrchestrator()). These let
+// the floating deck exercise the WAITING / EXHAUSTED / RESUMED banner states without real tokens.
+// `resetAt` defaults to ~1h out so the countdown reads a realistic HH:MM:SS.
+export function emitQuotaPaused(remaining = 1, resetMsFromNow = 3_600_000): void {
+  const resetAt = Date.now() + resetMsFromNow;
+  for (const o of observers) o.onQuotaPaused?.({ resetAt, remaining, source: "retry-after" });
+}
+export function emitQuotaExhausted(resetMsFromNow = 3 * 3_600_000): void {
+  const resetAt = Date.now() + resetMsFromNow;
+  for (const o of observers) o.onQuotaExhausted?.({ resetAt, source: "retry-after" });
+}
+export function emitQuotaResumed(): void {
+  for (const o of observers) o.onQuotaResumed?.();
+}
+
+// TEST-ONLY: the live observer set, so a cross-boundary test can fan an EXACT quota callback (e.g. the
+// degraded resetAt:0 sentinel) that the offset-from-now emit* helpers above cannot express.
+export function __getMockObserversForTest(): OrchestratorObserver[] {
+  return Array.from(observers);
 }
 
 // Clear the gate: deregister as active and fan a terminal so the bar reverts to its non-gate modes.

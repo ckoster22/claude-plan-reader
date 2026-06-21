@@ -23,6 +23,7 @@
       "identifier": "shell:allow-kill",
       "allow": [{ "name": "agent-driver", "sidecar": true }]
     },
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "notification:default"
   ]
 }

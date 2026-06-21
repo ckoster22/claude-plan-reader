@@ -263,7 +263,9 @@ describe("golden depth-1 equivalence oracle (pre-refactor wire traces)", () => {
     await driveToSizer(h, "SIZER: single / 1 / 0.95");
     await driveSub(h, 1, "sub1-tu");
 
-    // Terminal: the trace itself pins onDone as the last observer event.
+    // Terminal: natural completion ENDS the SDK session (cancelRun → endSession) BEFORE firing the
+    // onDone observer — mirroring cancel()/notifyFatal — so index.ts gets an agent-exit and the
+    // post-completion New-plan + Send-resume affordances work. The trace pins this exact terminal order.
     expect(trace).toMatchInlineSnapshot(`
       [
         {
@@ -530,6 +532,12 @@ describe("golden depth-1 equivalence oracle (pre-refactor wire traces)", () => {
         {
           "event": "onSummaryWritten",
           "kind": "observer",
+        },
+        {
+          "kind": "cancelRun",
+        },
+        {
+          "kind": "endSession",
         },
         {
           "event": "onDone",
@@ -1173,6 +1181,12 @@ describe("golden depth-1 equivalence oracle (pre-refactor wire traces)", () => {
         {
           "event": "onSummaryWritten",
           "kind": "observer",
+        },
+        {
+          "kind": "cancelRun",
+        },
+        {
+          "kind": "endSession",
         },
         {
           "event": "onDone",
