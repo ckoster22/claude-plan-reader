@@ -26,7 +26,9 @@
   --conv-danger: #c0392b;        /* permission-denied / fatal-error accent (red) */
   --conv-danger-soft: #fbeae8;   /* permission-denied / error row background */
   --conv-overlay: rgba(0, 0, 0, 0.38); /* composer modal scrim */
-  --conv-on-accent: #ffffff;     /* text/icon on an --accent fill (terracotta) */
+  --conv-scrim: rgba(0, 0, 0, 0.6);        /* dark scrim over arbitrary image content (attach badge/remove) */
+  --conv-scrim-strong: rgba(0, 0, 0, 0.85); /* hovered/active scrim variant */
+  --conv-on-accent: #ffffff;     /* text/icon on an --accent fill (terracotta); also text on a scrim */
   --conv-shadow: rgba(0, 0, 0, 0.28); /* composer card drop shadow */
   --conv-tool-run-bg: #fff6f1;   /* running tool-row accent wash (Dense Chat) */
   --conv-warn: #d99a3b;          /* quota-waiting amber: pulsing dot, countdown, auto-resume note */
@@ -65,6 +67,8 @@
   --conv-danger: #ff7a6b;
   --conv-danger-soft: #3a1f1c;
   --conv-overlay: rgba(0, 0, 0, 0.55);
+  --conv-scrim: rgba(0, 0, 0, 0.6);         /* scrim sits over image content — dark in both themes */
+  --conv-scrim-strong: rgba(0, 0, 0, 0.85);
   --conv-on-accent: #ffffff;
   --conv-shadow: rgba(0, 0, 0, 0.5);
   --conv-tool-run-bg: #241a14;   /* running tool-row accent wash (Dense Chat), dark variant */
@@ -1442,6 +1446,59 @@ figcaption { font-size: 11px; color: var(--text-dim); text-align: center; margin
   font-family: var(--mono); font-size: 0.92em;
   background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
 }
+
+/* --- Pasted-image attachment previews (new-plan composer + conversation) --- */
+.conv-attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.conv-attach-chip {
+  position: relative;
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.conv-attach-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover; /* uniform square tile; swap to `contain` to letterbox the whole image (then add a chip background) */
+  display: block;
+}
+.conv-attach-badge {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.4;
+  background: var(--conv-scrim);
+  color: var(--conv-on-accent);
+  pointer-events: none;
+}
+.conv-attach-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--conv-scrim);
+  color: var(--conv-on-accent);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.conv-attach-remove:hover { background: var(--conv-scrim-strong); }
 
 /* Generic hide hook: any element with `.hidden` is removed from layout. Component-scoped
    `.hidden` rules above remain (higher specificity, harmless duplicates). Added because the

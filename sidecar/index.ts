@@ -20,7 +20,6 @@ import {
   query,
   getSessionInfo,
   type Query,
-  type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { extractFromBunfs } from "@anthropic-ai/claude-agent-sdk/extract";
@@ -32,8 +31,6 @@ import {
   createPrototypePreToolUseHook,
   hostPolicyForMode,
   sdkPermissionMode,
-  statusLabelFor,
-  StatusThrottle,
   type HostPolicy,
 } from "./permissions";
 import { optionOverridesFromEnv } from "./env-overrides";
@@ -41,8 +38,8 @@ import { resolveModelEffort } from "./model-effort";
 import { cliPlanRedirectSettings } from "./cli-plans";
 import { decideStart } from "./session-start";
 import { decideResume, resumeOption, RESUME_FALLBACK_REASON } from "./session-resume";
-import { isRenderableText } from "./frames";
-import { decideRateLimitFrame, parseResetFromError, isUsageLimitText, decideResultQuota } from "./quota";
+import { parseResetFromError } from "./quota";
+import { createNormalizer, type SeqCounter } from "./normalize";
 import { planningAgents } from "./agents/planningAgents";
 import { makeGracefulExit } from "./shutdown";
 // The platform package carries the bundled `claude` CLI. Imported as a `file`
@@ -145,8 +142,14 @@ let hostPolicy: HostPolicy = "plan";
 // start arrives — under which the prototype policy denies all mutating tools (fail closed).
 let sessionCwd: string | null = null;
 
+// The running, monotonic frame-sequence counter — SHARED (by reference) with the
+// extracted normalizer so its `nextFrame` and these out-of-band emit sites (the
+// permission gate's frames, resume_fallback, error, quota backstop) all draw from the
+// ONE counter, byte-for-byte identical to the prior single-module behavior.
+const seqCounter: SeqCounter = { value: 0 };
+
 const permissionGate = createInteractivePermissionGate(
-  (frame) => emit({ seq: seq++, ...frame }),
+  (frame) => emit({ seq: seqCounter.value++, ...frame }),
   () => hostPolicy,
   () => sessionCwd,
 );
@@ -211,256 +214,12 @@ function liftUserMessage(text: string, images?: InboundImage[]): SDKUserMessage 
 // blocks → several frames). Unknown subtypes return [] (dropped + logged).
 // ---------------------------------------------------------------------------
 
-let seq = 0;
-
-// PHASE 1 — the most-recent `SDKRateLimitInfo` seen on a `rate_limit_event`, retained across messages.
-// The result-carrier quota path (a usage-limit `result` with no structured field of its own) reuses a
-// recent structured `resetsAt` from here via decideResultQuota → extractResetAt. Stored for ALL
-// statuses; reuse is gated on `status === "rejected"` inside extractResetAt (which returns null
-// otherwise), so a stale `allowed`/`allowed_warning` info never feeds a false reset time.
-let lastRateLimitInfo: unknown = null;
-
-function nextFrame(kind: string, extra: Record<string, unknown>): Record<string, unknown> {
-  return { seq: seq++, kind, ...extra };
-}
-
-// ---------------------------------------------------------------------------
-// Lightweight `status` events — immediate "working" feedback.
-//
-// The SDK emits a stream of low-level progress signals (thinking tokens, subagent
-// task lifecycle, rate-limit notices). We do NOT surface their full text (privacy +
-// noise); instead we map each to a SHORT label and emit a committed `status` frame
-// carrying only that label. To avoid flooding we throttle: emit ONLY when the label
-// CHANGES from the last one we emitted. Anything still unknown stays dropped + logged.
-// ---------------------------------------------------------------------------
-
-const statusThrottle = new StatusThrottle();
-
-/** Emit a `status` frame iff `label` differs from the last one emitted (de-dup throttle).
- *  Returns the frame(s) to emit (0 or 1). */
-function statusFrames(label: string): Array<Record<string, unknown>> {
-  return statusThrottle.next(label).map((l) => nextFrame("status", { label: l }));
-}
-
-/** A content block may be a string, or an array of typed blocks. Narrow safely. */
-function contentBlocks(content: unknown): Array<Record<string, unknown>> {
-  if (typeof content === "string") {
-    return content.length > 0 ? [{ type: "text", text: content }] : [];
-  }
-  if (Array.isArray(content)) {
-    return content.filter((b): b is Record<string, unknown> => b != null && typeof b === "object");
-  }
-  return [];
-}
-
-function normalize(msg: SDKMessage): Array<Record<string, unknown>> {
-  switch (msg.type) {
-    case "system": {
-      const sub = (msg as { subtype?: string }).subtype;
-      // A subagent (Task/Agent tool) was just spawned. The SDK carries rich metadata here that we
-      // surface as a committed `subagent_started` frame: the `tool_use_id` is the SAME id the
-      // subagent's child messages carry as `parent_tool_use_id` AND the id of the parent Task
-      // tool_use — so the frontend keys the subagent group off it. Without this frame the group is
-      // anonymous (identity + task lost). task_progress/task_notification stay coarse `status`.
-      if (sub === "task_started") {
-        const m = msg as unknown as {
-          tool_use_id?: string;
-          subagent_type?: string;
-          description?: string;
-          prompt?: string;
-        };
-        return [
-          nextFrame("subagent_started", {
-            tool_use_id: m.tool_use_id ?? null,
-            subagent_type: m.subagent_type ?? null,
-            description: m.description ?? null,
-            prompt: m.prompt ?? null,
-          }),
-        ];
-      }
-      if (sub === "init") {
-        const m = msg as unknown as {
-          model?: string;
-          cwd?: string;
-          tools?: string[];
-          skills?: string[];
-          slash_commands?: string[];
-          permissionMode?: string;
-          session_id?: string;
-        };
-        return [
-          nextFrame("system_init", {
-            model: m.model ?? null,
-            cwd: m.cwd ?? null,
-            tools: m.tools ?? [],
-            skills: m.skills ?? [],
-            slash_commands: m.slash_commands ?? [],
-            permission_mode: m.permissionMode ?? null,
-            session_id: m.session_id ?? null,
-          }),
-        ];
-      }
-      if (sub === "permission_denied") {
-        const m = msg as unknown as {
-          tool_name?: string;
-          tool_use_id?: string;
-          agent_id?: string;
-          decision_reason_type?: string;
-          message?: string;
-        };
-        return [
-          nextFrame("permission_denied", {
-            tool: m.tool_name ?? null,
-            tool_use_id: m.tool_use_id ?? null,
-            agent_id: m.agent_id ?? null,
-            decision_reason_type: m.decision_reason_type ?? null,
-            message: m.message ?? null,
-          }),
-        ];
-      }
-      // status carries the live permission mode — surface mode flips so the UI
-      // reflects setPermissionMode round-trips. NOTE: this is OUTBOUND notification only —
-      // SDK-originated mode changes must NEVER update `hostPolicy` (the SDK silently leaves
-      // "plan" after an ExitPlanMode approval; only the host's set-permission-mode command
-      // may widen the policy).
-      if (sub === "status") {
-        const m = msg as unknown as { permissionMode?: string };
-        if (m.permissionMode) {
-          return [nextFrame("mode_change", { mode: m.permissionMode })];
-        }
-        return [];
-      }
-      // Low-level progress signals (thinking / task lifecycle / rate-limit) surface as a
-      // throttled, label-only `status` frame so the pane shows "working" instead of going blank.
-      {
-        const label = sub ? statusLabelFor(sub) : null;
-        if (label !== null) return statusFrames(label);
-      }
-      // Other system subtypes are not committed by Sub-Plan 01 → drop.
-      logErr("[sidecar] dropping system subtype:", sub);
-      return [];
-    }
-
-    case "assistant": {
-      const m = msg as unknown as {
-        message?: { content?: unknown };
-        parent_tool_use_id?: string | null;
-        subagent_type?: string;
-      };
-      const frames: Array<Record<string, unknown>> = [];
-      for (const block of contentBlocks(m.message?.content)) {
-        if (block.type === "text" && isRenderableText(block.text)) {
-          frames.push(
-            nextFrame("assistant_text", {
-              text: block.text,
-              parent_tool_use_id: m.parent_tool_use_id ?? null,
-            }),
-          );
-        } else if (block.type === "tool_use") {
-          frames.push(
-            nextFrame("tool_use", {
-              id: block.id ?? null,
-              tool: block.name ?? null,
-              input: block.input ?? {},
-              parent_tool_use_id: m.parent_tool_use_id ?? null,
-            }),
-          );
-        }
-        // thinking / other blocks are not committed → silently skipped.
-      }
-      return frames;
-    }
-
-    case "user": {
-      // Tool results come back as a `user` message whose content holds
-      // tool_result blocks. Surface those under the committed `tool_result`
-      // kind; an ordinary echoed user turn carries no tool_result block.
-      const m = msg as unknown as {
-        message?: { content?: unknown };
-        parent_tool_use_id?: string | null;
-      };
-      const frames: Array<Record<string, unknown>> = [];
-      for (const block of contentBlocks(m.message?.content)) {
-        if (block.type === "tool_result") {
-          frames.push(
-            nextFrame("tool_result", {
-              tool_use_id: block.tool_use_id ?? null,
-              content: block.content ?? null,
-              is_error: block.is_error ?? false,
-              parent_tool_use_id: m.parent_tool_use_id ?? null,
-            }),
-          );
-        }
-      }
-      return frames;
-    }
-
-    case "result": {
-      // A turn completed — clear the throttle so the NEXT turn re-emits its first status label
-      // (e.g. "thinking…") instead of being suppressed as a duplicate of the prior turn's last.
-      statusThrottle.reset();
-      const m = msg as unknown as {
-        subtype?: string;
-        is_error?: boolean;
-        result?: string;
-        num_turns?: number;
-        duration_ms?: number;
-        total_cost_usd?: number;
-        session_id?: string;
-      };
-      // PHASE 1 — RESULT-CARRIER QUOTA DETECTION. A usage/session limit has NO dedicated subtype: it
-      // arrives as an `is_error:true` result whose only payload is the human limit string. When this
-      // result IS that wall, DROP the plain result (Decision B) and emit a `quota_exceeded` frame
-      // instead — driving the same pause + auto-resume + gracefulExit(0) path the rate_limit_event
-      // carrier uses. The reset time prefers a recent structured `resetsAt` (lastRateLimitInfo), then
-      // the string clock, then sentinel 0 (degraded → host routes to EXHAUSTED).
-      if ((m.is_error ?? false) && isUsageLimitText(m.result)) {
-        const { resetAt, source } = decideResultQuota(m.result, lastRateLimitInfo);
-        return [nextFrame("quota_exceeded", { resetAt, source })];
-      }
-      return [
-        nextFrame("result", {
-          subtype: m.subtype ?? null,
-          is_error: m.is_error ?? false,
-          result: m.result ?? null,
-          num_turns: m.num_turns ?? null,
-          duration_ms: m.duration_ms ?? null,
-          total_cost_usd: m.total_cost_usd ?? null,
-          session_id: m.session_id ?? null,
-        }),
-      ];
-    }
-
-    case "rate_limit_event": {
-      // A rate-limit notice. When the limit is REJECTED (the quota wall) AND a reset time is
-      // determinable, emit a NON-fatal `quota_exceeded` frame so the host can PAUSE + auto-resume
-      // instead of dying — travels via the normal stream (NOT an `error` kind), so the Rust `_ =>`
-      // Stream arm relays it with no Rust change. The emit loop drives gracefulExit(0) when it sees
-      // this kind (the SDK iterator is dead once the quota throws/ends; keeping the sidecar idle
-      // would pin the OAuth-bearing `claude` grandchild). Otherwise (allowed / allowed_warning /
-      // rejected-but-no-reset) keep TODAY's label-only `status` behavior unchanged.
-      const info = (msg as unknown as { rate_limit_info?: unknown }).rate_limit_info;
-      // PHASE 1 — retain the latest info so a following result-carrier quota can reuse its structured
-      // `resetsAt`. Stored for ALL statuses; reuse is gated on status==="rejected" in extractResetAt.
-      lastRateLimitInfo = info;
-      const decision = decideRateLimitFrame(info);
-      if (decision.quota) {
-        return [nextFrame("quota_exceeded", { resetAt: decision.resetAt, source: decision.source })];
-      }
-      return statusFrames(statusLabelFor("rate_limit_event") ?? "waiting (rate limit)");
-    }
-
-    default: {
-      // Some progress signals arrive as their OWN top-level message type rather than a
-      // system subtype — map those to a throttled, label-only `status` frame too.
-      const t = (msg as { type?: string }).type ?? "";
-      const label = statusLabelFor(t);
-      if (label !== null) return statusFrames(label);
-      logErr("[sidecar] dropping unknown message type:", t);
-      return [];
-    }
-  }
-}
+// The normalizer body lives in its own SDK-message-only module (`normalize.ts`) so it can be
+// unit-tested WITHOUT importing THIS entry (which embeds the `claude` binary AND installs a
+// stdin readline loop + SIGTERM/SIGINT handlers at import time). It owns its `lastRateLimitInfo`
+// + status throttle internally; we wire it the SHARED `seqCounter` (so its frame seq and our
+// out-of-band emit sites stay one monotonic sequence) and the `logErr` sink.
+const { normalize } = createNormalizer({ seq: seqCounter, logErr });
 
 // ---------------------------------------------------------------------------
 // canUseTool — the interactive permission seam. The full logic lives in the gate
@@ -614,7 +373,7 @@ async function runSession(start: StartCmd): Promise<void> {
       const { resume: _dropped, ...withoutResume } = start;
       effectiveStart = withoutResume;
       if (decision.fallback) {
-        emit({ seq: seq++, kind: "resume_fallback", reason: RESUME_FALLBACK_REASON });
+        emit({ seq: seqCounter.value++, kind: "resume_fallback", reason: RESUME_FALLBACK_REASON });
       }
     }
   }
@@ -623,7 +382,7 @@ async function runSession(start: StartCmd): Promise<void> {
   try {
     options = buildOptions(effectiveStart);
   } catch (e) {
-    emit({ seq: seq++, kind: "error", error_kind: "spawn", message: String(e), fatal: true });
+    emit({ seq: seqCounter.value++, kind: "error", error_kind: "spawn", message: String(e), fatal: true });
     process.exit(1);
   }
 
@@ -661,13 +420,13 @@ async function runSession(start: StartCmd): Promise<void> {
     if (!isAuth) {
       const resetAt = parseResetFromError(text);
       if (resetAt !== null) {
-        emit({ seq: seq++, kind: "quota_exceeded", resetAt, source: "thrown_error" });
+        emit({ seq: seqCounter.value++, kind: "quota_exceeded", resetAt, source: "thrown_error" });
         await gracefulExit("quota exceeded (thrown)", 0);
         return;
       }
     }
     emit({
-      seq: seq++,
+      seq: seqCounter.value++,
       kind: "error",
       error_kind: isAuth ? "auth" : "sdk",
       message: text,
@@ -729,7 +488,7 @@ async function handleCommand(line: string): Promise<void> {
       // so a stale "acceptEdits" can never leak into a new session's planning phase.
       const decision = decideStart(started, cmd.permissionMode);
       if (decision.kind === "reject") {
-        emit({ seq: seq++, ...decision.frame });
+        emit({ seq: seqCounter.value++, ...decision.frame });
         process.exit(1);
       }
       started = true;
