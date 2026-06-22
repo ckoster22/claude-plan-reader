@@ -39,9 +39,10 @@ import { cliPlanRedirectSettings } from "./cli-plans";
 import { decideStart } from "./session-start";
 import { decideResume, resumeOption, RESUME_FALLBACK_REASON } from "./session-resume";
 import { parseResetFromError } from "./quota";
-import { createNormalizer, type SeqCounter } from "./normalize";
+import { createNormalizer, isOverloadedMessage, overloadResultFrame, type SeqCounter } from "./normalize";
+import { decideBackoff, BACKOFF_MAX_RETRIES } from "./backoff";
 import { planningAgents } from "./agents/planningAgents";
-import { makeGracefulExit } from "./shutdown";
+import { makeGracefulExit, drainQuery } from "./shutdown";
 // The platform package carries the bundled `claude` CLI. Imported as a `file`
 // so `bun build --compile` embeds it; `extractFromBunfs` unpacks it at runtime
 // and yields the on-disk path we hand to `pathToClaudeCodeExecutable`.
@@ -63,6 +64,46 @@ function emit(obj: unknown): void {
 function logErr(...parts: unknown[]): void {
   process.stderr.write(parts.map(String).join(" ") + "\n");
 }
+
+// ---------------------------------------------------------------------------
+// 529 "Overloaded" backoff — net-new abort infra.
+//
+// There is NO AbortController anywhere else in the sidecar today. This single module-level one is
+// aborted at the VERY TOP of graceful shutdown (wired into makeGracefulExit's onBeforeDrain below)
+// so a SIGTERM/SIGINT/`end` arriving DURING a multi-minute 529 backoff sleep aborts the wait
+// immediately instead of hanging the teardown for up to ~30 minutes.
+// ---------------------------------------------------------------------------
+const backoffAbort = new AbortController();
+
+/** Sleep `ms`, resolving early (rejecting with the abort reason) if `backoffAbort` fires. ALWAYS
+ *  clears its timer on settle so a resolved/aborted sleep never leaks a pending timeout that would
+ *  pin the event loop. On abort the caller stops retrying and lets graceful shutdown proceed. */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new Error("aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new Error("aborted"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// The user message(s) of the IN-FLIGHT turn — captured at the push site (case "user") so a 529
+// retry can re-seed a FRESH MessageQueue with the exact same input that drove the overloaded
+// attempt. We never re-iterate the original queue (a second `query({prompt: sameQueue})` would
+// create a second concurrent consumer of the same buffer → a drop/duplicate race). Cleared when a
+// turn completes (a `result` frame) so the next turn starts empty and a later retry only ever
+// re-pushes the CURRENT turn, never a stale prior one.
+let pendingTurn: SDKUserMessage[] = [];
 
 // ---------------------------------------------------------------------------
 // Push-queue AsyncIterable<SDKUserMessage> — streaming-input mode.
@@ -358,11 +399,18 @@ async function resumeTranscriptExists(sessionId: string): Promise<boolean> {
 }
 
 async function runSession(start: StartCmd): Promise<void> {
-  const queue = new MessageQueue();
-  userQueue = queue;
+  // FIRST, SYNCHRONOUSLY (before ANY await): allocate attempt 0's MessageQueue and point
+  // `userQueue` at it. The resume pre-flight below `await`s getSessionInfo; on a resume start a
+  // `user` stdin line can arrive DURING that await, and if `userQueue` were still null it would hit
+  // the `case "user"` drop guard and be lost. Assigning here (the original ordering, restored) means
+  // the very first user message always lands in attempt 0's queue regardless of the resume probe.
+  // The retry loop REUSES this queue for attempt 0 and only allocates a fresh one for attempt > 0.
+  const initialQueue = new MessageQueue();
+  userQueue = initialQueue;
 
   // Resume pre-flight (Phase 4): if a resume id was requested, probe the transcript
   // BEFORE building options. SINGLE fallback — we decide once here; we never retry.
+  // Computed ONCE here (outside the 529 retry loop): a retry re-issues with the SAME options.
   let effectiveStart = start;
   if (start.resume) {
     const exists = await resumeTranscriptExists(start.resume);
@@ -386,53 +434,186 @@ async function runSession(start: StartCmd): Promise<void> {
     process.exit(1);
   }
 
-  q = query({ prompt: queue, options });
+  // ---------------------------------------------------------------------------
+  // 529 "Overloaded" in-band exponential-backoff retry loop.
+  //
+  // The HAPPY PATH (no overload) runs this loop exactly ONCE and is byte-identical to before: a
+  // single fresh queue, a single query(), the same consume loop with the same single emit site, the
+  // same quota handling, the same catch. The retry machinery is inert unless `isOverloadedMessage`
+  // fires IN-BAND on the stream (the SDK retries 529 internally first; only a STILL-overloaded
+  // request surfaces here, NOT as a throw — so the catch below is left UNCHANGED).
+  //
+  // PER ATTEMPT: a NEW MessageQueue (never re-iterate the singleton — a second concurrent consumer
+  // of the same buffer races). On a retry the prior turn's user message(s) are re-pushed from
+  // `pendingTurn` so the fresh query sees the same input; on attempt 1 the live stdin push already
+  // seeded the queue, so we do NOT re-push (that would double the turn). The previous `q`/queue are
+  // drained (interrupt → close → end, the same teardown gracefulExit uses) BEFORE the next query()
+  // so the prior `claude` subprocess is not orphaned by the re-issue.
+  // ---------------------------------------------------------------------------
+  let retry = 0; // 0 → 6; PRE-incremented per backoff decision (decideBackoff is 1-based).
+  let attempt = 0; // 0-based attempt index; attempt 0 is the original, >0 are 529 retries.
 
-  try {
-    for await (const msg of q) {
-      // PHASE 0 — RAW-FRAME TRACE (GATE A capture). With AGENT_TRACE set, log every raw SDK message
-      // verbatim to STDERR (logErr — off the fd-1 JSON-lines `emit` channel, so it never corrupts the
-      // host's frame stream). Used to capture the exact shape of a real usage-limit `result` /
-      // `rate_limit_event` before building quota detection. No file writes.
-      if (process.env.AGENT_TRACE) logErr("[raw]", JSON.stringify(msg));
-      let quotaPaused = false;
-      for (const frame of normalize(msg)) {
-        emit(frame);
-        // A `quota_exceeded` frame means the session hit the quota wall. The SDK iterator is now
-        // effectively dead; exit GRACEFULLY (0) so the SDK reaper closes the `claude` grandchild
-        // and the queue drains — never a bare process.exit (which would re-orphan it). The host
-        // records the pause + schedules auto-resume off the frame's resetAt.
-        if ((frame as { kind?: string }).kind === "quota_exceeded") quotaPaused = true;
-      }
-      if (quotaPaused) {
-        await gracefulExit("quota exceeded", 0);
-        return;
-      }
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    // NOTE: the previous attempt's query+queue are drained in the retry TAIL (below), right before
+    // the backoff sleep, which also nulls `q` — so on re-entry here there is no live prior query to
+    // drain. (On attempt 0 there is none either.) This keeps the drain at exactly one site.
+    //
+    // ATTEMPT 0 REUSES `initialQueue` (allocated + pointed-to by `userQueue` SYNCHRONOUSLY at the top
+    // of runSession, before the resume `await`) so a `user` line that arrived during the resume
+    // pre-flight is already buffered in it and is NOT dropped. A RETRY (attempt > 0) allocates a
+    // FRESH queue, repoints `userQueue`, and re-seeds it from the captured `pendingTurn`. We must
+    // NOT re-push on attempt 0: the live stdin `case "user"` handler already fed `initialQueue`
+    // (re-pushing would double the turn).
+    let queue: MessageQueue;
+    if (attempt === 0) {
+      queue = initialQueue; // `userQueue` already points here (set at the top, before the await).
+    } else {
+      queue = new MessageQueue();
+      userQueue = queue; // repoint BEFORE the (possible) backoff sleep so stdin `user` lands here.
+      for (const m of pendingTurn) queue.push(m);
     }
-  } catch (e) {
-    const text = String(e);
-    const isAuth = /auth|token|unauthor|401|oauth/i.test(text);
-    // Quota-wall backstop: the rate_limit_event may not precede the throw. If this is NOT an auth
-    // error AND a reset time is parseable from the error text, emit a NON-fatal `quota_exceeded`
-    // frame (same contract as the normalize path) and exit GRACEFULLY (0) — driving the SDK reaper
-    // so the `claude` grandchild is not re-orphaned. Otherwise the existing fatal path is unchanged:
-    // auth → "auth", everything else → "sdk", both fatal with exit(1).
-    if (!isAuth) {
-      const resetAt = parseResetFromError(text);
-      if (resetAt !== null) {
-        emit({ seq: seqCounter.value++, kind: "quota_exceeded", resetAt, source: "thrown_error" });
-        await gracefulExit("quota exceeded (thrown)", 0);
-        return;
+    attempt++;
+
+    q = query({ prompt: queue, options });
+
+    // Per-ATTEMPT overload bookkeeping (reset each attempt). `emittedAnyFrame` gates the retry:
+    // we only re-drive a PRE-OUTPUT overload (no assistant_text/tool_use emitted yet this attempt);
+    // an overload AFTER frames is mid-turn and must NOT be re-driven (it would duplicate already-
+    // emitted text under fresh seqCounter values).
+    let emittedAnyFrame = false;
+    let overloadPreOutput = false; // retryable: overloaded with nothing emitted this attempt.
+
+    try {
+      for await (const msg of q) {
+        // PHASE 0 — RAW-FRAME TRACE (GATE A capture). With AGENT_TRACE set, log every raw SDK message
+        // verbatim to STDERR (logErr — off the fd-1 JSON-lines `emit` channel, so it never corrupts the
+        // host's frame stream). Used to capture the exact shape of a real usage-limit `result` /
+        // `rate_limit_event` before building quota detection. No file writes.
+        if (process.env.AGENT_TRACE) logErr("[raw]", JSON.stringify(msg));
+
+        // IN-BAND 529 detection — BEFORE normalize (which would otherwise drop the overload frame or
+        // recast it as a plain `result`). Checked here so the retry is driven off the raw SDK message.
+        if (isOverloadedMessage(msg)) {
+          if (emittedAnyFrame) {
+            // MID-TURN overload: text/tool_use already went out this attempt. Re-driving would
+            // duplicate it under new seqs, so we do NOT retry. But BOTH consumers end a turn ONLY on a
+            // terminal `result` frame — the frontend's stream reducer clears the working spinner on
+            // `kind:"result"` (active=false), and the orchestrator's sequencer returns early on any
+            // non-`result` frame and has NO watchdog for recon/sizer/exec tags. A bare `status`
+            // notice would therefore HANG the run permanently on a mid-turn 529 in those phases. So we
+            // SYNTHESIZE the terminal `result` the partial turn never got to emit, matching the EXACT
+            // field shape normalize.ts produces for a `result` frame (subtype/is_error/result/
+            // num_turns/duration_ms/total_cost_usd/session_id). It is is_error:true + subtype
+            // "error_during_execution" — the orchestrator's session-FATAL guard EXCLUDES that subtype,
+            // so it is consumed as a GRACEFUL turn-end (advance/terminate), never a crash. We do NOT
+            // retry (partial output is already on the wire). A short non-fatal `status` rides ALONGSIDE
+            // the result (informational), never instead of it. This turn is finished (partially), so
+            // clear `pendingTurn` — a LATER turn's 529 must never re-push it.
+            emit({
+              seq: seqCounter.value++,
+              kind: "status",
+              label: "Overloaded (529) after partial output — this turn ended early; send your message again to continue.",
+            });
+            emit(overloadResultFrame(seqCounter.value++));
+            pendingTurn = [];
+            continue; // keep consuming so the session stays alive for the next turn; do NOT retry.
+          }
+          // PRE-OUTPUT overload (the dominant case): nothing emitted yet → retryable. Break the
+          // consume loop and handle backoff/exhaustion below.
+          overloadPreOutput = true;
+          break;
+        }
+
+        let quotaPaused = false;
+        for (const frame of normalize(msg)) {
+          emit(frame);
+          const kind = (frame as { kind?: string }).kind;
+          // Track output for THIS attempt's `emittedAnyFrame` gate (only rendered content counts).
+          if (kind === "assistant_text" || kind === "tool_use") emittedAnyFrame = true;
+          // A completed turn (its terminal `result`) clears the pending-turn buffer so a future
+          // turn's 529 retry only ever re-pushes the CURRENT turn, never a stale prior one.
+          if (kind === "result") pendingTurn = [];
+          // A `quota_exceeded` frame means the session hit the quota wall. The SDK iterator is now
+          // effectively dead; exit GRACEFULLY (0) so the SDK reaper closes the `claude` grandchild
+          // and the queue drains — never a bare process.exit (which would re-orphan it). The host
+          // records the pause + schedules auto-resume off the frame's resetAt.
+          if (kind === "quota_exceeded") quotaPaused = true;
+        }
+        if (quotaPaused) {
+          await gracefulExit("quota exceeded", 0);
+          return;
+        }
       }
+    } catch (e) {
+      const text = String(e);
+      const isAuth = /auth|token|unauthor|401|oauth/i.test(text);
+      // Quota-wall backstop: the rate_limit_event may not precede the throw. If this is NOT an auth
+      // error AND a reset time is parseable from the error text, emit a NON-fatal `quota_exceeded`
+      // frame (same contract as the normalize path) and exit GRACEFULLY (0) — driving the SDK reaper
+      // so the `claude` grandchild is not re-orphaned. Otherwise the existing fatal path is unchanged:
+      // auth → "auth", everything else → "sdk", both fatal with exit(1).
+      if (!isAuth) {
+        const resetAt = parseResetFromError(text);
+        if (resetAt !== null) {
+          emit({ seq: seqCounter.value++, kind: "quota_exceeded", resetAt, source: "thrown_error" });
+          await gracefulExit("quota exceeded (thrown)", 0);
+          return;
+        }
+      }
+      emit({
+        seq: seqCounter.value++,
+        kind: "error",
+        error_kind: isAuth ? "auth" : "sdk",
+        message: text,
+        fatal: true,
+      });
+      process.exit(1);
     }
+
+    // Reached here either by a NATURAL iterator end (turn(s) done, queue ended → session over) or by
+    // a PRE-OUTPUT 529 break. Only the latter retries; the former returns.
+    if (!overloadPreOutput) return;
+
+    // PRE-OUTPUT 529 → exponential backoff (sidecar/backoff.ts). decideBackoff is 1-based; PRE-
+    // increment `retry` (starts at 0) so the first retry is 1.
+    const decision = decideBackoff(++retry, Date.now());
+    if (decision.kind === "exhausted") {
+      // Sustained outage: retried BACKOFF_MAX_RETRIES times over ~61 min. Give up FATALLY, reusing
+      // the existing error shape (error_kind stays "sdk" — the contract enum is NOT widened).
+      emit({
+        seq: seqCounter.value++,
+        kind: "error",
+        error_kind: "sdk",
+        message: `Anthropic API overloaded (HTTP 529); retried ${BACKOFF_MAX_RETRIES}× over ~61 min, giving up.`,
+        fatal: true,
+      });
+      process.exit(1);
+    }
+
+    // Status notice BEFORE the wait (direct emit, NOT via the normalizer throttle — same out-of-band
+    // shape as the other index.ts status sites). Round the delay to whole minutes for the label.
+    const minutes = Math.round(decision.delayMs / 60_000);
     emit({
       seq: seqCounter.value++,
-      kind: "error",
-      error_kind: isAuth ? "auth" : "sdk",
-      message: text,
-      fatal: true,
+      kind: "status",
+      label: `Overloaded (529) — retrying in ${minutes}m (retry ${decision.retry}/${BACKOFF_MAX_RETRIES})`,
     });
-    process.exit(1);
+
+    // Drain THIS attempt's overloaded query before the wait so its `claude` subprocess is reaped
+    // while we sleep (not left live holding the OAuth-bearing grandchild for up to 30 minutes).
+    if (q) await drainQuery({ q, userQueue, logErr });
+    q = null;
+
+    // Abortable wait. A SIGTERM/SIGINT/`end` during the sleep aborts it (backoffAbort, wired into
+    // gracefulExit.onBeforeDrain) — stop retrying and let graceful shutdown proceed.
+    try {
+      await abortableSleep(decision.delayMs, backoffAbort.signal);
+    } catch {
+      logErr("[sidecar] 529 backoff sleep aborted — shutting down, no further retries.");
+      return;
+    }
+    // Loop: build a fresh queue, re-push pendingTurn, re-issue query().
   }
 }
 
@@ -462,6 +643,10 @@ const gracefulExit = makeGracefulExit({
   getUserQueue: () => userQueue,
   logErr,
   exit: (code) => process.exit(code),
+  // VERY FIRST thing on any teardown trigger: abort an in-flight 529 backoff sleep so the wait
+  // (up to ~30m) cannot stall the drain. The latch in makeGracefulExit makes repeat triggers safe;
+  // AbortController.abort() is itself idempotent.
+  onBeforeDrain: () => backoffAbort.abort(),
 });
 
 async function handleCommand(line: string): Promise<void> {
@@ -524,9 +709,15 @@ async function handleCommand(line: string): Promise<void> {
             (x: any) => x && typeof x.media_type === "string" && typeof x.data === "string",
           )
         : [];
-      userQueue.push(
-        liftUserMessage(String(cmd.text ?? ""), imgs.length ? (imgs as InboundImage[]) : undefined),
+      const lifted = liftUserMessage(
+        String(cmd.text ?? ""),
+        imgs.length ? (imgs as InboundImage[]) : undefined,
       );
+      // Mirror the message into the in-flight-turn buffer so a 529 retry can re-seed a fresh queue
+      // with the SAME input (see runSession). Cleared on each completed turn's `result` frame, so
+      // this only ever accumulates the CURRENT turn's message(s).
+      pendingTurn.push(lifted);
+      userQueue.push(lifted);
       return;
     }
 

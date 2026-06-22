@@ -40,6 +40,75 @@ export interface Normalizer {
   normalize(msg: SDKMessage): Array<Record<string, unknown>>;
 }
 
+// ---------------------------------------------------------------------------
+// OVERLOAD (HTTP 529) detection — pure predicate.
+//
+// The Anthropic SDK retries a 529 "Overloaded" INTERNALLY (≤8s, not configurable) and then —
+// if still overloaded — surfaces it IN-BAND as a terminal frame on the output stream (NOT as a
+// throw in index.ts's catch). index.ts's retry loop watches for this on the consume loop and
+// re-issues with a fresh queue + exponential backoff (sidecar/backoff.ts).
+//
+// WIRE-SHAPE CAVEAT (load-bearing): the EXACT post-internal-retry wire shape is NOT 100% confirmed
+// — it is produced by the bundled `claude` CLI binary, not modeled byte-for-byte by the SDK's
+// `.d.ts`. The SDK types DO document several overload-bearing fields, and the real frame could be
+// any of them depending on whether overload surfaces on the assistant message or the terminal
+// result. So we match DEFENSIVELY across ALL documented shapes rather than betting on one:
+//   - an assistant message with `error === "overloaded"` (SDKAssistantMessage.error, the
+//     SDKAssistantMessageError union includes "overloaded");
+//   - a terminal `result` with `api_error_status === 529` (SDKResultSuccess.api_error_status);
+//   - a terminal `result` whose `error` field is "overloaded" (defensive — not in the .d.ts but a
+//     plausible CLI rendering on the is_error path, mirroring the result `result`-string divergence);
+//   - a terminal `result` whose `errors[]` (SDKResultError.errors) contains /overloaded|529/.
+//
+// ORTHOGONAL TO QUOTA: this must NOT fire on a usage/session-limit wall (the `quota_exceeded`
+// path) — those carry the human "you've hit your … limit" string / a rate_limit_event, none of
+// which mention overloaded or 529. Kept disjoint so the two transient-failure paths never collide.
+const OVERLOADED_RE = /overloaded|\b529\b/i;
+
+/** True iff `msg` is the SDK's in-band signal that the request is overloaded (HTTP 529) AFTER the
+ *  SDK's own internal retries. Defensively matches every documented overload shape (see above). */
+export function isOverloadedMessage(msg: SDKMessage): boolean {
+  if (msg == null || typeof msg !== "object") return false;
+  const m = msg as { type?: string; error?: unknown; api_error_status?: unknown; errors?: unknown };
+
+  // (1) assistant message carrying an overloaded error.
+  if (m.type === "assistant" && m.error === "overloaded") return true;
+
+  // (2)/(3)/(4) terminal result carriers.
+  if (m.type === "result") {
+    if (typeof m.api_error_status === "number" && m.api_error_status === 529) return true;
+    if (m.error === "overloaded") return true;
+    if (Array.isArray(m.errors) && m.errors.some((e) => typeof e === "string" && OVERLOADED_RE.test(e))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// MID-TURN-529 GRACEFUL TURN-BOUNDARY FRAME — pure builder.
+//
+// When a 529 overload surfaces AFTER this attempt already emitted rendered output, index.ts ends the
+// turn (rather than re-driving, which would duplicate the emitted text) by emitting the terminal
+// `result` the partial turn never got to. This builds that frame, matching the EXACT field shape +
+// order normalize() produces for a `result` frame. is_error:true + subtype "error_during_execution"
+// is load-bearing: the orchestrator's session-FATAL guard EXCLUDES that subtype, so it is consumed as
+// a GRACEFUL turn-end (advance/terminate), never a crash.
+export function overloadResultFrame(seq: number): Record<string, unknown> {
+  return {
+    seq,
+    kind: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    result: "Anthropic API overloaded (HTTP 529) after partial output; not retried.",
+    num_turns: null,
+    duration_ms: null,
+    total_cost_usd: null,
+    session_id: null,
+  };
+}
+
 /** A content block may be a string, or an array of typed blocks. Narrow safely. */
 function contentBlocks(content: unknown): Array<Record<string, unknown>> {
   if (typeof content === "string") {

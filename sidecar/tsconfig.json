@@ -26,6 +26,7 @@
   },
   "include": [
     "index.ts",
+    "backoff.ts",
     "normalize.ts",
     "permissions.ts",
     "env-overrides.ts",

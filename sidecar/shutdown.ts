@@ -82,6 +82,13 @@ export interface GracefulExitDeps {
   /** Injected so tests assert the drain RESOLVED before exit; production passes
    *  `process.exit`. Typed to return `never` to match `process.exit`'s signature. */
   exit: (code: number) => never;
+  /** OPTIONAL, fired ONCE at the VERY TOP of the FIRST trigger — before the drain `await` and
+   *  before the latch could short-circuit a later trigger. index.ts wires this to
+   *  `backoffAbort.abort()` so a SIGTERM/SIGINT/`end` during an in-flight 529 backoff sleep aborts
+   *  the wait immediately (no up-to-30m hang) and lets the drain proceed. Guarded: a throw here is
+   *  logged, never propagated, so teardown still reaches `exit`. Absent (the default, e.g. all
+   *  shutdown unit tests) ⇒ behavior is byte-identical to before. */
+  onBeforeDrain?: () => void;
 }
 
 /** A re-entrancy latch so a second trigger (e.g. SIGTERM arriving while the `end`
@@ -93,6 +100,15 @@ export function makeGracefulExit(deps: GracefulExitDeps): (reason: string, code:
   return async function gracefulExit(reason: string, code: number): Promise<void> {
     if (shuttingDown) return; // a drain is already in flight — ignore the second trigger.
     shuttingDown = true;
+    // FIRST thing, before the drain await: signal any in-flight 529 backoff sleep to abort so a
+    // teardown trigger never waits out a multi-minute wait. Guarded — a throw must not skip the drain.
+    if (deps.onBeforeDrain) {
+      try {
+        deps.onBeforeDrain();
+      } catch (e) {
+        deps.logErr("[sidecar] graceful shutdown onBeforeDrain failed:", String(e));
+      }
+    }
     deps.logErr("[sidecar] graceful shutdown:", reason);
     // AWAIT the drain (interrupt → close → queue-end) so the SDK reaps its CLI
     // grandchild BEFORE we exit. This is the fix for the `end`-command path, which
