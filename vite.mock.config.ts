@@ -37,6 +37,20 @@ function injectDeckPlugin(): Plugin {
   };
 }
 
+// Inline plugin: inject the ANIMATE player module script right before </body> (mirrors
+// injectDeckPlugin). Used INSTEAD of the deck in `npm run mock-animate` (MOCK_ANIMATE=1), so the
+// scrubbable Trailhead beat boots and the deck does NOT (the two are mutually exclusive).
+function injectAnimatePlugin(): Plugin {
+  return {
+    name: "mock-inject-animate",
+    transformIndexHtml(html: string): string {
+      const tag = '<script type="module" src="/src/mock/animate/index.ts"></script>';
+      // Insert before the closing body tag; fall back to appending if it is somehow absent.
+      return html.includes("</body>") ? html.replace("</body>", `  ${tag}\n  </body>`) : html + tag;
+    },
+  };
+}
+
 // The mock-only overrides merged onto the base config.
 const mockOverrides: UserConfig = {
   resolve: {
@@ -67,7 +81,9 @@ const mockOverrides: UserConfig = {
     port: 1421,
     strictPort: true,
   },
-  plugins: [injectDeckPlugin()],
+  // Mutually exclusive: `npm run mock-animate` (MOCK_ANIMATE=1) boots the scrubbable Trailhead
+  // player INSTEAD of the control deck, so only one overlay mounts at a time.
+  plugins: [process.env.MOCK_ANIMATE ? injectAnimatePlugin() : injectDeckPlugin()],
 };
 
 // The base config is `defineConfig(async () => ({...}))` — a function returning a Promise. Resolve

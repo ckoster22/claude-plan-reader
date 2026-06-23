@@ -9,6 +9,7 @@
 // Keys MUST match the absolute_path values in src/mock/fixtures/plans.ts.
 
 import { NESTED_MARKDOWN } from "./nested";
+import { TRAILHEAD_MARKDOWN } from "./trailhead-plan";
 
 const PLANS = "/Users/mock/.claude/plans";
 
@@ -173,6 +174,27 @@ The reading pane resolves this relative image through \`read_image_as_data_url\`
 Text after the image, so the pane shows the image is inlined mid-document.
 `;
 
+// ---- ANIMATE prototype-review beat — the visual prototype the gate previews -------------------
+//
+// The TRAILHEAD_BEAT (src/mock/animate/storyboard.ts) opens THIS plan in the reading pane during the
+// prototype-gate window (its open_plan…open_plan{null} bracket). Its body is a short title plus a
+// ```mermaid fence whose flowchart MATCHES MOCK_PROTOTYPE_GATE.inlinePreview
+// ("flowchart LR\n  A[Request] --> B[Prototype] --> C[Review]" in src/mock/fixtures/reviews.ts) — so
+// the reading pane shows a coherent Trailhead prototype diagram regardless of whether the animate
+// reconciler's renderInto or production's renderPrototypePreview paints last. It is registered in the
+// served markdown map (read_plan_contents serves it) but NOT in the plan LIST / sidebar fixtures.
+export const PROTO_PREVIEW_PATH = `${PLANS}/trailhead-prototype-preview.md`;
+
+const PROTO_PREVIEW_DOC = `# Trailhead prototype — hike search flow
+
+A quick visual prototype of how a hike search moves through the screens.
+
+\`\`\`mermaid
+flowchart LR
+  A[Request] --> B[Prototype] --> C[Review]
+\`\`\`
+`;
+
 // The path -> document map consumed by state.ts / the mock read_plan_contents.
 export const MOCK_MARKDOWN: Record<string, string> = {
   [`${PLANS}/unread-standalone.md`]: RICH,
@@ -187,9 +209,16 @@ export const MOCK_MARKDOWN: Record<string, string> = {
   [`${PLANS}/variant-image.md`]: IMAGE_DOC,
   // The reviewed plan's file (its row is opened by the external-review flow).
   [`${PLANS}/review-pending.md`]: "# Plan under review\n\n- Step one\n- Step two\n\nReview this in the bar above.\n",
+  // The ANIMATE prototype-review preview (opened by TRAILHEAD_BEAT's open_plan bracket). NOT a
+  // sidebar/list plan — markdown map only, so read_plan_contents serves it. Its mermaid matches
+  // MOCK_PROTOTYPE_GATE.inlinePreview.
+  [PROTO_PREVIEW_PATH]: PROTO_PREVIEW_DOC,
   // The REAL "Chompy Asteroids" nested tree — nine VERBATIM plan files (frontmatter intact; the
   // mock read_plan_contents strips it on read, mirroring the real backend). Keys match NESTED_PLANS.
   ...NESTED_MARKDOWN,
+  // The fictional "Trailhead" tree the ANIMATE storyboard drafts on-screen (master doc only — the
+  // storyboard opens just the master). Keys match TRAILHEAD_PLANS. See trailhead-plan.ts.
+  ...TRAILHEAD_MARKDOWN,
 };
 
 // Fallback document for a path with no fixture entry — so an unexpected open never renders blank.
