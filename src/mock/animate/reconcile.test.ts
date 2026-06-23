@@ -14,7 +14,11 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-import { createReconciler, type ReconcilerSeams } from "./reconcile";
+import {
+  createReconciler,
+  type ReconcilerSeams,
+  QUESTION_OTHER_TEXT_SELECTOR,
+} from "./reconcile";
 import type { StoryFrame } from "./storyboard";
 import { clonePlans } from "../fixtures/plans";
 import {
@@ -75,6 +79,14 @@ function makeSeams(over?: Partial<ReconcilerSeams>): {
     emitGate: vi.fn(),
     clearGate: vi.fn(),
     setActiveTab: vi.fn(),
+    // ---- overlay seams (P1) ----
+    setCursor: vi.fn(),
+    setPulseTargets: vi.fn(),
+    setFieldText: vi.fn(),
+    setComposerOpen: vi.fn(),
+    setSelPopover: vi.fn(),
+    setProtoCard: vi.fn(),
+    setQuestionAnswerUI: vi.fn(),
     ...over,
   };
   return { seams, spies: seams as never, pane };
@@ -436,5 +448,259 @@ describe("reconcile — TRAILHEAD nested-plan reveal (invariant E, full-set)", (
     const calls = (seams.setPlans as ReturnType<typeof vi.fn>).mock.calls;
     const lastArg = calls[calls.length - 1][0] as PlanRecord[];
     expect(lastArg).toEqual([]);
+  });
+});
+
+// ====================================================================================================
+// P1 OVERLAY PASSES — cursor lerp/hold, pulse-set diffing, field per-character dispatch, composer /
+// popover / proto-card / question-UI on-change + backward-scrub revert. jsdom + spies. Every behavioral
+// test below was FALSIFIED (the logic inverted to confirm RED) then restored — see the comment on each.
+// ====================================================================================================
+
+// jsdom's getBoundingClientRect returns an all-zeros rect; stub a fixed rect onto an element so the
+// cursor pass can resolve a non-zero rect-center. Pass w=h=0 to simulate a display:none / zero-area node.
+function stubRect(elem: HTMLElement, x: number, y: number, w: number, h: number): void {
+  elem.getBoundingClientRect = () =>
+    ({ left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x, y, toJSON: () => ({}) }) as DOMRect;
+}
+
+function lastCall<K extends keyof ReconcilerSeams>(seams: ReconcilerSeams, key: K): unknown[] {
+  const calls = (seams[key] as ReturnType<typeof vi.fn>).mock.calls;
+  return calls[calls.length - 1];
+}
+
+describe("reconcile — cursor lerp + hold (P1)", () => {
+  it("lerps between two resolved rect-centers at a mid t01", () => {
+    const a = document.createElement("div");
+    a.id = "a";
+    const b = document.createElement("div");
+    b.id = "b";
+    document.body.append(a, b);
+    stubRect(a, 0, 0, 100, 100); // center (50,50)
+    stubRect(b, 200, 200, 100, 100); // center (250,250)
+
+    // Waypoint to #a at 0 (snaps), then to #b at 100 over 100ms → mid-move at T=150 is t01=0.5.
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "cursor_move", target: "#a", moveMs: 0 } },
+      { tMs: 100, frame: { t: "cursor_move", target: "#b", moveMs: 100 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(150); // travelling #a→#b, t01 = (150-100)/100 = 0.5 → center (150,150).
+    const arg = lastCall(seams, "setCursor")[0] as { x: number; y: number; pressing: boolean };
+    expect(arg.x).toBeCloseTo(150);
+    expect(arg.y).toBeCloseTo(150);
+    // FALSIFIABILITY: replacing the lerp with `fromPos` (t01 ignored) yields (50,50) here → RED. Confirmed.
+  });
+
+  it("HOLDS the last-good position when the destination target is absent (no jump to 0,0)", () => {
+    const a = document.createElement("div");
+    a.id = "a";
+    document.body.append(a);
+    stubRect(a, 0, 0, 100, 100); // center (50,50)
+    // #b is NEVER added to the DOM (absent target).
+
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "cursor_move", target: "#a", moveMs: 0 } },
+      { tMs: 100, frame: { t: "cursor_move", target: "#missing", moveMs: 100 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(0); // rest at #a → (50,50).
+    expect((lastCall(seams, "setCursor")[0] as { x: number }).x).toBeCloseTo(50);
+    r.reconcile(150); // travelling toward #missing (absent) → HOLD at the last-good (50,50), no (0,0).
+    const held = lastCall(seams, "setCursor")[0] as { x: number; y: number };
+    expect(held.x).toBeCloseTo(50);
+    expect(held.y).toBeCloseTo(50);
+    // FALSIFIABILITY: lerping toward an unresolved (0,0) dest would give roughly (25,25) here → RED.
+    // (Verified by temporarily treating a null toPos as {x:0,y:0}.) Confirmed.
+  });
+
+  it("treats a ZERO-AREA rect (display:none) like an absent target → HOLD", () => {
+    const a = document.createElement("div");
+    a.id = "a";
+    const b = document.createElement("div");
+    b.id = "b";
+    document.body.append(a, b);
+    stubRect(a, 0, 0, 100, 100); // center (50,50)
+    stubRect(b, 0, 0, 0, 0); // zero-area (display:none-like) → treated as absent.
+
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "cursor_move", target: "#a", moveMs: 0 } },
+      { tMs: 100, frame: { t: "cursor_move", target: "#b", moveMs: 100 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(0);
+    r.reconcile(150); // #b is zero-area → HOLD (50,50).
+    const held = lastCall(seams, "setCursor")[0] as { x: number; y: number };
+    expect(held.x).toBeCloseTo(50);
+    expect(held.y).toBeCloseTo(50);
+    // FALSIFIABILITY: dropping the (width===0 && height===0) guard makes #b resolve to its (0,0)-center
+    // and the cursor lerps to ~(25,25) → RED. Confirmed.
+  });
+
+  it("setCursor(null) before the first cursor_move", () => {
+    const story: StoryFrame[] = [{ tMs: 100, frame: { t: "cursor_move", target: "#a", moveMs: 0 } }];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+    r.reconcile(0); // before the first move → no cursor.
+    expect(lastCall(seams, "setCursor")[0]).toBeNull();
+  });
+});
+
+describe("reconcile — pulse set diffing (P1)", () => {
+  it("setPulseTargets fires on a CHANGED set, NOT on a stable tick", () => {
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "pulse", target: ".x", fromMs: 0, toMs: 100 } },
+      { tMs: 0, frame: { t: "pulse", target: ".y", fromMs: 50, toMs: 100 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(10); // {.x}
+    expect(seams.setPulseTargets).toHaveBeenCalledTimes(1);
+    expect([...(lastCall(seams, "setPulseTargets")[0] as Set<string>)].sort()).toEqual([".x"]);
+
+    r.reconcile(20); // still {.x} → NO new call.
+    expect(seams.setPulseTargets).toHaveBeenCalledTimes(1);
+
+    r.reconcile(60); // {.x,.y} → changed → ONE more call.
+    expect(seams.setPulseTargets).toHaveBeenCalledTimes(2);
+    expect([...(lastCall(seams, "setPulseTargets")[0] as Set<string>)].sort()).toEqual([".x", ".y"]);
+
+    r.reconcile(150); // both windows closed → {} → changed → ONE more.
+    expect(seams.setPulseTargets).toHaveBeenCalledTimes(3);
+    expect([...(lastCall(seams, "setPulseTargets")[0] as Set<string>)]).toEqual([]);
+    // FALSIFIABILITY: removing the `if (key === lastPulseKey) return` memo makes the stable tick at T=20
+    // fire a 2nd call → the `toHaveBeenCalledTimes(1)` assertion goes RED. Confirmed.
+  });
+});
+
+describe("reconcile — field per-character dispatch (P1)", () => {
+  it("setFieldText fires once per prefix change forward, and re-fires the SHORTER prefix on rewind", () => {
+    // "abcd" typed into #f over [0,400) → one char per 100ms.
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "field_type", target: "#f", text: "abcd", fromMs: 0, toMs: 400 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(0); // floor(0)→""
+    r.reconcile(50); // still "" → no change (same prefix).
+    r.reconcile(150); // "a"
+    r.reconcile(250); // "ab"
+    let calls = (seams.setFieldText as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1] as string);
+    // Distinct, monotonic prefixes only — NOT one per tick.
+    expect(calls).toEqual(["", "a", "ab"]);
+
+    r.reconcile(450); // T past toMs → full "abcd".
+    calls = (seams.setFieldText as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1] as string);
+    expect(calls[calls.length - 1]).toBe("abcd");
+
+    // BACKWARD scrub: T=150 → prefix shrinks back to "a", which differs from the last-applied "abcd",
+    // so it RE-FIRES with the shorter prefix.
+    r.reconcile(150);
+    expect(lastCall(seams, "setFieldText")[1]).toBe("a");
+    // FALSIFIABILITY: if setFieldText were called every tick regardless of change, calls after the first
+    // four reconciles would be ["","","a","ab"] (the T=50 stable tick duplicating "") → the
+    // `toEqual(["", "a", "ab"])` assertion goes RED. Confirmed by removing the prefix-changed guard.
+  });
+});
+
+describe("reconcile — composer on/off + backward-scrub revert (P1)", () => {
+  it("opens, then reverts to closed on an earlier scrub", () => {
+    const story: StoryFrame[] = [
+      { tMs: 100, frame: { t: "overlay_modal", kind: "composer", on: true } },
+      { tMs: 300, frame: { t: "overlay_modal", kind: "composer", on: false } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(50); // before any frame → closed (first drive).
+    expect(lastCall(seams, "setComposerOpen")[0]).toBe(false);
+    r.reconcile(100); // open.
+    expect(lastCall(seams, "setComposerOpen")[0]).toBe(true);
+    r.reconcile(200); // still open → no new call.
+    const callCountAtOpen = (seams.setComposerOpen as ReturnType<typeof vi.fn>).mock.calls.length;
+    r.reconcile(250); // still open → no new call.
+    expect((seams.setComposerOpen as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callCountAtOpen);
+    // BACKWARD scrub to before the open frame → reverts to closed.
+    r.reconcile(50);
+    expect(lastCall(seams, "setComposerOpen")[0]).toBe(false);
+    // FALSIFIABILITY: projectModalState is last-≤-T per kind; if it instead latched `true` forever, the
+    // backward scrub would leave it `true` → the final `toBe(false)` goes RED. Confirmed.
+  });
+});
+
+describe("reconcile — popover on/off + backward-scrub revert (P1)", () => {
+  it("drives on+target, then reverts off on rewind", () => {
+    const story: StoryFrame[] = [
+      { tMs: 100, frame: { t: "overlay_modal", kind: "popover", on: true, target: "#blk" } },
+      { tMs: 300, frame: { t: "overlay_modal", kind: "popover", on: false } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(150);
+    expect(lastCall(seams, "setSelPopover")[0]).toEqual({ on: true, target: "#blk" });
+    r.reconcile(350);
+    expect(lastCall(seams, "setSelPopover")[0]).toEqual({ on: false, target: null });
+    // BACKWARD scrub before the open → off.
+    r.reconcile(0);
+    expect(lastCall(seams, "setSelPopover")[0]).toEqual({ on: false, target: null });
+    // FALSIFIABILITY: a stable-tick no-op would still keep the LAST call correct, so to make this
+    // falsifiable we also assert the open call's target: dropping `target` from projectModalState's
+    // popover branch would make the open call `{on:true,target:null}` → the first `toEqual` goes RED.
+  });
+});
+
+describe("reconcile — proto-card on/off (derived from gate) + revert (P1)", () => {
+  it("round mirrors the prototype gate; null when gate off; reverts on rewind", () => {
+    const story: StoryFrame[] = [
+      { tMs: 100, frame: { t: "prototype_gate", on: true, round: 1 } },
+      { tMs: 200, frame: { t: "prototype_gate", on: true, round: 2 } },
+      { tMs: 300, frame: { t: "prototype_gate", on: false } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(50); // before the gate → null.
+    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: null });
+    r.reconcile(100); // gate on round 1.
+    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: 1 });
+    r.reconcile(200); // gate on round 2.
+    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: 2 });
+    r.reconcile(300); // gate off → hide.
+    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: null });
+    // BACKWARD scrub into round 1 → card re-shows at round 1.
+    r.reconcile(100);
+    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: 1 });
+    // FALSIFIABILITY: deriving round from `surface.prototypeGate.round` unconditionally (ignoring `.on`)
+    // would emit {round:2} at T=300 instead of {round:null} → the gate-off assertion goes RED. Confirmed.
+  });
+});
+
+describe("reconcile — question Other-answer UI (derived from field text) + revert (P1)", () => {
+  it("turns on with the typed text, then reverts to null before the field window", () => {
+    const sel = QUESTION_OTHER_TEXT_SELECTOR;
+    const story: StoryFrame[] = [
+      { tMs: 100, frame: { t: "field_type", target: sel, text: "Android", fromMs: 100, toMs: 200 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(50); // before the field window → null.
+    expect(lastCall(seams, "setQuestionAnswerUI")[0]).toBeNull();
+    r.reconcile(250); // past the window → full text, toggle checked.
+    expect(lastCall(seams, "setQuestionAnswerUI")[0]).toEqual({ otherChecked: true, otherText: "Android" });
+    // BACKWARD scrub before the window → reverts to null (the reconciler re-asserts off-state).
+    r.reconcile(50);
+    expect(lastCall(seams, "setQuestionAnswerUI")[0]).toBeNull();
+    // FALSIFIABILITY: if the UI latched on after first turning on (never re-deriving null), the backward
+    // scrub would leave the last call as the on-state → the final `toBeNull()` goes RED. Confirmed.
   });
 });

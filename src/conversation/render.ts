@@ -663,6 +663,14 @@ function renderQuotaBanner(node: QuotaBannerNode, handlers?: RenderHandlers): HT
 // Render a single top-level OR nested node (everything except a subagent group, which is
 // top-level only and handled in renderTree).
 function renderNode(node: RenderNode, handlers?: RenderHandlers): HTMLElement {
+  const elem = renderNodeInner(node, handlers);
+  // Stamp the node's seq as a harmless data attribute so the mock-animate demo can target a SPECIFIC
+  // bubble for pulse/cursor overlays (`[data-seq="N"]`). No effect on layout or app behavior.
+  elem.dataset.seq = String(node.seq);
+  return elem;
+}
+
+function renderNodeInner(node: RenderNode, handlers?: RenderHandlers): HTMLElement {
   switch (node.type) {
     case "text":
       return renderTextBubble(node.text);
@@ -790,6 +798,8 @@ export function renderTree(
       const group = document.createElement("div");
       group.className = "conv-subagent";
       group.dataset.agentId = node.agentId;
+      // Stamp the group's seq (mirrors renderNode) for mock-animate pulse/cursor targeting.
+      group.dataset.seq = String(node.seq);
 
       if (node.subagentType !== null || node.description !== null) {
         const header = document.createElement("div");

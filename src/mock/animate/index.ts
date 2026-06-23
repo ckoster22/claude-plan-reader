@@ -38,6 +38,11 @@ import { emitMockEvent } from "../event";
 import { emitGate, clearGate, installMockOrchestrator } from "../orchestrator";
 import { applyComments, renderInto, settle } from "../../render";
 import {
+  TRAILHEAD_PROTO_CARD_R1_HTML,
+  TRAILHEAD_PROTO_CARD_R2_HTML,
+  TRAILHEAD_PROTO_CARD_CSS,
+} from "../fixtures/markdown";
+import {
   applyUpToTime,
   storyDurationMs,
   TRAILHEAD_BEAT,
@@ -175,6 +180,71 @@ const ANIM_CSS = `
   cursor: pointer;
 }
 #mock-anim .mockanim-speed:hover { background: rgba(255, 255, 255, 0.16); }
+
+/* ---- overlay primitives (cosmetic; reconciler-owned) -----------------------------------------
+   All scoped to their own ids/classes so they never perturb real app layout. */
+
+/* The simulated cursor: a fixed, max-z arrow overlay positioned via style.transform (translate +
+   optional press scale composed in JS). transition smooths the 50ms tick steps. */
+#demo-cursor {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 22px;
+  height: 22px;
+  z-index: 2147483647;
+  pointer-events: none;
+  transition: transform 60ms linear;
+  will-change: transform;
+  background-repeat: no-repeat;
+  background-size: contain;
+  /* A classic arrow pointer (inline SVG data URL). */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'><path d='M2 1 L2 17 L6.5 12.8 L9.4 19.2 L12 18 L9.2 11.8 L15 11.6 Z' fill='white' stroke='black' stroke-width='1.2' stroke-linejoin='round'/></svg>");
+}
+
+/* Attention pulse: a glowing outline that breathes while the element carries .demo-pulse. */
+@keyframes demo-pulse {
+  0% {
+    outline-color: rgba(106, 163, 255, 0.0);
+    box-shadow: 0 0 0 0 rgba(106, 163, 255, 0.45);
+  }
+  35% {
+    outline-color: rgba(106, 163, 255, 0.95);
+    box-shadow: 0 0 0 5px rgba(106, 163, 255, 0.28);
+  }
+  100% {
+    outline-color: rgba(106, 163, 255, 0.0);
+    box-shadow: 0 0 0 11px rgba(106, 163, 255, 0.0);
+  }
+}
+.demo-pulse {
+  animation: demo-pulse 1.1s ease-out infinite;
+  border-radius: 8px;
+  outline: 2px solid rgba(106, 163, 255, 0.85);
+  outline-offset: 2px;
+}
+
+/* The prototype trail-card overlay CHROME: a fixed, max-z card positioned over #reading-pane each tick.
+   --tc-scale grows round 1 → round 2 (set by the player per round). The card INTERIOR rules
+   (.tc-card/.tc-thumb/.tc-title/.tc-meta/.tc-badge) live in TRAILHEAD_PROTO_CARD_CSS (markdown.ts),
+   injected alongside this sheet — cohesive with the player-authored HTML those exports also own. */
+#demo-proto-card {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+  --tc-scale: 1;
+  width: calc(260px * var(--tc-scale));
+  padding: calc(14px * var(--tc-scale)) calc(16px * var(--tc-scale));
+  border-radius: 12px;
+  background: #1f2027;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+  color: #e8e8e8;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  transition: width 200ms ease, padding 200ms ease;
+}
 `;
 
 // ---- element helper (mirrors deck.ts's el()) -------------------------------------------------
@@ -194,7 +264,9 @@ function injectStyle(): void {
   if (document.getElementById("mock-anim-style")) return;
   const style = el("style");
   style.id = "mock-anim-style";
-  style.textContent = ANIM_CSS;
+  // The card-interior rules (.tc-card/.tc-thumb/…/.tc-badge) ship with the player-authored card HTML in
+  // markdown.ts; append them so the card markup + its styling stay cohesive in one place.
+  style.textContent = ANIM_CSS + TRAILHEAD_PROTO_CARD_CSS;
   document.head.appendChild(style);
 }
 
@@ -280,6 +352,160 @@ function mountPlayer(): void {
   const readingPane =
     document.getElementById("reading-pane") ?? document.createElement("div");
 
+  // ---- overlay nodes: created ONCE, appended to the max-z player root layer ----
+  // (Defined below; the root is built after the reconciler. We append them to <body> here so they
+  // exist before the first paint; they sit at the same max-z as the transport chrome.)
+  const cursorNode = el("div");
+  cursorNode.id = "demo-cursor";
+  cursorNode.style.display = "none";
+  document.body.appendChild(cursorNode);
+
+  const protoCard = el("div");
+  protoCard.id = "demo-proto-card";
+  protoCard.style.display = "none";
+  document.body.appendChild(protoCard);
+
+  // The set of elements currently carrying `.demo-pulse` (so a changed pulse set removes from the gone
+  // and adds to the new). Held across reconcile passes — the player is the single writer of the class.
+  const pulsedEls = new Set<HTMLElement>();
+
+  // ---- overlay seam implementations -------------------------------------------------------------
+
+  // Move/press the cursor. Position IS a transform (translate); compose the press scale in JS so a
+  // single transform carries both (a class alone cannot encode the live x/y).
+  const setCursor = (state: { x: number; y: number; pressing: boolean } | null): void => {
+    if (state === null) {
+      cursorNode.style.display = "none";
+      return;
+    }
+    cursorNode.style.display = "block";
+    const scale = state.pressing ? " scale(0.82)" : "";
+    cursorNode.style.transform = `translate(${state.x}px, ${state.y}px)${scale}`;
+  };
+
+  // Drive `.demo-pulse` to EXACTLY the projected selector set: remove from elements no longer targeted,
+  // add to elements matching the new selectors. A missing selector is a no-op (no match → nothing added).
+  const setPulseTargets = (selectors: ReadonlySet<string>): void => {
+    const next = new Set<HTMLElement>();
+    for (const sel of selectors) {
+      for (const m of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+        next.add(m);
+      }
+    }
+    // Remove from elements that fell out of the set.
+    for (const elPrev of pulsedEls) {
+      if (!next.has(elPrev)) elPrev.classList.remove("demo-pulse");
+    }
+    // Add to the new set.
+    for (const elNext of next) elNext.classList.add("demo-pulse");
+    pulsedEls.clear();
+    for (const elNext of next) pulsedEls.add(elNext);
+  };
+
+  // Re-apply the LAST projected pulse set to the live DOM (after a conv rebuild wiped classes on conv
+  // nodes). Reads the same source of truth — `pulsedEls` is rebuilt from scratch by setPulseTargets,
+  // so we re-derive from the selectors the reconciler last passed. We cache that selector set here.
+  let lastPulseSelectors: ReadonlySet<string> = new Set();
+  const setPulseTargetsTracked = (selectors: ReadonlySet<string>): void => {
+    lastPulseSelectors = selectors;
+    setPulseTargets(selectors);
+  };
+
+  // Type into a real field: set .value to the prefix and dispatch a real `input` event (so the app's
+  // own input listeners — composer error-clear, #review-submit enable — fire faithfully).
+  const setFieldText = (selector: string, prefix: string): void => {
+    const field = document.querySelector(selector) as
+      | HTMLInputElement
+      | HTMLTextAreaElement
+      | null;
+    if (!field) return;
+    field.value = prefix;
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  // Drive the composer modal open/closed. The reconciler is the EXCLUSIVE writer of `.hidden` during
+  // the demo (cursor clicks are cosmetic; the real #new-plan-btn is never triggered), so toggling the
+  // class directly cannot desync any second writer.
+  const setComposerOpen = (open: boolean): void => {
+    const modal = document.getElementById("composer-modal");
+    if (!modal) return;
+    modal.classList.toggle("hidden", !open);
+  };
+
+  // Drive the selection popover (reconciler exclusive writer). On: show #sel-popover, set #sp-quote
+  // from the target block's text, position it under the target block's rect. Off: hide it. No real
+  // selection events are dispatched.
+  const setSelPopover = (state: { on: boolean; target: string | null }): void => {
+    const popover = document.getElementById("sel-popover");
+    if (!popover) return;
+    if (!state.on || state.target === null) {
+      popover.classList.add("hidden");
+      return;
+    }
+    const block = document.querySelector(state.target);
+    if (block === null) {
+      popover.classList.add("hidden");
+      return;
+    }
+    const quote = document.getElementById("sp-quote");
+    if (quote) quote.textContent = (block.textContent ?? "").trim();
+    popover.classList.remove("hidden");
+    const rect = block.getBoundingClientRect();
+    popover.style.position = "fixed";
+    popover.style.left = `${rect.left}px`;
+    popover.style.top = `${rect.bottom + 6}px`;
+  };
+
+  // Drive the prototype trail-card overlay. null → hide. Otherwise inject the player-authored card HTML
+  // (TRAILHEAD_PROTO_CARD_R1/R2_HTML from markdown.ts — SAFE, not user content) and bump --tc-scale so
+  // round 2 is visibly LARGER; round 2's HTML also carries the difficulty badge (.tc-badge). Position it
+  // over #reading-pane by reading that pane's rect EACH call (the pane scrolls).
+  const setProtoCard = (state: { round: number | null }): void => {
+    if (state.round === null) {
+      protoCard.style.display = "none";
+      return;
+    }
+    const round = state.round;
+    // Round 2+ : larger card + difficulty badge. Round 1: the clean base card.
+    protoCard.style.setProperty("--tc-scale", round >= 2 ? "1.3" : "1");
+    protoCard.innerHTML = round >= 2 ? TRAILHEAD_PROTO_CARD_R2_HTML : TRAILHEAD_PROTO_CARD_R1_HTML;
+    protoCard.style.display = "block";
+    // Reposition over #reading-pane each call (the reconciler calls this every tick; the pane scrolls).
+    const paneRect = readingPane.getBoundingClientRect();
+    if (paneRect.width > 0 || paneRect.height > 0) {
+      protoCard.style.left = `${paneRect.left + 24}px`;
+      protoCard.style.top = `${paneRect.top + 24}px`;
+    }
+  };
+
+  // Drive the reconciler-owned question-card Other answer UI. Non-null: check the toggle + dispatch a
+  // real `change` (so the card's refresh() un-hides the Other input) and set the text input value (+
+  // dispatch input). null: leave as-is (the reconciler only calls on change; backward scrub re-asserts).
+  // Idempotent: only dispatch when the value actually changes.
+  const setQuestionAnswerUI = (
+    state: { otherChecked: boolean; otherText: string } | null,
+  ): void => {
+    const card = document.querySelector(".conv-question");
+    if (!card) return;
+    const toggle = card.querySelector('[data-other="toggle"]') as HTMLInputElement | null;
+    const textInput = card.querySelector('[data-other="text"]') as HTMLInputElement | null;
+    if (state === null) {
+      if (toggle && toggle.checked) {
+        toggle.checked = false;
+        toggle.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return;
+    }
+    if (toggle && toggle.checked !== state.otherChecked) {
+      toggle.checked = state.otherChecked;
+      toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    if (textInput && textInput.value !== state.otherText) {
+      textInput.value = state.otherText;
+      textInput.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  };
+
   // ---- the reconciler: wired to the REAL host seams ----
   const reconciler = createReconciler(
     {
@@ -290,6 +516,11 @@ function mountPlayer(): void {
         // renderTree does replaceChildren (no scroll handling); the long Execution conversation would
         // render with the finale below the fold. Pin to the bottom so the latest bubbles stay visible.
         pane.scrollTop = pane.scrollHeight;
+        // SAME-PASS PULSE RE-APPLY (anti-strobe): replaceChildren above wiped `.demo-pulse` on the conv
+        // nodes. During a revealMs window the pulse SET is unchanged, so the memoized reconcilePulse
+        // pass would NOT re-apply it — a separate post-pass would strobe at 20Hz. Re-apply the LAST
+        // projected pulse selectors here, in the SAME paint pass, immediately after the conv rebuild.
+        setPulseTargetsTracked(lastPulseSelectors);
       },
       // Reading pane: the real read_plan_contents + render facade.
       readPlan: (path: string) => invoke<string>("read_plan_contents", { path }),
@@ -319,6 +550,16 @@ function mountPlayer(): void {
       setActiveTab: (tab: "plan" | "conversation"): void => {
         clickTab(tab);
       },
+      // ---- overlay seams (cosmetic; reconciler-owned DOM) ----
+      setCursor,
+      // Use the tracked variant so the LAST projected pulse selectors are cached for the same-pass
+      // re-apply inside renderConv (anti-strobe).
+      setPulseTargets: setPulseTargetsTracked,
+      setFieldText,
+      setComposerOpen,
+      setSelPopover,
+      setProtoCard,
+      setQuestionAnswerUI,
     },
     story,
     model,

@@ -93,8 +93,27 @@ export type SurfaceFrame =
   // The prototype gate state: on/off (+ optional round 1..3 when on).
   | { t: "prototype_gate"; on: boolean; round?: number };
 
+// ---- OverlayFrame variants ---------------------------------------------------------------------
+//
+// OverlayFrames are NEVER applied to the model (applyModelFrame treats them as no-ops, exactly like
+// SurfaceFrames) AND they are excluded from the model signature (an overlay frame entering the ≤T set
+// must NOT re-render the conversation pane — it drives a cosmetic overlay seam, not conv content).
+// Each is a PURE function of T projected by one of the projections below (projectPulseSet,
+// projectCursorState, projectFieldText, projectModalState) and reconciled onto a real overlay seam.
+//
+// The cursor is COSMETIC: cursor_move/cursor_click drive a `#demo-cursor` overlay; they NEVER dispatch
+// a real DOM click. `pulse` is an attention glow over matching elements while fromMs <= T < toMs.
+// `field_type` types a growing prefix into a real input/textarea. `overlay_modal` drives a real
+// modal/popover open/closed as a pure last-≤-T fn of T per `kind`.
+export type OverlayFrame =
+  | { t: "cursor_move"; target: string; moveMs: number }
+  | { t: "cursor_click"; target: string; pressMs?: number }
+  | { t: "pulse"; target: string; fromMs: number; toMs: number }
+  | { t: "field_type"; target: string; text: string; fromMs: number; toMs: number }
+  | { t: "overlay_modal"; kind: "composer" | "popover"; on: boolean; target?: string };
+
 // The unified storyboard frame envelope.
-export type Frame = ModelFrame | SurfaceFrame;
+export type Frame = ModelFrame | SurfaceFrame | OverlayFrame;
 
 // The discriminator values that belong to the SURFACE family — every other `t` is a ModelFrame.
 const SURFACE_KINDS = new Set<Frame["t"]>([
@@ -105,9 +124,24 @@ const SURFACE_KINDS = new Set<Frame["t"]>([
   "prototype_gate",
 ]);
 
+// The discriminator values that belong to the OVERLAY family (mirrors SURFACE_KINDS). Overlay frames
+// are model no-ops AND signature-excluded — they drive cosmetic overlay seams, never conv content.
+const OVERLAY_KINDS = new Set<Frame["t"]>([
+  "cursor_move",
+  "cursor_click",
+  "pulse",
+  "field_type",
+  "overlay_modal",
+]);
+
 // Is this a SurfaceFrame (vs a ModelFrame)?
 export function isSurfaceFrame(frame: Frame): frame is SurfaceFrame {
   return SURFACE_KINDS.has(frame.t);
+}
+
+// Is this an OverlayFrame (vs a ModelFrame or SurfaceFrame)?
+export function isOverlayFrame(frame: Frame): frame is OverlayFrame {
+  return OVERLAY_KINDS.has(frame.t);
 }
 
 // One timed storyboard entry: reveal `frame` once the scrub time reaches `tMs`. `chapterLabel` is an
@@ -170,6 +204,14 @@ export function applyModelFrame(
     case "set_comments":
     case "pending_reviews":
     case "prototype_gate":
+      break;
+    // OverlayFrames are model no-ops too — projected by projectPulseSet/projectCursorState/
+    // projectFieldText/projectModalState and reconciled onto cosmetic overlay seams, never the model.
+    case "cursor_move":
+    case "cursor_click":
+    case "pulse":
+    case "field_type":
+    case "overlay_modal":
       break;
     default: {
       // Exhaustiveness guard — a new Frame variant must add a case above.
@@ -277,6 +319,146 @@ export function projectSurfaceState(story: ReadonlyArray<StoryFrame>, T: number)
   };
 }
 
+// ---- Overlay projections (PURE fns of (story, T)) ----------------------------------------------
+//
+// Each projects ONE overlay primitive at scrub time T from the OverlayFrames in the story. All four
+// are pure (no DOM, no selectors resolved to pixels — that happens later in the reconciler). They
+// scrub forward AND backward cleanly because they are full re-derivations from the frame set, not
+// forward deltas.
+
+// The default press duration (ms) for a cursor_click whose `pressMs` is omitted.
+const DEFAULT_PRESS_MS = 180;
+
+// PURE: the set of pulse `target`s active at T. STATELESS additive scan: for every `pulse` OverlayFrame
+// include its `target` iff its window contains T (half-open [fromMs, toMs)). NOT last-≤-T — pulses are
+// additive windows, so two overlapping pulses are both present.
+export function projectPulseSet(story: ReadonlyArray<StoryFrame>, T: number): Set<string> {
+  const out = new Set<string>();
+  for (const sf of story) {
+    const frame = sf.frame;
+    if (frame.t !== "pulse") continue;
+    if (frame.fromMs <= T && T < frame.toMs) out.add(frame.target);
+  }
+  return out;
+}
+
+// The symbolic cursor state at T. `t01` is the lerp fraction along the current move (0 at depart, 1 at
+// arrive / at rest). Selectors are NOT resolved to pixels here — the reconciler does that against the
+// live DOM. `null` before the first cursor_move frame.
+export interface CursorState {
+  fromTarget: string;
+  toTarget: string;
+  t01: number;
+  pressing: boolean;
+}
+
+// PURE: project the cursor's symbolic state at T. Waypoints are the `cursor_move` frames in story (tMs)
+// order. The move toward waypoint `w` runs during [w.tMs, w.tMs + w.moveMs): the cursor DEPARTS the
+// previous waypoint's target at w.tMs and ARRIVES at w.target by w.tMs + w.moveMs.
+//
+// Let `cur` = the latest waypoint with cur.tMs <= T (the move currently happening or just-completed),
+// and `from` = the waypoint immediately before it (where the cursor came from). Then:
+//   • no waypoint with tMs <= T (T before the first cursor_move) → null;
+//   • cur.tMs <= T < cur.tMs + cur.moveMs → TRAVELING from.target → cur.target, t01 lerped along the
+//     move (from.target is cur.target itself for the very first waypoint — it eases out in place);
+//   • T >= cur.tMs + cur.moveMs → RESTED at cur.target (t01 = 1).
+// `pressing` = some cursor_click frame has tMs <= T < tMs + (pressMs ?? DEFAULT_PRESS_MS).
+export function projectCursorState(story: ReadonlyArray<StoryFrame>, T: number): CursorState | null {
+  // Collect cursor_move waypoints with their StoryFrame tMs, in story order (already tMs-ordered).
+  const moves: Array<{ tMs: number; target: string; moveMs: number }> = [];
+  for (const sf of story) {
+    if (sf.frame.t === "cursor_move") {
+      moves.push({ tMs: sf.tMs, target: sf.frame.target, moveMs: sf.frame.moveMs });
+    }
+  }
+  moves.sort((a, b) => a.tMs - b.tMs);
+
+  // pressing: any cursor_click whose press window contains T.
+  let pressing = false;
+  for (const sf of story) {
+    if (sf.frame.t !== "cursor_click") continue;
+    const pressMs = sf.frame.pressMs ?? DEFAULT_PRESS_MS;
+    if (sf.tMs <= T && T < sf.tMs + pressMs) {
+      pressing = true;
+      break;
+    }
+  }
+
+  if (moves.length === 0) return null;
+
+  // `curIdx` = latest waypoint that has started (tMs <= T) = the move currently happening or completed.
+  // Before the first move begins → null.
+  let curIdx = -1;
+  for (let i = 0; i < moves.length; i++) {
+    if (moves[i].tMs <= T) curIdx = i;
+    else break;
+  }
+  if (curIdx === -1) return null;
+
+  const cur = moves[curIdx];
+  // Where the cursor came from: the prior waypoint (or `cur` itself for the very first move).
+  const from = curIdx > 0 ? moves[curIdx - 1] : cur;
+
+  // Traveling toward `cur` while inside its move window.
+  if (T < cur.tMs + cur.moveMs) {
+    const t01 = cur.moveMs > 0 ? clamp01((T - cur.tMs) / cur.moveMs) : 1;
+    return { fromTarget: from.target, toTarget: cur.target, t01, pressing };
+  }
+
+  // The move has completed → rested at cur.target.
+  return { fromTarget: cur.target, toTarget: cur.target, t01: 1, pressing };
+}
+
+// PURE: the visible typed text per target at T. For each `field_type` frame:
+//   • T < fromMs → contributes nothing;
+//   • fromMs <= T < toMs → a linear prefix slice (floor(fraction * length));
+//   • T >= toMs → the full text.
+// Last-writer-wins per target (story order). Map keys are targets, values the visible prefix.
+export function projectFieldText(story: ReadonlyArray<StoryFrame>, T: number): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const sf of story) {
+    const frame = sf.frame;
+    if (frame.t !== "field_type") continue;
+    if (T < frame.fromMs) continue; // not started → contributes nothing (do NOT clear a prior writer).
+    if (T >= frame.toMs) {
+      out.set(frame.target, frame.text);
+      continue;
+    }
+    const span = frame.toMs - frame.fromMs;
+    const fraction = span > 0 ? clamp01((T - frame.fromMs) / span) : 1;
+    const cut = Math.floor(fraction * frame.text.length);
+    out.set(frame.target, frame.text.slice(0, cut));
+  }
+  return out;
+}
+
+// The modal/popover overlay state at T. `composer` open/closed; `popover` on + its (optional) target.
+export interface ModalState {
+  composer: boolean;
+  popover: { on: boolean; target: string | null };
+}
+
+// PURE: project the modal state at T as the LAST `overlay_modal` frame (tMs <= T) PER kind (mirrors the
+// open_plan last-≤-T pattern). Default both off / null target before any frame. A backward scrub reverts
+// because we re-derive the last-≤-T value from scratch (a modal opened later is closed at an earlier T).
+export function projectModalState(story: ReadonlyArray<StoryFrame>, T: number): ModalState {
+  let composer = false;
+  let popoverOn = false;
+  let popoverTarget: string | null = null;
+  for (const sf of story) {
+    if (sf.tMs > T) continue;
+    const frame = sf.frame;
+    if (frame.t !== "overlay_modal") continue;
+    if (frame.kind === "composer") {
+      composer = frame.on;
+    } else {
+      popoverOn = frame.on;
+      popoverTarget = frame.target ?? null;
+    }
+  }
+  return { composer, popover: { on: popoverOn, target: popoverTarget } };
+}
+
 // ---- Model signature (memo key) ----------------------------------------------------------------
 
 // An INJECTIVE string over the applied MODEL-frame SET at T plus the in-progress reveal prefix. The
@@ -289,7 +471,7 @@ export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): str
   let revealPrefixLen = 0;
   for (const sf of story) {
     if (sf.tMs > T) continue;
-    if (isSurfaceFrame(sf.frame)) continue;
+    if (isSurfaceFrame(sf.frame) || isOverlayFrame(sf.frame)) continue;
     countModelFramesLeqT++;
     const frame = sf.frame;
     if (
@@ -311,21 +493,44 @@ export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): str
 // A two-chapter beat for a fictional React-Native "Trailhead" hiking app. It exercises the FULL
 // interactive + subagent surface the live app renders, all through the REAL ConversationModel:
 //
-//   Chapter "Clarify" (seq 1..5):
-//     The user kicks off ("plan Trailhead"). The assistant asks ONE clarifying question via an
-//     AskUserQuestion permission request (an interactive card). The user answers with a FREE-TEXT
-//     value that matches NO option label — the "Other…" affordance — which folds onto the card
-//     (answers set) and is ALSO echoed as a standalone user bubble (a demo-authored echo; see below).
+//   P3 REWRITTEN FRONT (beats 1-4) — the cosmetic-cursor / frame-driven-truth interaction model:
+//   every cursor click is COSMETIC (a `#demo-cursor` press animation); the named state change is driven
+//   by the frame next to it, and the reconciler owns any real DOM it touches. The named B1_/B2_/B3_/B4_
+//   tMs constants above pin every dwell; the tests reference THOSE constants (not magic numbers).
 //
-//   Chapter "Scope recon" (seq 6..20):
+//   Chapter "Clarify" — Beat 1 + Beat 2 (seq 1..5):
+//     Beat 1 (new-plan opening, REPLACES the old pre-filled prompt): the cursor moves to #new-plan-btn
+//     and cosmetically clicks; overlay_modal opens the composer (reconciler-owned `.hidden`); a ~2s
+//     pulse dwells on the empty composer; the cursor moves to #composer-request and field_type TYPES the
+//     Trailhead request over ~2.5s; the cursor clicks #composer-start (cosmetic) and overlay_modal closes
+//     the composer (NOT via the real start(), which the mock forces to fail); THEN the seq-1 user_message
+//     (the SAME request text) lands as a chat bubble, gets a ~1.8s pulse, and the seq-2 reply streams.
+//     Beat 2 (clarify): the seq-3 AskUserQuestion card is pulsed ~2s, then the answer is DRIVEN through
+//     the card's Other input — field_type into [data-other="text"] (the reconciler auto-checks the Other
+//     toggle); a cosmetic submit-button click; the seq-4 question_answered folds the FREE-TEXT "Other"
+//     value (source of truth) and the seq-5 echo bubble carries it.
+//
+//   Chapter "Scope recon" — Beat 3 (seq 6..54):
 //     The assistant launches a `scope-recon` SUBAGENT (a Task tool). A `subagent_started` frame LABELS
-//     the group (header "scope-recon"). Inside the group the subagent runs four LEAF tool pairs
-//     (Glob/Read/Grep/Bash), each tool_use + tool_result sharing a tMs so each reveals ATOMICALLY (no
-//     "running" leaf at rest). The Task's OWN tool_result (seq 18) lands at the END, flipping the
-//     top-level Task tool node running→done — WITHOUT it the Task row stays "running" forever (the
-//     no-stuck-tool invariant fails).
+//     the group. Inside the group the subagent runs ~20 LEAF tool pairs (Glob×4 / Read×9 / Grep×4 /
+//     Bash×3) plus two intermediate in-group notes, each tool_use + tool_result sharing a tMs so each
+//     reveals ATOMICALLY (no "running" leaf at rest). The Task's OWN tool_result (seq 53) lands at the
+//     END, flipping the top-level Task tool node running→done — WITHOUT it the Task row stays "running"
+//     forever (the no-stuck-tool invariant fails). seq 52 is the in-group summary, seq 54 the wrap-up.
 //
-//   Chapter "Prototype review" (seq 21..24):
+//   Chapter "Plan sizer" — Beat 4 (seq 55..58, NEW):
+//     A short narration announces the right-sizing gate, then a top-level `plan-sizer` Task (atomic
+//     tool_use seq 56 + tool_result seq 57, shared tMs) returns the SPLIT decision ("master + 3 subplans;
+//     subplan 04 decomposed into 4 leaves"). A brief pulse marks the plan-sizer row; seq 58 narrates the
+//     outcome. This precedes the (shifted) prototype-review chapter.
+//
+//   DOWNSTREAM SHIFT (load-bearing): the chapters BELOW (prototype review … execution … terminal) are
+//   kept VERBATIM in shape but written PRE-SHIFTED: every downstream model frame's seq is + SEQ_SHIFT
+//   (38) and its tMs is + EXEC_SHIFT (26800). The seq/tMs ranges quoted below are the ORIGINAL pre-shift
+//   numbers; add SEQ_SHIFT/EXEC_SHIFT for the live values (e.g. the terminal is seq TERMINAL_SEQ / tMs
+//   TERMINAL_MS — the strictly-highest seq AND tMs).
+//
+//   Chapter "Prototype review" (orig seq 21..24, + SEQ_SHIFT):
 //     The assistant narrates a visual prototype (seq 21, Conversation tab). A SURFACE bracket then
 //     opens PROTO_PREVIEW_PATH in the reading pane AND turns the prototype gate ON for a window, then
 //     closes BOTH (open_plan{null} + gate off) — so during the window the reconciler tracks
@@ -371,34 +576,157 @@ export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): str
 //   narration → prototype (Plan) → flip back → feedback + approval bubbles (Conversation).
 //
 // TIMING / INVARIANTS (load-bearing):
-//   • dense seqs 1..49 (model seqs 1..25, the system echo seq 26, then the Execution chapter seqs 27..49:
-//     four 04.* Write leaves + their OUTPUT/`[context]` echoes, an integration wrap-up, the terminal 49).
-//   • monotonic tMs; the terminal `result` (seq 49 / tMs 40000) is the strictly-highest seq AND tMs
-//     (so `working` is non-null for every mid-run T but null at T = storyDurationMs — a finished
-//     thought). The prototype-review surface frames (open_plan / prototype_gate at tMs 13800/15600),
-//     the nested-plan surface frames (plan_changed at 0/19800, open_plan at 20200), the
-//     comment-and-iterate surface frames (set_comments at 22000/22800/23600, open_plan{V2} at 24800),
-//     and the Execution open_plan{null} (tMs 27000) carry no seq — they are SurfaceFrames, projected by
-//     projectSurfaceState, never model frames.
-//   • QUESTION INVARIANT: request.seq (3) < answer.seq (4) AND request.tMs (2000) <= answer.tMs (3600).
-//   • The Task tool SPANS its group (tool_use seq 7 @ 5800 .. its tool_result seq 18 @ 10800); only the
-//     LEAF tool pairs inside the group are atomic. The Task is the ONLY non-atomic tool — its result is
-//     deferred to the group's end, which is exactly why it must be emitted explicitly (seq 18).
+//   • dense, contiguous seqs 1..TERMINAL_SEQ (= 87). Front beats 1-4 use seqs 1..58 (Beat 1/2 → 1..5,
+//     Beat 3 scope-recon → 6..54 incl. ~20 atomic leaf pairs, Beat 4 plan-sizer → 55..58); the
+//     downstream chapters (prototype review … execution … terminal) follow at + SEQ_SHIFT (orig 21..49 →
+//     59..87).
+//   • monotonic tMs; the terminal `result` (seq TERMINAL_SEQ / tMs TERMINAL_MS) is the strictly-highest
+//     seq AND tMs (so `working` is non-null for every mid-run T but null at T = storyDurationMs — a
+//     finished thought). All surface frames (the tMs-0 empty plan_changed, the prototype-review /
+//     nested-plan / comment-and-iterate brackets, the Execution open_plan{null}) AND all overlay frames
+//     (cursor_move/click, pulse, field_type, overlay_modal) carry no seq — they are projected by
+//     projectSurfaceState / the overlay projections, never applied to the model.
+//   • QUESTION INVARIANT: request.seq (3) < answer.seq (4) AND request.tMs (B2_QUESTION_MS) <= answer.tMs
+//     (B2_ANSWER_MS).
+//   • The scope-recon Task tool SPANS its group (tool_use seq 7 @ B3_TASK_MS .. its tool_result seq 53 @
+//     B3_TASK_RESULT_MS); only the LEAF tool pairs inside the group are atomic. The scope-recon Task is
+//     the ONLY non-atomic tool — its result is deferred to the group's end, emitted explicitly (seq 53).
+//     The Beat-4 plan-sizer Task, by contrast, is ATOMIC (its result shares its tMs).
 //   • subagent label path: `subagent_started` is an existing AgentStream kind that appendStream already
 //     handles; emitting it through the widened ConvFrame Extract LABELS the group ("scope-recon")
 //     WITHOUT any engine change.
 const TASK_ID = "toolu_trailhead_task_scope_recon";
-const GLOB_ID = "toolu_trailhead_glob_1";
-const READ_ID = "toolu_trailhead_read_1";
-const GREP_ID = "toolu_trailhead_grep_1";
-const BASH_ID = "toolu_trailhead_bash_1";
 const QUESTION_ID = "toolu_trailhead_ask_platform";
-// Execution-chapter Write tool ids — one per 04.* detail leaf. Each leaf's tool_use + tool_result share
-// the SAME id so derive() correlates the result onto its tool_use (atomic, no "running" leaf at rest).
-const WRITE_0401_ID = "toolu_trailhead_write_0401";
-const WRITE_0402_ID = "toolu_trailhead_write_0402";
-const WRITE_0403_ID = "toolu_trailhead_write_0403";
-const WRITE_0404_ID = "toolu_trailhead_write_0404";
+// The plan-sizer right-sizing gate's tool id (Beat 4). Top-level Task; its result lands atomically.
+const PLAN_SIZER_ID = "toolu_trailhead_plan_sizer";
+
+// ---- Named beat tMs constants (load-bearing; tests pin to THESE, not magic numbers) -------------
+//
+// Beats 1-4 (the rewritten front) introduce real viewer DWELLS — the cursor moves, the composer opens
+// and is read, text is typed character-by-character, the question is read and answered. Every dwell is
+// a tMs GAP that the player's hold-state spans; a `pulse` window straddling the gap tells the viewer
+// where to look. These constants make a re-time a one-line change instead of churn across the tests.
+//
+// Beat 1 — New plan opening (the composer flow REPLACES the old pre-filled seq-1 prompt):
+export const B1_NEWPLAN_MOVE_MS = 600; // cursor travels to #new-plan-btn
+export const B1_NEWPLAN_CLICK_MS = 1300; // cosmetic click on #new-plan-btn
+export const B1_COMPOSER_OPEN_MS = 1500; // overlay_modal{composer,on} — the modal opens (reconciler-owned)
+export const B1_COMPOSER_PULSE_FROM = 1700; // pulse #composer-modal …
+export const B1_COMPOSER_PULSE_TO = 3700; //   … for ~2s (a real dwell: the viewer reads the empty composer)
+export const B1_REQUEST_MOVE_MS = 3700; // cursor travels to #composer-request
+export const B1_REQUEST_TYPE_FROM = 4300; // field_type #composer-request begins …
+export const B1_REQUEST_TYPE_TO = 6800; //   … typed over ~2.5s
+export const B1_START_MOVE_MS = 7100; // cursor travels to #composer-start
+export const B1_START_CLICK_MS = 7500; // cosmetic click on #composer-start
+export const B1_COMPOSER_CLOSE_MS = 7700; // overlay_modal{composer,off} — modal closes (NOT via real start())
+export const B1_USER_MSG_MS = 7900; // seq 1 user_message (the request) appears as a chat bubble
+export const B1_USER_PULSE_FROM = 8000; // pulse the user bubble …
+export const B1_USER_PULSE_TO = 9800; //   … for ~1.8s
+export const B1_REPLY_MS = 9900; // seq 2 assistant reply begins streaming
+
+// Beat 2 — Clarify (the user is shown ENTERING the Other answer):
+export const B2_QUESTION_MS = 11000; // seq 3 question_request (the AskUserQuestion card)
+export const B2_QUESTION_PULSE_FROM = 11200; // pulse .conv-question …
+export const B2_QUESTION_PULSE_TO = 13200; //   … for ~2s (pause+pulse on the card)
+export const B2_ANSWER_TYPE_FROM = 13400; // field_type [data-other="text"] begins (reconciler auto-checks Other)
+export const B2_ANSWER_TYPE_TO = 15600; //   … typed over ~2.2s
+export const B2_SUBMIT_MOVE_MS = 15800; // cursor travels to .conv-question-submit
+export const B2_SUBMIT_CLICK_MS = 16200; // cosmetic click on .conv-question-submit
+export const B2_ANSWER_MS = 16400; // seq 4 question_answered (folds onto the card — source of truth) + seq 5 echo
+
+// Beat 3 — Scope recon ×5 (~20 atomic leaf tool pairs under the scope-recon Task):
+export const B3_ACK_MS = 17600; // seq 6 assistant ack
+export const B3_TASK_MS = 18800; // seq 7 Task tool_use + seq 8 subagent_started
+export const B3_FIRSTWORDS_MS = 19100; // seq 9 subagent's first words
+export const B3_LEAF_START_MS = 20000; // first leaf pair tMs; each subsequent pair steps by B3_LEAF_STEP_MS
+export const B3_LEAF_STEP_MS = 450; // the inter-leaf gap (atomic pair shares one tMs)
+export const B3_SUMMARY_MS = 31000; // the subagent's closing summary
+export const B3_TASK_RESULT_MS = 31900; // the Task's OWN deferred tool_result (flips it done)
+export const B3_WRAPUP_MS = 32800; // the top-level wrap-up
+
+// Beat 4 — Plan-sizer (NEW): the right-sizing gate between scope-recon and the drafted plan:
+export const B4_NARRATION_MS = 34200; // short narration announcing the right-sizing gate
+export const B4_SIZER_MS = 35400; // the plan-sizer Task tool_use + its atomic tool_result
+export const B4_SIZER_PULSE_FROM = 35600; // brief pulse on the plan-sizer row …
+export const B4_SIZER_PULSE_TO = 37200; //   … ~1.6s
+export const B4_OUTCOME_MS = 37600; // narration of the split decision
+
+// EXEC_SHIFT / SEQ_SHIFT (load-bearing): the rewritten front (beats 1-4) is LONGER and uses MORE seqs
+// than the original. The downstream beats (prototype review … execution … terminal) are kept VERBATIM
+// in shape but SHIFTED uniformly: every downstream model frame's tMs is + EXEC_SHIFT and its seq is +
+// SEQ_SHIFT. The original front ended at seq 20 / the prototype-review chapter opened at tMs 13000; the
+// new front ends at seq 58 / tMs B4_OUTCOME_MS, so downstream is renumbered from there. These two
+// constants are the SINGLE source of the shift (every downstream literal below is written pre-shifted).
+export const SEQ_SHIFT = 38; // old downstream seqs 21..49 → 59..87
+export const EXEC_SHIFT = 26800; // old downstream tMs 13000..40000 → 39800..66800
+
+// PROTO_ACT_SHIFT (load-bearing, P4): the rewritten "Prototype review" chapter is LONGER than the
+// original instant feedback/approval — it now scripts the full prototype ACT (pulse the narration
+// bubble ~2s, show the round-1 trail card + pulse it, TYPE the feedback into #prototype-feedback ~2.5s,
+// cosmetic-click #review-submit, morph to the round-2 card + pulse it ~2s, cosmetic-click #review-approve).
+// It adds NO new seqs (every new frame is an OVERLAY frame, which carries no seq) — only TIME. So the
+// chapters BELOW it (nested plan … comment & iterate … execution … terminal) keep their seqs but shift
+// their tMs by + PROTO_ACT_SHIFT (applied via DOWNSTREAM_AFTER_PROTOTYPE.map below, NOT hand-edited
+// literals). The prototype chapter's OWN seq-60/61/62 model frames are written at their new in-act tMs.
+export const PROTO_ACT_SHIFT = 9600; // pushes nested-plan (was 45800) → 55400, after the act ends (~52400).
+
+// COMMENT_ACT_SHIFT (load-bearing, P4): the rewritten "Comment & iterate" chapter now SCRIPTS the
+// selection-popover act for two comments (cursor → block, popover open + pulse, type into #sp-text,
+// cosmetic #sp-save click, popover close, THEN the highlight paints). That act carries NO new seqs (all
+// overlay frames) and shifts the (P4) nested-plan/comment-and-iterate tMs by + PROTO_ACT_SHIFT only.
+// (Before P5 the Execution chapter also shifted by + COMMENT_ACT_SHIFT; P5 REWROTE Execution as a
+// programmatic subagent sequence built directly at FINAL tMs/seq from EXEC_BASE_MS / EXEC_SEQ_BASE
+// below, so this constant now only documents the comment-act length used to choose EXEC_BASE_MS.)
+export const COMMENT_ACT_SHIFT = 5000;
+
+// ---- (P5) Execution chapter base — built directly at FINAL tMs/seq ------------------------------
+//
+// The P4 "Comment & iterate" chapter's last model frame lands at final tMs 68000 (pre-shift 58400 +
+// PROTO_ACT_SHIFT) at seq 64. The P5 Execution chapter (a SEQUENCE OF SUBAGENTS) is generated by the
+// EXEC_SUBPLANS builder below at FINAL tMs/seq (NO further shift) starting just after that. EXEC_BASE_MS
+// is the Execution open_plan{null} tMs; EXEC_SEQ_BASE is the first Execution model seq (the exec-open
+// narration). The builder steps from there; TERMINAL_MS / TERMINAL_SEQ are COMPUTED from its output
+// (see after EXEC_FRAMES) so a re-time/re-count is a one-line base change, never a literal edit.
+export const EXEC_BASE_MS = 69000; // Execution open_plan{null}; > the comment act's last frame (68000).
+export const EXEC_SEQ_BASE = 65; // first Execution model seq (= old 64 + 1, contiguous after the comment chapter).
+
+// ---- Named tMs constants for the P4 prototype ACT (tests pin to THESE, not magic numbers) -------
+// The prototype chapter narration (seq 59) lands at PROTO_NARR_MS; the act then plays out as a sequence
+// of dwells (pulses spanning tMs gaps) the player's hold-state covers. All overlay frames; no seqs.
+export const PROTO_NARR_MS = 39800; // seq 59 "I put together a quick visual prototype…"
+export const PROTO_NARR_PULSE_FROM = 40700; // pulse the narration bubble (by data-seq) …
+export const PROTO_NARR_PULSE_TO = 42700; //   … ~2s pause (the viewer reads it)
+export const PROTO_OPEN_MS = 40600; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → round-1 card shows
+export const PROTO_CARD1_PULSE_FROM = 42800; // pulse #demo-proto-card (round 1) …
+export const PROTO_CARD1_PULSE_TO = 44800; //   … ~2s
+export const PROTO_FEEDBACK_MOVE_MS = 44900; // cursor → #prototype-feedback
+export const PROTO_FEEDBACK_TYPE_FROM = 45200; // field_type #prototype-feedback begins …
+export const PROTO_FEEDBACK_TYPE_TO = 47700; //   … typed over ~2.5s (also pulsed across this window)
+export const PROTO_SUBMIT_MOVE_MS = 47900; // cursor → #review-submit
+export const PROTO_SUBMIT_CLICK_MS = 48200; // cosmetic click on #review-submit ("Request changes")
+export const PROTO_ROUND2_MS = 48400; // prototype_gate{on,round:2} → the card MORPHS larger + difficulty badge
+export const PROTO_CARD2_PULSE_FROM = 48600; // pulse #demo-proto-card (round 2) …
+export const PROTO_CARD2_PULSE_TO = 50600; //   … ~2s pause
+export const PROTO_APPROVE_MOVE_MS = 50800; // cursor → #review-approve
+export const PROTO_APPROVE_CLICK_MS = 51100; // cosmetic click on #review-approve ("Approve visual")
+export const PROTO_CLOSE_MS = 51300; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
+export const PROTO_FEEDBACK_MS = 51600; // seq 60 user feedback bubble + seq 61 approval echo (land together)
+export const PROTO_ACK_MS = 52400; // seq 62 assistant ack
+// (P5) The Execution chapter is now a SEQUENCE OF SUBAGENTS — one Task subagent per subplan, each with
+// 4–6 atomic leaf tool calls + a deferred top-level Task tool_result. The per-subplan Task ids and the
+// leaf-tool ids are generated by the EXEC_SUBPLANS builder below (no hand-authored WRITE_* ids).
+
+// The Trailhead kickoff request. In the rewritten Beat 1 the user TYPES this into the composer
+// (field_type #composer-request) and it then appears as the seq-1 user bubble — so the SAME string is
+// both the typed composer text AND the chat bubble (no pre-filled prompt). Reuse of the original text.
+const TRAILHEAD_REQUEST =
+  "I want to build Trailhead — a mobile app that helps hikers find and log trails. Can you plan it?";
+
+// The prototype feedback the user TYPES into #prototype-feedback during the P4 prototype act and that
+// then lands as the seq-60 user bubble — the SAME string is both the typed feedback AND the chat row
+// (mirrors Beat 1's compose-then-echo). It literally names the two changes the round-2 card makes
+// (larger card + difficulty badge), so the typed feedback and the card morph are coherent.
+const TRAILHEAD_PROTO_FEEDBACK = "Love it — bump the trail-card size and add a difficulty badge.";
 
 // The exact question text — used BOTH as the card's question and as the answers key (the SDK keys
 // `answers` by the `question` string, and derive() folds by that key).
@@ -457,20 +785,92 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     tMs: 0,
     frame: { t: "plan_changed", plans: [] },
   },
+
+  // ================================================================================================
+  // Chapter "Clarify" — Beat 1 (new-plan opening) + Beat 2 (entering the Other answer)
+  // ================================================================================================
+  //
+  // Beat 1 REPLACES the old pre-filled seq-1 prompt. The user OPENS a new plan through the real
+  // composer flow — all cursor clicks are COSMETIC; the modal open/close and the chat bubble are driven
+  // by frames (overlay_modal / user_message), the reconciler being the exclusive owner of #composer-modal.
+  //
+  // ---- Beat 1: cursor → #new-plan-btn (cosmetic click) → composer opens → read → type request → start
   {
-    // seq 1 — the user's kickoff request opens the beat (the first node is now a USER node).
-    tMs: 0,
+    // OVERLAY — the cursor travels to the New-plan button.
+    tMs: B1_NEWPLAN_MOVE_MS,
     chapterLabel: "Clarify",
+    frame: { t: "cursor_move", target: "#new-plan-btn", moveMs: 500 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #new-plan-btn (no real DOM click is dispatched).
+    tMs: B1_NEWPLAN_CLICK_MS,
+    frame: { t: "cursor_click", target: "#new-plan-btn" },
+  },
+  {
+    // OVERLAY — the composer modal OPENS (reconciler-owned `.hidden`), driven by the frame (NOT the real
+    // #new-plan-btn handler — the click above was cosmetic). A backward scrub closes it (last-≤-T per kind).
+    tMs: B1_COMPOSER_OPEN_MS,
+    frame: { t: "overlay_modal", kind: "composer", on: true },
+  },
+  {
+    // OVERLAY — pulse the open composer for ~2s: a real DWELL (the tMs gap to the next frame) so the
+    // viewer reads the empty composer before anything is typed.
+    tMs: B1_COMPOSER_PULSE_FROM,
+    frame: { t: "pulse", target: "#composer-modal", fromMs: B1_COMPOSER_PULSE_FROM, toMs: B1_COMPOSER_PULSE_TO },
+  },
+  {
+    // OVERLAY — the cursor travels to the request textarea.
+    tMs: B1_REQUEST_MOVE_MS,
+    frame: { t: "cursor_move", target: "#composer-request", moveMs: 500 },
+  },
+  {
+    // OVERLAY — the user TYPES the Trailhead request into #composer-request over ~2.5s. field_type
+    // dispatches a real `input` event (harmless: it clears the composer's own error state visually).
+    tMs: B1_REQUEST_TYPE_FROM,
     frame: {
-      t: "user_message",
-      seq: 1,
-      text:
-        "I want to build Trailhead — a mobile app that helps hikers find and log trails. Can you plan it?",
+      t: "field_type",
+      target: "#composer-request",
+      text: TRAILHEAD_REQUEST,
+      fromMs: B1_REQUEST_TYPE_FROM,
+      toMs: B1_REQUEST_TYPE_TO,
+    },
+  },
+  {
+    // OVERLAY — the cursor travels to the Start button.
+    tMs: B1_START_MOVE_MS,
+    frame: { t: "cursor_move", target: "#composer-start", moveMs: 400 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #composer-start (the real start() is forced to fail in the mock, so
+    // we never trigger it; the close below is frame-driven).
+    tMs: B1_START_CLICK_MS,
+    frame: { t: "cursor_click", target: "#composer-start" },
+  },
+  {
+    // OVERLAY — the composer CLOSES (frame-driven, NOT via the real start()). Backward scrub re-opens it.
+    tMs: B1_COMPOSER_CLOSE_MS,
+    frame: { t: "overlay_modal", kind: "composer", on: false },
+  },
+  {
+    // seq 1 — the user's kickoff request now APPEARS as a chat bubble (the SAME text just typed into the
+    // composer). The first conv node is a USER node, but it lands AFTER the composer beat (no pre-fill).
+    tMs: B1_USER_MSG_MS,
+    frame: { t: "user_message", seq: 1, text: TRAILHEAD_REQUEST },
+  },
+  {
+    // OVERLAY — pulse the freshly-landed user bubble (by its data-seq) for ~1.8s. The bubble lives under
+    // the player's conv pane, so the selector is `.mockanim-pane [data-seq="1"]`.
+    tMs: B1_USER_PULSE_FROM,
+    frame: {
+      t: "pulse",
+      target: '.mockanim-pane [data-seq="1"]',
+      fromMs: B1_USER_PULSE_FROM,
+      toMs: B1_USER_PULSE_TO,
     },
   },
   {
     // seq 2 — the assistant's reply (streams via revealMs 900). Targeted by the token-reveal test.
-    tMs: 900,
+    tMs: B1_REPLY_MS,
     frame: {
       t: "conv",
       revealMs: 900,
@@ -482,10 +882,12 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
       },
     },
   },
+
+  // ---- Beat 2: clarify — show the user ENTERING the Other answer --------------------------------
   {
     // seq 3 — an interactive AskUserQuestion permission request (the question card). While it is the
     // latest unresolved hold, derive() shows the WAITING_INPUT_LABEL working indicator.
-    tMs: 2000,
+    tMs: B2_QUESTION_MS,
     frame: {
       t: "question_request",
       ev: {
@@ -512,10 +914,44 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 4 — the user's submitted answer. KEYED BY THE EXACT `question` STRING (derive folds by it).
-    // The value matches NO option label → this is the "Other…" free-text demonstration: derive sets
-    // the card's `answers` and the working indicator clears.
-    tMs: 3600,
+    // OVERLAY — pause+pulse the question card for ~2s so the viewer reads it before the answer is entered.
+    tMs: B2_QUESTION_PULSE_FROM,
+    frame: {
+      t: "pulse",
+      target: ".conv-question",
+      fromMs: B2_QUESTION_PULSE_FROM,
+      toMs: B2_QUESTION_PULSE_TO,
+    },
+  },
+  {
+    // OVERLAY — drive the ANSWER through the card's Other input: field_type into [data-other="text"].
+    // The reconciler auto-checks the Other toggle when this selector has field text (setQuestionAnswerUI
+    // from projectFieldText), un-hiding the real Other input — a pure fn of T that resets on back-scrub.
+    tMs: B2_ANSWER_TYPE_FROM,
+    frame: {
+      t: "field_type",
+      target: '[data-other="text"]',
+      text: PLATFORM_ANSWER,
+      fromMs: B2_ANSWER_TYPE_FROM,
+      toMs: B2_ANSWER_TYPE_TO,
+    },
+  },
+  {
+    // OVERLAY — the cursor travels to the question card's submit button.
+    tMs: B2_SUBMIT_MOVE_MS,
+    frame: { t: "cursor_move", target: ".conv-question-submit", moveMs: 400 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on .conv-question-submit (the real submit is never dispatched; the fold
+    // below is frame-driven).
+    tMs: B2_SUBMIT_CLICK_MS,
+    frame: { t: "cursor_click", target: ".conv-question-submit" },
+  },
+  {
+    // seq 4 — the user's submitted answer (the SOURCE OF TRUTH for the fold). KEYED BY THE EXACT
+    // `question` STRING (derive folds by it). The value matches NO option label → the "Other…" free-text
+    // demonstration: derive sets the card's `answers` and the working indicator clears.
+    tMs: B2_ANSWER_MS,
     frame: {
       t: "question_answered",
       id: QUESTION_ID,
@@ -524,17 +960,25 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 5 — DEMO-AUTHORED echo: a standalone user bubble carrying the SAME free-text the user typed.
-    // In the real app an "Other" pick folds onto the question card ONLY (no separate bubble); this echo
-    // exists purely so the demo also shows the typed answer as a chat bubble. Shares the answer's tMs.
-    tMs: 3600,
+    // seq 5 — DEMO-AUTHORED echo: a standalone user bubble carrying the SAME free-text. Shares the
+    // answer's tMs (they land together).
+    tMs: B2_ANSWER_MS,
     frame: { t: "user_message", seq: 5, text: PLATFORM_ANSWER },
   },
 
-  // ---- Chapter "Scope recon" -------------------------------------------------------------------
+  // ================================================================================================
+  // Chapter "Scope recon" — Beat 3: ~20 atomic leaf tool pairs under the scope-recon Task
+  // ================================================================================================
+  //
+  // The assistant launches a `scope-recon` SUBAGENT (a Task). A `subagent_started` frame LABELS the
+  // group. Inside it the subagent runs ~20 LEAF tool pairs (Glob×3 / Read×8 / Grep×4 / Bash×3) plus two
+  // intermediate in-group notes, EACH tool_use+tool_result pair sharing a tMs (atomic — no lingering
+  // "running" leaf, so the no-stuck-tool invariant holds). The Task's OWN deferred tool_result lands at
+  // the group's END, flipping the top-level Task running→done. All leaves carry parent_tool_use_id =
+  // TASK_ID. File names/patterns are realistic for a React-Native trail app.
   {
     // seq 6 — the assistant acknowledges and starts scoping (streams via revealMs 1000).
-    tMs: 4600,
+    tMs: B3_ACK_MS,
     chapterLabel: "Scope recon",
     frame: {
       t: "conv",
@@ -549,8 +993,8 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
   },
   {
     // seq 7 — the Task tool_use that launches the `scope-recon` subagent. Top-level (parent null). Its
-    // OWN result is DEFERRED to seq 18 (the group's end) — so the Task spans the whole group.
-    tMs: 5800,
+    // OWN result is DEFERRED to the group's end — so the Task SPANS the whole group.
+    tMs: B3_TASK_MS,
     frame: {
       t: "conv",
       ev: {
@@ -562,7 +1006,7 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
           description: "Scope the Trailhead source tree",
           subagent_type: "scope-recon",
           prompt:
-            "Survey the Trailhead React-Native source: map the navigation layer, the screens, and where trail data lives. Report a concise summary.",
+            "Survey the Trailhead React-Native source: map the navigation layer, the screens, the components, and where trail data lives. Report a concise summary.",
         },
         parent_tool_use_id: null,
       },
@@ -570,9 +1014,8 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
   },
   {
     // seq 8 — a `subagent_started` frame LABELS the group (header → "scope-recon"). Keyed by
-    // tool_use_id = TASK_ID (= the group key = every child's parent_tool_use_id). Produces NO timeline
-    // node; it seeds the group metadata. (This is the widened-Extract conv frame.)
-    tMs: 5800,
+    // tool_use_id = TASK_ID. Produces NO timeline node; it seeds the group metadata.
+    tMs: B3_TASK_MS,
     frame: {
       t: "conv",
       ev: {
@@ -582,13 +1025,13 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
         subagent_type: "scope-recon",
         description: "Scope the Trailhead source tree",
         prompt:
-          "Survey the Trailhead React-Native source: map the navigation layer, the screens, and where trail data lives. Report a concise summary.",
+          "Survey the Trailhead React-Native source: map the navigation layer, the screens, the components, and where trail data lives. Report a concise summary.",
       },
     },
   },
   {
-    // seq 9 — the subagent's first words (INSIDE the group, parent = TASK_ID). Non-empty so it renders.
-    tMs: 6100,
+    // seq 9 — the subagent's first words (INSIDE the group, parent = TASK_ID).
+    tMs: B3_FIRSTWORDS_MS,
     frame: {
       t: "conv",
       revealMs: 800,
@@ -601,45 +1044,147 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 10 — LEAF tool: Glob for screen components (inside the group). Atomic with its result (seq 11).
-    tMs: 7000,
+    // seq 10 — LEAF Glob (inside the group, parent = TASK_ID). Atomic with its result (seq 11).
+    tMs: B3_LEAF_START_MS,
     frame: {
       t: "conv",
       ev: {
         seq: 10,
         kind: "tool_use",
-        id: GLOB_ID,
+        id: "toolu_th_sr_10",
         tool: "Glob",
-        input: { pattern: "src/**/*.tsx" },
+        input: { pattern: "src/screens/**/*.tsx" },
         parent_tool_use_id: TASK_ID,
       },
     },
   },
   {
     // seq 11 — Glob result (SAME tMs as seq 10 = atomic; the leaf never lingers "running").
-    tMs: 7000,
+    tMs: B3_LEAF_START_MS,
     frame: {
       t: "conv",
       ev: {
         seq: 11,
         kind: "tool_result",
-        tool_use_id: GLOB_ID,
-        content:
-          "src/navigation/RootNavigator.tsx\nsrc/navigation/TabBar.tsx\nsrc/screens/TrailListScreen.tsx\nsrc/screens/TrailDetailScreen.tsx\nsrc/screens/LogHikeScreen.tsx",
+        tool_use_id: "toolu_th_sr_10",
+        content: "src/screens/TrailListScreen.tsx\nsrc/screens/TrailDetailScreen.tsx\nsrc/screens/LogHikeScreen.tsx\nsrc/screens/MapScreen.tsx\nsrc/screens/SettingsScreen.tsx\nsrc/screens/ProfileScreen.tsx\nsrc/screens/SearchScreen.tsx\nsrc/screens/OnboardingScreen.tsx",
         is_error: false,
         parent_tool_use_id: TASK_ID,
       },
     },
   },
   {
-    // seq 12 — LEAF tool: Read the root navigator (inside the group). Atomic with its result (seq 13).
-    tMs: 7800,
+    // seq 12 — LEAF Glob (inside the group, parent = TASK_ID). Atomic with its result (seq 13).
+    tMs: B3_LEAF_START_MS + 1 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
         seq: 12,
         kind: "tool_use",
-        id: READ_ID,
+        id: "toolu_th_sr_12",
+        tool: "Glob",
+        input: { pattern: "src/navigation/**/*.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 13 — Glob result (SAME tMs as seq 12 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 1 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 13,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_12",
+        content: "src/navigation/RootNavigator.tsx\nsrc/navigation/TabNavigator.tsx",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 14 — LEAF Glob (inside the group, parent = TASK_ID). Atomic with its result (seq 15).
+    tMs: B3_LEAF_START_MS + 2 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 14,
+        kind: "tool_use",
+        id: "toolu_th_sr_14",
+        tool: "Glob",
+        input: { pattern: "src/components/**/*.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 15 — Glob result (SAME tMs as seq 14 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 2 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 15,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_14",
+        content: "src/components/TrailCard.tsx\nsrc/components/DifficultyBadge.tsx\nsrc/components/ElevationSparkline.tsx\nsrc/components/SearchBar.tsx",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 16 — LEAF Glob (inside the group, parent = TASK_ID). Atomic with its result (seq 17).
+    tMs: B3_LEAF_START_MS + 3 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 16,
+        kind: "tool_use",
+        id: "toolu_th_sr_16",
+        tool: "Glob",
+        input: { pattern: "src/data/**/*.{ts,json}" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 17 — Glob result (SAME tMs as seq 16 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 3 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 17,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_16",
+        content: "src/data/TrailRepository.ts\nsrc/data/trails.json\nsrc/data/useTrails.ts",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 18 — INTERMEDIATE in-group note (parent = TASK_ID).
+    tMs: B3_LEAF_START_MS + 4 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 18,
+        kind: "assistant_text",
+        text: "Navigation maps cleanly: a root native-stack wrapping a 4-tab bottom navigator.",
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 19 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 20).
+    tMs: B3_LEAF_START_MS + 5 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 19,
+        kind: "tool_use",
+        id: "toolu_th_sr_19",
         tool: "Read",
         input: { file_path: "src/navigation/RootNavigator.tsx" },
         parent_tool_use_id: TASK_ID,
@@ -647,30 +1192,282 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 13 — Read result (atomic with seq 12).
-    tMs: 7800,
+    // seq 20 — Read result (SAME tMs as seq 19 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 5 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
-        seq: 13,
+        seq: 20,
         kind: "tool_result",
-        tool_use_id: READ_ID,
-        content:
-          "import { createNativeStackNavigator } from '@react-navigation/native-stack';\n\nconst Stack = createNativeStackNavigator();\n\nexport function RootNavigator() {\n  return (\n    <Stack.Navigator>\n      <Stack.Screen name=\"TrailList\" component={TrailListScreen} />\n      <Stack.Screen name=\"TrailDetail\" component={TrailDetailScreen} />\n    </Stack.Navigator>\n  );\n}",
+        tool_use_id: "toolu_th_sr_19",
+        content: "import { createNativeStackNavigator } from '@react-navigation/native-stack';\n\nconst Stack = createNativeStackNavigator();\n\nexport function RootNavigator() {\n  return (\n    <Stack.Navigator>\n      <Stack.Screen name=\"Tabs\" component={TabNavigator} />\n      <Stack.Screen name=\"TrailDetail\" component={TrailDetailScreen} />\n    </Stack.Navigator>\n  );\n}",
         is_error: false,
         parent_tool_use_id: TASK_ID,
       },
     },
   },
   {
-    // seq 14 — LEAF tool: Grep for the navigator factory (inside the group). Atomic with seq 15.
-    tMs: 8500,
+    // seq 21 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 22).
+    tMs: B3_LEAF_START_MS + 6 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
-        seq: 14,
+        seq: 21,
         kind: "tool_use",
-        id: GREP_ID,
+        id: "toolu_th_sr_21",
+        tool: "Read",
+        input: { file_path: "src/navigation/TabNavigator.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 22 — Read result (SAME tMs as seq 21 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 6 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 22,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_21",
+        content: "const Tab = createBottomTabNavigator();\n\nexport function TabNavigator() {\n  return (\n    <Tab.Navigator>\n      <Tab.Screen name=\"Trails\" component={TrailListScreen} />\n      <Tab.Screen name=\"Map\" component={MapScreen} />\n      <Tab.Screen name=\"Log\" component={LogHikeScreen} />\n      <Tab.Screen name=\"Profile\" component={ProfileScreen} />\n    </Tab.Navigator>\n  );\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 23 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 24).
+    tMs: B3_LEAF_START_MS + 7 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 23,
+        kind: "tool_use",
+        id: "toolu_th_sr_23",
+        tool: "Read",
+        input: { file_path: "src/screens/TrailListScreen.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 24 — Read result (SAME tMs as seq 23 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 7 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 24,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_23",
+        content: "export function TrailListScreen({ navigation }) {\n  const { trails } = useTrails();\n  return (\n    <FlatList\n      data={trails}\n      renderItem={({ item }) => <TrailCard trail={item} onPress={() => navigation.navigate('TrailDetail', { id: item.id })} />}\n    />\n  );\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 25 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 26).
+    tMs: B3_LEAF_START_MS + 8 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 25,
+        kind: "tool_use",
+        id: "toolu_th_sr_25",
+        tool: "Read",
+        input: { file_path: "src/screens/TrailDetailScreen.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 26 — Read result (SAME tMs as seq 25 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 8 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 26,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_25",
+        content: "export function TrailDetailScreen({ route }) {\n  const trail = useTrail(route.params.id);\n  // TODO: header + difficulty badge, elevation chart, reviews, save/share\n  return <ScrollView><Text>{trail.name}</Text></ScrollView>;\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 27 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 28).
+    tMs: B3_LEAF_START_MS + 9 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 27,
+        kind: "tool_use",
+        id: "toolu_th_sr_27",
+        tool: "Read",
+        input: { file_path: "src/components/TrailCard.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 28 — Read result (SAME tMs as seq 27 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 9 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 28,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_27",
+        content: "export function TrailCard({ trail, onPress }) {\n  return (\n    <Pressable onPress={onPress} style={styles.card}>\n      <Image source={{ uri: trail.thumb }} style={styles.thumb} />\n      <Text style={styles.title}>{trail.name}</Text>\n      <Text style={styles.meta}>{trail.distance} mi · {trail.gain} ft</Text>\n    </Pressable>\n  );\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 29 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 30).
+    tMs: B3_LEAF_START_MS + 10 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 29,
+        kind: "tool_use",
+        id: "toolu_th_sr_29",
+        tool: "Read",
+        input: { file_path: "src/components/DifficultyBadge.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 30 — Read result (SAME tMs as seq 29 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 10 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 30,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_29",
+        content: "export function DifficultyBadge({ level }) {\n  const color = DIFFICULTY_COLORS[level];\n  return <View style={[styles.badge, { backgroundColor: color }]}><Text>{level}</Text></View>;\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 31 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 32).
+    tMs: B3_LEAF_START_MS + 11 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 31,
+        kind: "tool_use",
+        id: "toolu_th_sr_31",
+        tool: "Read",
+        input: { file_path: "src/data/TrailRepository.ts" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 32 — Read result (SAME tMs as seq 31 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 11 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 32,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_31",
+        content: "export class TrailRepository {\n  async list(): Promise<Trail[]> { return seed; }\n  async byId(id: string): Promise<Trail> { return seed.find((t) => t.id === id)!; }\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 33 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 34).
+    tMs: B3_LEAF_START_MS + 12 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 33,
+        kind: "tool_use",
+        id: "toolu_th_sr_33",
+        tool: "Read",
+        input: { file_path: "src/data/useTrails.ts" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 34 — Read result (SAME tMs as seq 33 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 12 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 34,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_33",
+        content: "export function useTrails() {\n  const [trails, setTrails] = useState<Trail[]>([]);\n  useEffect(() => { repo.list().then(setTrails); }, []);\n  return { trails };\n}",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 35 — LEAF Read (inside the group, parent = TASK_ID). Atomic with its result (seq 36).
+    tMs: B3_LEAF_START_MS + 13 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 35,
+        kind: "tool_use",
+        id: "toolu_th_sr_35",
+        tool: "Read",
+        input: { file_path: "src/data/trails.json" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 36 — Read result (SAME tMs as seq 35 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 13 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 36,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_35",
+        content: "[{ \"id\": \"eagle-ridge\", \"name\": \"Eagle Ridge Loop\", \"distance\": 5.2, \"gain\": 1200, \"difficulty\": \"moderate\" }]",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 37 — INTERMEDIATE in-group note (parent = TASK_ID).
+    tMs: B3_LEAF_START_MS + 14 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 37,
+        kind: "assistant_text",
+        text: "Trail data flows TrailRepository → useTrails → TrailListScreen → TrailCard; difficulty palette is shared.",
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 38 — LEAF Grep (inside the group, parent = TASK_ID). Atomic with its result (seq 39).
+    tMs: B3_LEAF_START_MS + 15 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 38,
+        kind: "tool_use",
+        id: "toolu_th_sr_38",
         tool: "Grep",
         input: { pattern: "createNativeStackNavigator", output_mode: "files_with_matches" },
         parent_tool_use_id: TASK_ID,
@@ -678,14 +1475,14 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 15 — Grep result (atomic with seq 14).
-    tMs: 8500,
+    // seq 39 — Grep result (SAME tMs as seq 38 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 15 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
-        seq: 15,
+        seq: 39,
         kind: "tool_result",
-        tool_use_id: GREP_ID,
+        tool_use_id: "toolu_th_sr_38",
         content: "src/navigation/RootNavigator.tsx",
         is_error: false,
         parent_tool_use_id: TASK_ID,
@@ -693,14 +1490,104 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 16 — LEAF tool: Bash list the screens dir (inside the group). Atomic with seq 17.
-    tMs: 9200,
+    // seq 40 — LEAF Grep (inside the group, parent = TASK_ID). Atomic with its result (seq 41).
+    tMs: B3_LEAF_START_MS + 16 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
-        seq: 16,
+        seq: 40,
         kind: "tool_use",
-        id: BASH_ID,
+        id: "toolu_th_sr_40",
+        tool: "Grep",
+        input: { pattern: "useTrails", output_mode: "files_with_matches" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 41 — Grep result (SAME tMs as seq 40 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 16 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 41,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_40",
+        content: "src/screens/TrailListScreen.tsx\nsrc/data/useTrails.ts",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 42 — LEAF Grep (inside the group, parent = TASK_ID). Atomic with its result (seq 43).
+    tMs: B3_LEAF_START_MS + 17 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 42,
+        kind: "tool_use",
+        id: "toolu_th_sr_42",
+        tool: "Grep",
+        input: { pattern: "DIFFICULTY_COLORS", output_mode: "files_with_matches" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 43 — Grep result (SAME tMs as seq 42 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 17 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 43,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_42",
+        content: "src/components/DifficultyBadge.tsx\nsrc/theme/difficulty.ts",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 44 — LEAF Grep (inside the group, parent = TASK_ID). Atomic with its result (seq 45).
+    tMs: B3_LEAF_START_MS + 18 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 44,
+        kind: "tool_use",
+        id: "toolu_th_sr_44",
+        tool: "Grep",
+        input: { pattern: "difficulty", output_mode: "files_with_matches" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 45 — Grep result (SAME tMs as seq 44 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 18 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 45,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_44",
+        content: "src/components/DifficultyBadge.tsx\nsrc/data/trails.json\nsrc/theme/difficulty.ts",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 46 — LEAF Bash (inside the group, parent = TASK_ID). Atomic with its result (seq 47).
+    tMs: B3_LEAF_START_MS + 19 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 46,
+        kind: "tool_use",
+        id: "toolu_th_sr_46",
         tool: "Bash",
         input: { command: "ls src/screens" },
         parent_tool_use_id: TASK_ID,
@@ -708,162 +1595,393 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 17 — Bash result (atomic with seq 16).
-    tMs: 9200,
+    // seq 47 — Bash result (SAME tMs as seq 46 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 19 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
-        seq: 17,
+        seq: 47,
         kind: "tool_result",
-        tool_use_id: BASH_ID,
-        content:
-          "MapScreen.tsx\nLogHikeScreen.tsx\nSettingsScreen.tsx\nTrailDetailScreen.tsx\nTrailListScreen.tsx\nProfileScreen.tsx",
+        tool_use_id: "toolu_th_sr_46",
+        content: "LogHikeScreen.tsx\nMapScreen.tsx\nOnboardingScreen.tsx\nProfileScreen.tsx\nSearchScreen.tsx\nSettingsScreen.tsx\nTrailDetailScreen.tsx\nTrailListScreen.tsx",
         is_error: false,
         parent_tool_use_id: TASK_ID,
       },
     },
   },
   {
-    // seq 18 — the subagent's closing summary text (inside the group).
-    tMs: 10000,
+    // seq 48 — LEAF Bash (inside the group, parent = TASK_ID). Atomic with its result (seq 49).
+    tMs: B3_LEAF_START_MS + 20 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
-      revealMs: 1200,
       ev: {
-        seq: 18,
-        kind: "assistant_text",
-        text: "Mapped it: navigation in src/navigation, six screens in src/screens, trail data in src/data.",
+        seq: 48,
+        kind: "tool_use",
+        id: "toolu_th_sr_48",
+        tool: "Bash",
+        input: { command: "ls src/data" },
         parent_tool_use_id: TASK_ID,
       },
     },
   },
   {
-    // seq 19 — the Task's OWN tool_result (top-level, tool_use_id = TASK_ID). LOAD-BEARING: this is what
-    // flips the top-level Task tool node running→done. WITHOUT it the Task row stays status:"running" at
-    // T = duration and the no-stuck-tool invariant fails. (The Task is the ONLY non-atomic tool — its
-    // result is deferred to here, the group's end.)
-    tMs: 10800,
+    // seq 49 — Bash result (SAME tMs as seq 48 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 20 * B3_LEAF_STEP_MS,
     frame: {
       t: "conv",
       ev: {
-        seq: 19,
+        seq: 49,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_48",
+        content: "TrailRepository.ts\ntrails.json\nuseTrails.ts",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 50 — LEAF Bash (inside the group, parent = TASK_ID). Atomic with its result (seq 51).
+    tMs: B3_LEAF_START_MS + 21 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 50,
+        kind: "tool_use",
+        id: "toolu_th_sr_50",
+        tool: "Bash",
+        input: { command: "wc -l src/screens/TrailDetailScreen.tsx" },
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 51 — Bash result (SAME tMs as seq 50 = atomic; the leaf never lingers "running").
+    tMs: B3_LEAF_START_MS + 21 * B3_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 51,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_sr_50",
+        content: "9 src/screens/TrailDetailScreen.tsx",
+        is_error: false,
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 52 — the subagent's closing summary text (inside the group).
+    tMs: B3_SUMMARY_MS,
+    frame: {
+      t: "conv",
+      revealMs: 1200,
+      ev: {
+        seq: 52,
+        kind: "assistant_text",
+        text:
+          "Mapped it: native-stack navigation in src/navigation, eight screens in src/screens, shared UI in src/components, and trail data in src/data (TrailRepository + the trails seed).",
+        parent_tool_use_id: TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 53 — the Task's OWN tool_result (top-level, tool_use_id = TASK_ID). LOAD-BEARING: this is what
+    // flips the top-level Task tool node running→done. WITHOUT it the Task row stays status:"running" at
+    // T = duration and the no-stuck-tool invariant fails. (The Task is the ONLY non-atomic tool.)
+    tMs: B3_TASK_RESULT_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 53,
         kind: "tool_result",
         tool_use_id: TASK_ID,
         content:
-          "Scope recon complete. Navigation: native-stack in src/navigation (RootNavigator + TabBar). Screens: six under src/screens (TrailList, TrailDetail, LogHike, Map, Settings, Profile). Trail data lives in src/data.",
+          "Scope recon complete. Navigation: native-stack in src/navigation (RootNavigator + TabNavigator). Screens: eight under src/screens. Components: TrailCard, DifficultyBadge, ElevationSparkline in src/components. Trail data: src/data (TrailRepository + trails.json seed + the useTrails hook).",
         is_error: false,
         parent_tool_use_id: null,
       },
     },
   },
   {
-    // seq 20 — the assistant's top-level wrap-up (streams via revealMs 1000).
-    tMs: 11600,
+    // seq 54 — the assistant's top-level wrap-up (streams via revealMs 1000).
+    tMs: B3_WRAPUP_MS,
     frame: {
       t: "conv",
       revealMs: 1000,
       ev: {
-        seq: 20,
+        seq: 54,
         kind: "assistant_text",
-        text: "Scope recon complete — I have what I need to draft the plan.",
+        text: "Scope recon complete — I have what I need to right-size the plan.",
         parent_tool_use_id: null,
       },
     },
   },
 
-  // ---- Chapter "Prototype review" --------------------------------------------------------------
+  // ================================================================================================
+  // Chapter "Plan sizer" — Beat 4 (NEW): the right-sizing gate before the plan is drafted
+  // ================================================================================================
+  //
+  // Between scope-recon and the drafted plan the assistant runs a `plan-sizer` Task whose result returns
+  // the split decision ("master + 3 subplans; subplan 04 decomposed into 4 leaves"). The Task's tool_use
+  // and tool_result share a tMs (ATOMIC — no lingering running leaf, so the no-stuck-tool invariant
+  // holds). A brief pulse draws the eye to the plan-sizer row.
   {
-    // seq 21 — the assistant narrates the visual prototype (streams via revealMs 700). This bubble
-    // lives on the Conversation tab; the prototype itself paints on the Plan tab (see the bracket).
-    tMs: 13000,
-    chapterLabel: "Prototype review",
+    // seq 55 — short narration announcing the right-sizing gate (streams via revealMs 900).
+    tMs: B4_NARRATION_MS,
+    chapterLabel: "Plan sizer",
     frame: {
       t: "conv",
-      revealMs: 700,
+      revealMs: 900,
       ev: {
-        seq: 21,
+        seq: 55,
         kind: "assistant_text",
-        text:
-          "I put together a quick visual prototype of the Trailhead flow — here's how a hike search moves through the screens.",
+        text: "Before drafting, I'll right-size the work so each plan stays focused.",
         parent_tool_use_id: null,
       },
     },
   },
   {
-    // SURFACE — open the prototype-preview plan in the reading pane. This is the OPENING edge of the
-    // open_plan bracket: while a plan is open the reconciler's structural projection makes
-    // activeTab="plan" (the review bar + reading pane live on the Plan tab). Aligned with the gate ON.
-    tMs: 13800,
-    frame: { t: "open_plan", path: PROTO_PREVIEW_PATH },
-  },
-  {
-    // SURFACE — the prototype gate turns ON (round 1): the review bar lights up "Visual prototype —
-    // round 1 of 3". Production's onPrototypeReview force-switches to the Plan tab; here the open_plan
-    // above already drives activeTab="plan", so the gate and the tab agree for the whole window.
-    tMs: 13800,
-    frame: { t: "prototype_gate", on: true, round: 1 },
-  },
-  {
-    // SURFACE — the gate turns OFF (the user reviewed). Closing edge of the gate window.
-    tMs: 15600,
-    frame: { t: "prototype_gate", on: false },
-  },
-  {
-    // SURFACE — close the reading pane (open_plan{path:null}). CLOSING edge of the bracket: with no
-    // plan open the projection flips activeTab back to "conversation", so the reconciler clicks back to
-    // the Conversation tab and the feedback/approval bubbles below are visible. Without this frame the
-    // Plan tab would stay stuck (and the flip-back reconcile assertion goes RED).
-    tMs: 15600,
-    frame: { t: "open_plan", path: null },
-  },
-  {
-    // seq 22 — the user's feedback on the prototype (a standalone user bubble on the Conversation tab).
-    // Shares tMs 16000 with the system approval echo below (they land together).
-    tMs: 16000,
+    // seq 56 — the plan-sizer Task tool_use (top-level). Its `input` describes the right-sizing decision.
+    // ATOMIC with its result (seq 57, SAME tMs) — the plan-sizer is a quick gate, not a spanning group.
+    tMs: B4_SIZER_MS,
     frame: {
-      t: "user_message",
-      seq: 22,
-      text: "Love it — bump the trail-card size and add a difficulty badge.",
+      t: "conv",
+      ev: {
+        seq: 56,
+        kind: "tool_use",
+        id: PLAN_SIZER_ID,
+        tool: "Task",
+        input: {
+          description: "Right-size the Trailhead plan",
+          subagent_type: "plan-sizer",
+          prompt:
+            "Given the scope-recon report (navigation, eight screens, shared components, trail data), decide whether to draft a single plan or split into a master + subplans. Decompose any screen that is itself multi-part.",
+        },
+        parent_tool_use_id: null,
+      },
     },
   },
   {
-    // seq 23 — DEMO-AUTHORED approval echo: a system bubble standing in for the review bar's Approve
-    // click (in the real app clicking "Approve visual" resolves the gate; this echo exists purely so
-    // the demo shows the approval as a chat row, like the seq-5 "Other" answer echo). Shares tMs 16000.
-    tMs: 16000,
+    // seq 57 — the plan-sizer's tool_result (ATOMIC with seq 56). Returns the SPLIT DECISION verbatim.
+    tMs: B4_SIZER_MS,
     frame: {
-      t: "system_message",
-      seq: 23,
-      text: "Prototype approved with feedback — folding the changes into the plan.",
+      t: "conv",
+      ev: {
+        seq: 57,
+        kind: "tool_result",
+        tool_use_id: PLAN_SIZER_ID,
+        content:
+          "Right-sizing decision: SPLIT. Master + 3 subplans (01 navigation, 02 data layer, 03 trail list). Subplan 04 (trail detail) decomposed into 4 leaves: 04.01 header + difficulty badge, 04.02 elevation chart, 04.03 reviews, 04.04 save/share.",
+        is_error: false,
+        parent_tool_use_id: null,
+      },
     },
   },
   {
-    // seq 24 — the assistant acknowledges the feedback (streams via revealMs 1000).
-    tMs: 16800,
+    // OVERLAY — a brief pulse on the plan-sizer Task row (by its data-seq) so the gate reads as deliberate.
+    tMs: B4_SIZER_PULSE_FROM,
+    frame: {
+      t: "pulse",
+      target: '.mockanim-pane [data-seq="56"]',
+      fromMs: B4_SIZER_PULSE_FROM,
+      toMs: B4_SIZER_PULSE_TO,
+    },
+  },
+  {
+    // seq 58 — the assistant narrates the split outcome (streams via revealMs 1000).
+    tMs: B4_OUTCOME_MS,
     frame: {
       t: "conv",
       revealMs: 1000,
       ev: {
-        seq: 24,
+        seq: 58,
+        kind: "assistant_text",
+        text:
+          "Right-sized: a master with three subplans, and the trail-detail screen split into four leaves (including that difficulty badge).",
+        parent_tool_use_id: null,
+      },
+    },
+  },
+  // ---- Chapter "Prototype review" (P4: the scripted prototype ACT) -----------------------------
+  //
+  // The assistant narrates a visual prototype; the storyboard then PLAYS the act: pulse the narration
+  // bubble (a ~2s read), show the ROUND-1 trail card (an HTML overlay, #demo-proto-card) over the
+  // reading pane + pulse it, TYPE the feedback into #prototype-feedback over ~2.5s, cosmetic-click
+  // #review-submit, MORPH to the ROUND-2 card (larger + difficulty badge, driven by prototype_gate
+  // round:2) + pulse it, then cosmetic-click #review-approve. The card round is DERIVED from the
+  // prototype_gate projection (reconcileProtoCard: round 1|2 while on, null while off), so the round-2
+  // gate frame is what re-renders the bigger badged card — no separate card signal. All clicks are
+  // COSMETIC (the named state change is frame-driven); the reconciler owns the card + the gate.
+  {
+    // seq 59 — the assistant narrates the visual prototype (streams via revealMs 700). Conversation tab.
+    tMs: PROTO_NARR_MS,
+    chapterLabel: "Prototype review",
+    frame: {
+      t: "conv",
+      revealMs: 700,
+      ev: {
+        seq: 59,
+        kind: "assistant_text",
+        text:
+          "I put together a quick visual prototype of the Trailhead trail card — take a look.",
+        parent_tool_use_id: null,
+      },
+    },
+  },
+  {
+    // SURFACE — open the prototype-preview BACKDROP plan in the reading pane (OPENING edge of the bracket:
+    // a plan being open makes activeTab="plan"). The trail-card overlay floats over this pane. (Ordered
+    // before the narration pulse below so the array stays tMs-monotonic: PROTO_OPEN_MS < PROTO_NARR_PULSE_FROM.)
+    tMs: PROTO_OPEN_MS,
+    frame: { t: "open_plan", path: PROTO_PREVIEW_PATH },
+  },
+  {
+    // SURFACE — the prototype gate turns ON (round 1): the review bar lights up AND reconcileProtoCard
+    // shows the ROUND-1 trail card (#demo-proto-card, TRAILHEAD_PROTO_CARD_R1_HTML) over the pane.
+    tMs: PROTO_OPEN_MS,
+    frame: { t: "prototype_gate", on: true, round: 1 },
+  },
+  {
+    // OVERLAY — pulse the narration bubble (by its data-seq) for ~2s: a real DWELL so the viewer reads it
+    // (the card has just appeared on the Plan side). The bubble lives under the player pane →
+    // `.mockanim-pane [data-seq="59"]`.
+    tMs: PROTO_NARR_PULSE_FROM,
+    frame: {
+      t: "pulse",
+      target: '.mockanim-pane [data-seq="59"]',
+      fromMs: PROTO_NARR_PULSE_FROM,
+      toMs: PROTO_NARR_PULSE_TO,
+    },
+  },
+  {
+    // OVERLAY — pulse the round-1 card (#demo-proto-card) for ~2s so the viewer takes it in.
+    tMs: PROTO_CARD1_PULSE_FROM,
+    frame: { t: "pulse", target: "#demo-proto-card", fromMs: PROTO_CARD1_PULSE_FROM, toMs: PROTO_CARD1_PULSE_TO },
+  },
+  {
+    // OVERLAY — the cursor travels to the inline feedback textarea (visible while the gate is on).
+    tMs: PROTO_FEEDBACK_MOVE_MS,
+    frame: { t: "cursor_move", target: "#prototype-feedback", moveMs: 500 },
+  },
+  {
+    // OVERLAY — the user TYPES the feedback into #prototype-feedback over ~2.5s. field_type dispatches a
+    // real `input` event, which (harmlessly + faithfully) enables #review-submit ("Request changes").
+    tMs: PROTO_FEEDBACK_TYPE_FROM,
+    frame: {
+      t: "field_type",
+      target: "#prototype-feedback",
+      text: TRAILHEAD_PROTO_FEEDBACK,
+      fromMs: PROTO_FEEDBACK_TYPE_FROM,
+      toMs: PROTO_FEEDBACK_TYPE_TO,
+    },
+  },
+  {
+    // OVERLAY — pulse #prototype-feedback across the typing window (draws the eye to the field being typed).
+    tMs: PROTO_FEEDBACK_TYPE_FROM,
+    frame: { t: "pulse", target: "#prototype-feedback", fromMs: PROTO_FEEDBACK_TYPE_FROM, toMs: PROTO_FEEDBACK_TYPE_TO },
+  },
+  {
+    // OVERLAY — the cursor travels to the "Request changes" button (#review-submit).
+    tMs: PROTO_SUBMIT_MOVE_MS,
+    frame: { t: "cursor_move", target: "#review-submit", moveMs: 300 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #review-submit (the real refine handler is never triggered; the card
+    // morph below is frame-driven via the round-2 gate).
+    tMs: PROTO_SUBMIT_CLICK_MS,
+    frame: { t: "cursor_click", target: "#review-submit" },
+  },
+  {
+    // SURFACE — the gate ADVANCES to round 2: reconcileGate re-emits at the new round AND reconcileProtoCard
+    // re-renders the card from TRAILHEAD_PROTO_CARD_R2_HTML — VISIBLY LARGER (--tc-scale bump) with a green
+    // "Moderate" difficulty badge. This is the on-screen result of the typed feedback (frame-driven, the
+    // #review-submit click above being cosmetic).
+    tMs: PROTO_ROUND2_MS,
+    frame: { t: "prototype_gate", on: true, round: 2 },
+  },
+  {
+    // OVERLAY — pulse the morphed round-2 card (#demo-proto-card) for ~2s: a pause to register the change.
+    tMs: PROTO_CARD2_PULSE_FROM,
+    frame: { t: "pulse", target: "#demo-proto-card", fromMs: PROTO_CARD2_PULSE_FROM, toMs: PROTO_CARD2_PULSE_TO },
+  },
+  {
+    // OVERLAY — the cursor travels to the "Approve visual" button (#review-approve).
+    tMs: PROTO_APPROVE_MOVE_MS,
+    frame: { t: "cursor_move", target: "#review-approve", moveMs: 300 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #review-approve (the real approve handler is never triggered; the
+    // gate-off + pane-close below are frame-driven).
+    tMs: PROTO_APPROVE_CLICK_MS,
+    frame: { t: "cursor_click", target: "#review-approve" },
+  },
+  {
+    // SURFACE — the gate turns OFF (closing edge): reconcileProtoCard hides the card (round → null).
+    tMs: PROTO_CLOSE_MS,
+    frame: { t: "prototype_gate", on: false },
+  },
+  {
+    // SURFACE — close the reading pane (open_plan{null}). CLOSING edge of the bracket: activeTab flips
+    // back to "conversation" so the feedback/approval bubbles below are visible.
+    tMs: PROTO_CLOSE_MS,
+    frame: { t: "open_plan", path: null },
+  },
+  {
+    // seq 60 — the user's feedback now appears as a chat bubble (the SAME text just typed into
+    // #prototype-feedback). Lands with the approval echo below.
+    tMs: PROTO_FEEDBACK_MS,
+    frame: {
+      t: "user_message",
+      seq: 60,
+      text: TRAILHEAD_PROTO_FEEDBACK,
+    },
+  },
+  {
+    // seq 61 — DEMO-AUTHORED approval echo: a system bubble standing in for the review bar's Approve
+    // click (in the real app clicking "Approve visual" resolves the gate; this echo shows it as a chat row).
+    tMs: PROTO_FEEDBACK_MS,
+    frame: {
+      t: "system_message",
+      seq: 61,
+      text: "Prototype approved with feedback — folding the changes into the plan.",
+    },
+  },
+  {
+    // seq 62 — the assistant acknowledges the feedback (streams via revealMs 1000).
+    tMs: PROTO_ACK_MS,
+    frame: {
+      t: "conv",
+      revealMs: 1000,
+      ev: {
+        seq: 62,
         kind: "assistant_text",
         text: "On it — larger trail cards and a difficulty badge. Drafting the plan now.",
         parent_tool_use_id: null,
       },
     },
   },
+];
 
+// ---- DOWNSTREAM (P4-shifted): nested plan … comment & iterate … execution … terminal ------------
+//
+// These chapters keep their ORIGINAL shape + seqs but are shifted by + PROTO_ACT_SHIFT in tMs (the P4
+// prototype ACT above is longer than the original instant feedback). The shift is applied PROGRAMMATICALLY
+// by the .map at the bottom (never hand-edited literals) — exactly the named-constant discipline P3 used
+// for EXEC_SHIFT, extended one level. Every tMs literal below is written at its pre-PROTO_ACT_SHIFT value
+// (= old + EXEC_SHIFT); the .map adds PROTO_ACT_SHIFT so the tests can pin `old + EXEC_SHIFT + PROTO_ACT_SHIFT`.
+const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
   // ---- Chapter "Nested plan" -------------------------------------------------------------------
   {
     // seq 25 — the assistant announces the drafted plan tree (streams via revealMs ~1200). This bubble
     // lives on the Conversation tab and narrates the nested plan the storyboard is about to reveal in
     // the sidebar (plan_changed below) + open in the reading pane (open_plan below).
-    tMs: 19000,
+    tMs: 45800,
     chapterLabel: "Nested plan",
     frame: {
       t: "conv",
       revealMs: 1200,
       ev: {
-        seq: 25,
+        seq: 63,
         kind: "assistant_text",
         text:
           "Here's the plan — a master with three subplans, plus a decomposition of the trail-detail screen into four leaves (including that difficulty badge you asked for).",
@@ -875,38 +1993,123 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     // SURFACE — the drafted Trailhead plan tree pops into the (until-now empty) sidebar: master + four
     // subs + four 04.* leaves. projectSurfaceState takes the last-≤-T plan_changed, so for any T in
     // [0, 19800) the sidebar is [] and for T ≥ 19800 it is TRAILHEAD_PLANS (a clean reveal).
-    tMs: 19800,
+    tMs: 46600,
     frame: { t: "plan_changed", plans: TRAILHEAD_PLANS },
   },
   {
     // SURFACE — open the master plan in the reading pane. LEFT OPEN (no closing open_plan{null}): the
     // beat ENDS on the still-open master, so activeTab stays "plan" and the master doc + its mermaid
     // decomposition diagram remain on screen at duration. Slice 06 comments on this still-open plan.
-    tMs: 20200,
+    tMs: 47000,
     frame: { t: "open_plan", path: TRAILHEAD_MASTER_PATH },
   },
 
-  // ---- Chapter "Comment & iterate" -------------------------------------------------------------
+  // ---- Chapter "Comment & iterate" (P4: the scripted popover ACT) ------------------------------
   //
-  // The master (TRAILHEAD_MASTER_PATH) is still open on the Plan tab. The user now leaves THREE comments
-  // on it, one at a time — each `set_comments` SurfaceFrame projects the FULL comment set for that path,
-  // so projectSurfaceState.comments grows 1 → 2 → 3 and the reconciler's applyComments paints that many
-  // inline `.cmt-hl` highlights into the reading pane. HIGHLIGHTS-ONLY: no pending_reviews frame, no
-  // review-bar count (see the comment consts above — driving the bar would auto-open + wipe highlights).
+  // The master (TRAILHEAD_MASTER_PATH) is still open on the Plan tab. The user now leaves comments on it
+  // — and (P4) the demo SCRIPTS the act for two of them (c1 + c3, which anchor to DISTINCT reading-pane
+  // blocks): the cursor moves to the block, the selection popover opens under it (#sel-popover, driven by
+  // overlay_modal{popover,on,target} — the reconciler is its exclusive writer, setting #sp-quote +
+  // positioning it), it is pulsed, the comment is TYPED into #sp-text, a cosmetic #sp-save click lands,
+  // the popover closes, and THEN the `set_comments` SurfaceFrame paints the persisted `.cmt-hl` highlight
+  // (the SOLE source of truth — the real #sp-save handler stays inert). The comment SET still grows
+  // 1 → 2 → 3 (c2 lands as a plain set_comments between c1's and c3's acts; its quote shares c1's block).
+  // HIGHLIGHTS-ONLY: no pending_reviews frame (driving the review bar would auto-open + wipe highlights).
+  //
+  // The popover anchor selectors are stable reading-pane blocks by `data-source-line` (the V1 master's
+  // Context paragraph = line 4 carries c1's quote; the closing paragraph = line 53 carries c3's quote).
+
+  // ---- Comment 1 act (anchors to the Context paragraph, data-source-line="4") ----
   {
-    // SURFACE — comment 1 lands on the open V1 master (1 highlight).
-    tMs: 22000,
+    // OVERLAY — the cursor travels to the Context block (carries c1's quote).
+    tMs: 48800,
     chapterLabel: "Comment & iterate",
+    frame: { t: "cursor_move", target: '#reading-pane [data-source-line="4"]', moveMs: 400 },
+  },
+  {
+    // OVERLAY — the selection popover opens UNDER that block (reconciler shows #sel-popover, sets
+    // #sp-quote from the block text, positions it). Backward scrub closes it (last-≤-T per kind).
+    tMs: 49200,
+    frame: { t: "overlay_modal", kind: "popover", on: true, target: '#reading-pane [data-source-line="4"]' },
+  },
+  {
+    // OVERLAY — pulse the open popover (~1s).
+    tMs: 49400,
+    frame: { t: "pulse", target: "#sel-popover", fromMs: 49400, toMs: 50600 },
+  },
+  {
+    // OVERLAY — TYPE the comment into #sp-text over ~1.8s (the popover's textarea).
+    tMs: 49600,
+    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_1.comment, fromMs: 49600, toMs: 51400 },
+  },
+  {
+    // OVERLAY — the cursor travels to the popover's save button.
+    tMs: 51500,
+    frame: { t: "cursor_move", target: "#sp-save", moveMs: 300 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #sp-save (the real handler is inert; the highlight is painted by the
+    // set_comments below, the SOLE source of truth).
+    tMs: 51800,
+    frame: { t: "cursor_click", target: "#sp-save" },
+  },
+  {
+    // OVERLAY — the popover closes (frame-driven).
+    tMs: 52000,
+    frame: { t: "overlay_modal", kind: "popover", on: false },
+  },
+  {
+    // SURFACE — comment 1's persisted highlight paints (1 highlight). This lands AFTER the popover act
+    // (the popover-on + typing precede this highlight, the ordering the test asserts).
+    tMs: 52200,
     frame: { t: "set_comments", path: TRAILHEAD_MASTER_PATH, comments: [TRAILHEAD_COMMENT_1] },
   },
   {
-    // SURFACE — comment 2 lands (full set [c1, c2] → 2 highlights).
-    tMs: 22800,
+    // SURFACE — comment 2 lands (full set [c1, c2] → 2 highlights). Its quote shares c1's block, so it is
+    // not separately scripted; it simply grows the persisted set.
+    tMs: 52800,
     frame: { t: "set_comments", path: TRAILHEAD_MASTER_PATH, comments: [TRAILHEAD_COMMENT_1, TRAILHEAD_COMMENT_2] },
   },
+
+  // ---- Comment 3 act (anchors to the closing paragraph, data-source-line="53") ----
   {
-    // SURFACE — comment 3 lands (full set [c1, c2, c3] → 3 highlights).
-    tMs: 23600,
+    // OVERLAY — the cursor travels to the closing block (carries c3's quote, a DISTINCT block from c1/c2).
+    tMs: 53400,
+    frame: { t: "cursor_move", target: '#reading-pane [data-source-line="53"]', moveMs: 400 },
+  },
+  {
+    // OVERLAY — the popover opens under that block.
+    tMs: 53800,
+    frame: { t: "overlay_modal", kind: "popover", on: true, target: '#reading-pane [data-source-line="53"]' },
+  },
+  {
+    // OVERLAY — pulse the popover (~1s).
+    tMs: 54000,
+    frame: { t: "pulse", target: "#sel-popover", fromMs: 54000, toMs: 55200 },
+  },
+  {
+    // OVERLAY — TYPE comment 3 into #sp-text over ~1.8s.
+    tMs: 54200,
+    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_3.comment, fromMs: 54200, toMs: 56000 },
+  },
+  {
+    // OVERLAY — the cursor travels to the save button.
+    tMs: 56100,
+    frame: { t: "cursor_move", target: "#sp-save", moveMs: 300 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #sp-save.
+    tMs: 56400,
+    frame: { t: "cursor_click", target: "#sp-save" },
+  },
+  {
+    // OVERLAY — the popover closes.
+    tMs: 56600,
+    frame: { t: "overlay_modal", kind: "popover", on: false },
+  },
+  {
+    // SURFACE — comment 3's persisted highlight paints (full set [c1, c2, c3] → 3 highlights).
+    tMs: 56800,
     frame: {
       t: "set_comments",
       path: TRAILHEAD_MASTER_PATH,
@@ -914,352 +2117,381 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
+    // OVERLAY — the cursor travels to "Request changes" (#review-submit) to send the comments back.
+    tMs: 57400,
+    frame: { t: "cursor_move", target: "#review-submit", moveMs: 300 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #review-submit ("Request changes"); the V2 load below is frame-driven.
+    tMs: 57700,
+    frame: { t: "cursor_click", target: "#review-submit" },
+  },
+  {
     // SURFACE — switch the reading pane to the REVISED master (V2). No closing open_plan{null} — the
     // master stays open, so the beat ends on the Plan tab showing the revised doc. Because comments are
     // scoped to the OPEN path (projectSurfaceState), and V2 has no set_comments, projectSurfaceState
-    // .comments is [] for T ≥ 24800 (the V1 comments do not paint on V2 — a clean iteration reveal).
-    tMs: 24800,
+    // .comments is [] for T ≥ this frame (the V1 comments do not paint on V2 — a clean iteration reveal).
+    tMs: 58000,
     frame: { t: "open_plan", path: TRAILHEAD_MASTER_V2_PATH },
   },
   {
     // seq 26 — a system echo announcing the revision (a system bubble on the hidden Conversation tab).
-    tMs: 25200,
+    tMs: 58400,
     frame: {
       t: "system_message",
-      seq: 26,
+      seq: 64,
       text: "Revised the plan per your 3 comments — bigger trail cards and a difficulty badge are in.",
     },
   },
+];
 
-  // ---- Chapter "Execution" — the FINAL beat: build the four trail-detail leaves --------------------
-  //
-  // Plan approved → the assistant executes the four 04.* detail leaves FLAT (per-leaf, NO Task wrapper):
-  // each leaf is one Write tool_use/tool_result pair (sharing a tMs = atomic, so the leaf never lingers
-  // "running"), a leaf OUTPUT assistant_text, and a scripted `[context]` system_message that threads the
-  // next leaf. All four leaves' OUTPUT texts (seqs 31/36/41/46) and `[context]` echoes (seqs 32/37/42/47)
-  // are TOP-LEVEL (parent_tool_use_id: null) — they render as standalone bubbles, not nested in a group.
-  //
-  // DEMO-AUTHORED CONTEXT THREADING (load-bearing): the `[context] → NN.NN: …` system_messages are
-  // SCRIPTED storyboard authoring, NOT emitted by a live orchestrator. The real app's multiplan driver
-  // (orchestrator.ts) threads per-leaf context between sub-plans at runtime; here those handoffs are
-  // hand-written so the demo SHOWS the threading without a live driver. Each is the seq-adjacent node
-  // immediately AFTER its leaf's OUTPUT text (the seq-adjacency test pins outSeq→ctxSeq).
+// ---- (P5) EXECUTION CHAPTER — a SEQUENCE OF PER-SUBPLAN SUBAGENTS -------------------------------
+//
+// The plan (master + subplans 01/02/03 + 04 decomposed into 04.01–04.04) is approved → the assistant
+// EXECUTES it. P5 REWROTE this chapter from four flat Write leaves into a SEQUENCE OF SUBAGENTS: each
+// subplan runs via its OWN `Task` subagent — a top-level Task tool_use + a `subagent_started` label +
+// the subplan's 4–6 LEAF tool calls (a realistic Read/Write/Edit/Bash mix) nested under that Task's id,
+// an in-group summary `assistant_text`, and a DEFERRED top-level Task `tool_result` (mirroring the
+// scope-recon Task pattern: the deferred result is what flips the spanning Task running→done). Every
+// leaf tool_use+tool_result pair shares a tMs (ATOMIC — no lingering "running" leaf, so the recursive
+// no-stuck-tool invariant holds).
+//
+// CONTEXT THREADING (load-bearing, replaces P4's hand-wavy `[context]` system echoes): each subplan
+// produces a named ARTIFACT (e.g. 01 → `TrailRepository.ts` exposing a `Trail` type + difficulty
+// palette {easy/moderate/hard}; 04.01 → `<DifficultyBadge>`). The NEXT subplan's launch narration AND
+// its `Task.input.prompt` VERBATIM reference the prior subplan's produced artifact (e.g. 02's prompt
+// "Building on subplan 01's `TrailRepository` …"). This makes "the output of one plan feeds the next"
+// literal and visible (the falsifiable context-threading test asserts the actual substring).
+
+// One leaf tool inside a subplan subagent group. `tool` is the engine tool name; `input` is its tool_use
+// input; `result` is the tool_result content. Read/Write/Edit/Bash mix per subplan.
+interface ExecLeaf {
+  tool: "Read" | "Write" | "Edit" | "Bash";
+  input: Record<string, unknown>;
+  result: string;
+}
+
+// One subplan executed as a Task subagent. `narration` is the top-level launch narration (VERBATIM
+// references `producedBy`-prior artifacts where threaded); `prompt` is the Task.input.prompt (likewise
+// threaded); `summary` is the in-group closing summary naming `artifact`; `taskResult` is the DEFERRED
+// top-level Task tool_result (also naming `artifact`). `leaves` are the 4–6 atomic leaf tool calls.
+interface ExecSubplan {
+  id: string; // subplan id label, e.g. "01" / "04.01"
+  taskId: string; // the Task tool_use id (= the subagent group key)
+  description: string; // Task description / subagent_started description
+  narration: string; // top-level launch narration (threads the prior artifact)
+  prompt: string; // Task.input.prompt (threads the prior artifact)
+  leaves: ExecLeaf[]; // 4–6 atomic leaf tool calls
+  summary: string; // in-group closing summary (names the produced artifact)
+  taskResult: string; // deferred top-level Task tool_result (names the produced artifact)
+}
+
+// The seven subplan subagents, in execution order. Subplans 01/02/03 are top-level subplans; 04.01–04.04
+// are the trail-detail decomposition leaves — each rendered as its OWN Task subagent per the P5 spec.
+// THREADING: every subplan after the first names the IMMEDIATELY-PRIOR subplan's artifact VERBATIM in
+// BOTH its narration AND its Task prompt (the substrings the falsifiable test pins).
+const EXEC_SUBPLANS: ExecSubplan[] = [
   {
-    // SURFACE — the FIRST execution frame: open_plan{null} closes the reading pane (V2 master no longer
-    // shown) so projectSurfaceState flips activeTab "plan"→"conversation" — the execution conversation
-    // takes the foreground for the whole final chapter. Backward scrub reverts cleanly (pure fn of T).
-    tMs: 27000,
-    chapterLabel: "Execution",
-    frame: { t: "open_plan", path: null },
+    id: "01",
+    taskId: "toolu_th_exec_sp01",
+    description: "Subplan 01 — Trail data & search",
+    narration: "Subplan 01 · Trail data & search — building the data layer first so everything downstream has trails to render.",
+    prompt:
+      "Implement subplan 01 (Trail data & search): create a TrailRepository that exposes a `Trail` type and a difficulty palette {easy/moderate/hard}, seed it from trails.json, and add a search-by-name query. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/data/trails.json" }, result: "[ { \"id\": \"t-001\", \"name\": \"Eagle Ridge\", \"difficulty\": \"hard\" }, … 42 trails ]" },
+      { tool: "Write", input: { file_path: "src/data/TrailRepository.ts" }, result: "Wrote src/data/TrailRepository.ts — exports `Trail` type + DIFFICULTY_PALETTE {easy,moderate,hard} + searchByName()." },
+      { tool: "Write", input: { file_path: "src/data/useTrails.ts" }, result: "Wrote src/data/useTrails.ts — a hook over TrailRepository.searchByName()." },
+      { tool: "Bash", input: { command: "npx tsc --noEmit -p src/data" }, result: "tsc: no errors. TrailRepository + useTrails typecheck clean." },
+    ],
+    summary: "Subplan 01 done — `TrailRepository.ts` exposes the `Trail` type and the difficulty palette {easy/moderate/hard}, with a search-by-name hook.",
+    taskResult:
+      "Subplan 01 complete. ARTIFACT: `TrailRepository.ts` — exposes a `Trail` type + a difficulty palette {easy/moderate/hard} + searchByName(), with the `useTrails` hook over it.",
   },
   {
-    // seq 27 — the assistant announces execution (streams via revealMs). Top-level (Conversation tab).
-    tMs: 27200,
+    id: "02",
+    taskId: "toolu_th_exec_sp02",
+    description: "Subplan 02 — Map & navigation",
+    narration: "Subplan 02 · Map & navigation — building on subplan 01's `TrailRepository` (`Trail` type + difficulty palette) to plot trails on the map.",
+    prompt:
+      "Implement subplan 02 (Map & navigation): building on subplan 01's `TrailRepository` (`Trail` type + difficulty palette), wire native-stack navigation and plot each trail on the MapScreen, colouring pins by the difficulty palette. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/data/TrailRepository.ts" }, result: "export type Trail = …; export const DIFFICULTY_PALETTE = { easy, moderate, hard }; export function searchByName() …" },
+      { tool: "Write", input: { file_path: "src/screens/MapScreen.tsx" }, result: "Wrote src/screens/MapScreen.tsx — plots TrailRepository trails, pins coloured by DIFFICULTY_PALETTE." },
+      { tool: "Edit", input: { file_path: "src/navigation/RootNavigator.tsx" }, result: "Edited RootNavigator.tsx — registered MapScreen + TrailDetail route in the native stack." },
+      { tool: "Edit", input: { file_path: "src/navigation/TabNavigator.tsx" }, result: "Edited TabNavigator.tsx — added the Map tab." },
+      { tool: "Bash", input: { command: "npx tsc --noEmit -p src/screens/MapScreen.tsx" }, result: "tsc: no errors. MapScreen consumes the Trail type cleanly." },
+    ],
+    summary: "Subplan 02 done — `MapScreen.tsx` plots `TrailRepository` trails with difficulty-coloured pins, wired into native-stack navigation.",
+    taskResult:
+      "Subplan 02 complete. ARTIFACT: `MapScreen.tsx` + native-stack routes — plots `TrailRepository` trails, pins coloured by the difficulty palette, with a TrailDetail route registered.",
+  },
+  {
+    id: "03",
+    taskId: "toolu_th_exec_sp03",
+    description: "Subplan 03 — Hike logging",
+    narration: "Subplan 03 · Hike logging — building on subplan 02's `MapScreen.tsx` + TrailDetail route so a logged hike deep-links back to its trail.",
+    prompt:
+      "Implement subplan 03 (Hike logging): building on subplan 02's `MapScreen.tsx` + TrailDetail route, add a HikeLogStore that records completed hikes against a `Trail` and a LogHikeScreen that deep-links to the trail. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/screens/MapScreen.tsx" }, result: "MapScreen navigates to the TrailDetail route with a Trail param — reuse that route for the hike deep-link." },
+      { tool: "Write", input: { file_path: "src/data/HikeLogStore.ts" }, result: "Wrote src/data/HikeLogStore.ts — records {trailId, date, notes} against a Trail; exposes logsForTrail()." },
+      { tool: "Write", input: { file_path: "src/screens/LogHikeScreen.tsx" }, result: "Wrote src/screens/LogHikeScreen.tsx — logs a hike + deep-links to the TrailDetail route from subplan 02." },
+      { tool: "Edit", input: { file_path: "src/navigation/TabNavigator.tsx" }, result: "Edited TabNavigator.tsx — added the Log tab next to Map." },
+      { tool: "Bash", input: { command: "npx vitest run src/data/HikeLogStore.test.ts" }, result: "1 file, 4 tests passed — logsForTrail() returns the hikes for a given Trail." },
+    ],
+    summary: "Subplan 03 done — `HikeLogStore.ts` records hikes against a `Trail`, and LogHikeScreen deep-links to subplan 02's TrailDetail route.",
+    taskResult:
+      "Subplan 03 complete. ARTIFACT: `HikeLogStore.ts` + LogHikeScreen — records hikes against a `Trail`, deep-linking to the TrailDetail route, with the Log tab wired in.",
+  },
+  {
+    id: "04.01",
+    taskId: "toolu_th_exec_sp0401",
+    description: "Subplan 04.01 — Trail header + difficulty badge",
+    narration: "Subplan 04.01 · Trail header + difficulty badge — reusing subplan 01's `TrailRepository` difficulty palette {easy/moderate/hard} for the badge colours.",
+    prompt:
+      "Implement subplan 04.01 (Trail header + difficulty badge): reusing subplan 01's `TrailRepository` difficulty palette {easy/moderate/hard}, build a `<DifficultyBadge>` and a TrailHeader that shows it. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/data/TrailRepository.ts" }, result: "DIFFICULTY_PALETTE = { easy: '#2e7d32', moderate: '#f9a825', hard: '#c62828' } — reuse for the badge." },
+      { tool: "Write", input: { file_path: "src/screens/TrailDetail/DifficultyBadge.tsx" }, result: "Wrote DifficultyBadge.tsx — a `<DifficultyBadge>` pill coloured from DIFFICULTY_PALETTE." },
+      { tool: "Write", input: { file_path: "src/screens/TrailDetail/TrailHeader.tsx" }, result: "Wrote TrailHeader.tsx — title + `<DifficultyBadge>`." },
+      { tool: "Bash", input: { command: "npx tsc --noEmit -p src/screens/TrailDetail/TrailHeader.tsx" }, result: "tsc: no errors. TrailHeader + DifficultyBadge typecheck clean." },
+    ],
+    summary: "Subplan 04.01 done — `<DifficultyBadge>` reuses subplan 01's difficulty palette, shown in TrailHeader.",
+    taskResult:
+      "Subplan 04.01 complete. ARTIFACT: `<DifficultyBadge>` — a difficulty pill coloured from subplan 01's palette {easy/moderate/hard}, surfaced in TrailHeader.",
+  },
+  {
+    id: "04.02",
+    taskId: "toolu_th_exec_sp0402",
+    description: "Subplan 04.02 — Elevation chart",
+    narration: "Subplan 04.02 · Elevation chart — reusing subplan 04.01's `<DifficultyBadge>` palette to tint the elevation line.",
+    prompt:
+      "Implement subplan 04.02 (Elevation chart): reusing subplan 04.01's `<DifficultyBadge>` palette, draw an ElevationChart whose line is tinted by the trail's difficulty and expose onSegmentPress. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/screens/TrailDetail/DifficultyBadge.tsx" }, result: "DifficultyBadge maps difficulty → palette colour — reuse the same map to tint the elevation line." },
+      { tool: "Write", input: { file_path: "src/screens/TrailDetail/ElevationChart.tsx" }, result: "Wrote ElevationChart.tsx — line tinted by `<DifficultyBadge>` palette; exposes onSegmentPress." },
+      { tool: "Edit", input: { file_path: "src/screens/TrailDetail/TrailHeader.tsx" }, result: "Edited TrailHeader.tsx — render ElevationChart under the header." },
+      { tool: "Bash", input: { command: "npx tsc --noEmit -p src/screens/TrailDetail/ElevationChart.tsx" }, result: "tsc: no errors. ElevationChart typechecks; onSegmentPress exported." },
+    ],
+    summary: "Subplan 04.02 done — `ElevationChart.tsx` tints its line by subplan 04.01's badge palette and exposes onSegmentPress.",
+    taskResult:
+      "Subplan 04.02 complete. ARTIFACT: `ElevationChart.tsx` — elevation line tinted by subplan 04.01's `<DifficultyBadge>` palette, exposing onSegmentPress.",
+  },
+  {
+    id: "04.03",
+    taskId: "toolu_th_exec_sp0403",
+    description: "Subplan 04.03 — Reviews",
+    narration: "Subplan 04.03 · Reviews — wiring subplan 04.02's `ElevationChart.tsx` onSegmentPress so a review deep-links to its elevation segment.",
+    prompt:
+      "Implement subplan 04.03 (Reviews): wiring subplan 04.02's `ElevationChart.tsx` onSegmentPress, add a Reviews list whose entries deep-link to the elevation segment they describe, and surface shareable highlights. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/screens/TrailDetail/ElevationChart.tsx" }, result: "ElevationChart exposes onSegmentPress(segmentIndex) — subscribe Reviews to it." },
+      { tool: "Write", input: { file_path: "src/screens/TrailDetail/Reviews.tsx" }, result: "Wrote Reviews.tsx — reviews deep-link to elevation segments via onSegmentPress; marks shareable highlights." },
+      { tool: "Edit", input: { file_path: "src/screens/TrailDetail/ElevationChart.tsx" }, result: "Edited ElevationChart.tsx — forwards onSegmentPress to the Reviews list." },
+      { tool: "Bash", input: { command: "npx vitest run src/screens/TrailDetail/Reviews.test.ts" }, result: "1 file, 3 tests passed — a segment press scrolls to the matching review." },
+    ],
+    summary: "Subplan 04.03 done — `Reviews.tsx` deep-links to subplan 04.02's elevation segments and marks shareable highlights.",
+    taskResult:
+      "Subplan 04.03 complete. ARTIFACT: `Reviews.tsx` — reviews deep-linking to subplan 04.02's elevation segments (onSegmentPress), surfacing shareable highlights.",
+  },
+  {
+    id: "04.04",
+    taskId: "toolu_th_exec_sp0404",
+    description: "Subplan 04.04 — Save / share",
+    narration: "Subplan 04.04 · Save / share — surfacing subplan 04.03's `Reviews.tsx` shareable highlights through a share sheet.",
+    prompt:
+      "Implement subplan 04.04 (Save / share): surfacing subplan 04.03's `Reviews.tsx` shareable highlights, wire a ShareSheet that saves a trail and shares its review highlights. Report the artifact you produced.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/screens/TrailDetail/Reviews.tsx" }, result: "Reviews exposes shareableHighlights() — feed them into the share sheet." },
+      { tool: "Write", input: { file_path: "src/screens/TrailDetail/ShareSheet.tsx" }, result: "Wrote ShareSheet.tsx — saves the trail + shares subplan 04.03's review highlights." },
+      { tool: "Edit", input: { file_path: "src/screens/TrailDetail/TrailHeader.tsx" }, result: "Edited TrailHeader.tsx — added the Save/Share action that opens ShareSheet." },
+      { tool: "Bash", input: { command: "npx tsc --noEmit -p src/screens/TrailDetail" }, result: "tsc: no errors. The whole Trail-detail screen (header/badge/chart/reviews/share) typechecks." },
+    ],
+    summary: "Subplan 04.04 done — `ShareSheet.tsx` shares subplan 04.03's review highlights; the Trail-detail screen is complete.",
+    taskResult:
+      "Subplan 04.04 complete. ARTIFACT: `ShareSheet.tsx` — saves a trail and shares subplan 04.03's review highlights; all four 04.* leaves compose the Trail-detail screen.",
+  },
+];
+
+// ---- Programmatic Execution-chapter builder (FINAL tMs/seq, no further shift) -------------------
+//
+// Walks EXEC_SUBPLANS, emitting per subplan: a top-level launch narration, the Task tool_use, the
+// `subagent_started` label, each atomic leaf pair (tool_use + tool_result share a tMs, parent = taskId),
+// an in-group summary, and the DEFERRED top-level Task tool_result (which flips the spanning Task done).
+// seqs are dense/contiguous from EXEC_SEQ_BASE; tMs steps by EXEC_STEP_MS (atomic pairs share one tMs).
+// The chapter opens with a SURFACE open_plan{null} (closes the V2 master → activeTab "conversation" for
+// the whole chapter) and ends with an integration wrap-up + the terminal `result` (strictly highest).
+const EXEC_STEP_MS = 600; // inter-frame tMs step within the Execution chapter (atomic pairs share one tMs).
+
+function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminalMs: number } {
+  const frames: StoryFrame[] = [];
+  let seq = EXEC_SEQ_BASE;
+  let tMs = EXEC_BASE_MS;
+  const step = () => {
+    tMs += EXEC_STEP_MS;
+  };
+
+  // SURFACE — close the reading pane (the V2 master is no longer shown) so projectSurfaceState flips
+  // activeTab "plan" → "conversation" for the whole Execution chapter. No seq (a surface frame).
+  frames.push({ tMs: EXEC_BASE_MS, chapterLabel: "Execution", frame: { t: "open_plan", path: null } });
+
+  // Top-level exec-open narration.
+  step();
+  frames.push({
+    tMs,
     frame: {
       t: "conv",
       revealMs: 1000,
       ev: {
-        seq: 27,
+        seq: seq++,
         kind: "assistant_text",
-        text: "Plan approved — executing the four detail leaves now.",
+        text: "Plan approved — executing the subplans in order, each as its own subagent. The output of each feeds the next.",
         parent_tool_use_id: null,
       },
     },
-  },
+  });
 
-  // ---- Leaf 04.01 — Trail header + difficulty badge ----
-  {
-    // seq 28 — leaf 04.01 scaffolding narration (top-level).
-    tMs: 28000,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 28,
-        kind: "assistant_text",
-        text: "04.01 · Trail header + difficulty badge — scaffolding.",
-        parent_tool_use_id: null,
+  for (const sp of EXEC_SUBPLANS) {
+    // Top-level launch narration (threads the prior artifact verbatim).
+    step();
+    frames.push({
+      tMs,
+      frame: {
+        t: "conv",
+        revealMs: 800,
+        ev: { seq: seq++, kind: "assistant_text", text: sp.narration, parent_tool_use_id: null },
       },
-    },
-  },
-  {
-    // seq 29 — Write tool_use for 04.01 (atomic with its result seq 30 — same tMs). Exact id correlates.
-    tMs: 28800,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 29,
-        kind: "tool_use",
-        id: WRITE_0401_ID,
-        tool: "Write",
-        input: { file_path: "src/screens/TrailDetail/TrailHeader.tsx" },
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 30 — Write result for 04.01 (SAME tMs as seq 29 = atomic; tool_use_id correlates by WRITE_0401_ID).
-    tMs: 28800,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 30,
-        kind: "tool_result",
-        tool_use_id: WRITE_0401_ID,
-        content: "Wrote src/screens/TrailDetail/TrailHeader.tsx",
-        is_error: false,
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 31 — leaf 04.01 OUTPUT (top-level). The `[context]` system_message (seq 32) is seq-adjacent next.
-    tMs: 29400,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 31,
-        kind: "assistant_text",
-        text: "Done — colour-coded difficulty badge.",
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 32 — DEMO-AUTHORED `[context]` thread → 04.02 (top-level system bubble; seq-adjacent after seq 31).
-    tMs: 29900,
-    frame: {
-      t: "system_message",
-      seq: 32,
-      text: "[context] → 04.02: difficulty palette {easy/moderate/hard} lives in TrailHeader; reuse it.",
-    },
-  },
+    });
 
-  // ---- Leaf 04.02 — Elevation chart ----
-  {
-    // seq 33 — leaf 04.02 narration (top-level).
-    tMs: 30600,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 33,
-        kind: "assistant_text",
-        text: "04.02 · Elevation chart — reusing the palette from 04.01.",
-        parent_tool_use_id: null,
+    // Top-level Task tool_use — its `input.prompt` threads the prior artifact verbatim. Its OWN result
+    // is DEFERRED to the group's end (so the Task SPANS its leaves, exactly like scope-recon).
+    step();
+    const taskTMs = tMs;
+    frames.push({
+      tMs: taskTMs,
+      frame: {
+        t: "conv",
+        ev: {
+          seq: seq++,
+          kind: "tool_use",
+          id: sp.taskId,
+          tool: "Task",
+          input: { description: sp.description, subagent_type: "subplan-executor", prompt: sp.prompt },
+          parent_tool_use_id: null,
+        },
       },
-    },
-  },
-  {
-    // seq 34 — Write tool_use for 04.02 (atomic with seq 35).
-    tMs: 31400,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 34,
-        kind: "tool_use",
-        id: WRITE_0402_ID,
-        tool: "Write",
-        input: { file_path: "src/screens/TrailDetail/ElevationChart.tsx" },
-        parent_tool_use_id: null,
+    });
+    // `subagent_started` LABELS the group (header → the subplan description). Same tMs as the Task.
+    frames.push({
+      tMs: taskTMs,
+      frame: {
+        t: "conv",
+        ev: {
+          seq: seq++,
+          kind: "subagent_started",
+          tool_use_id: sp.taskId,
+          subagent_type: "subplan-executor",
+          description: sp.description,
+          prompt: sp.prompt,
+        },
       },
-    },
-  },
-  {
-    // seq 35 — Write result for 04.02 (atomic with seq 34).
-    tMs: 31400,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 35,
-        kind: "tool_result",
-        tool_use_id: WRITE_0402_ID,
-        content: "Wrote src/screens/TrailDetail/ElevationChart.tsx",
-        is_error: false,
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 36 — leaf 04.02 OUTPUT (top-level).
-    tMs: 32000,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 36,
-        kind: "assistant_text",
-        text: "Done — elevation tinted by difficulty.",
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 37 — DEMO-AUTHORED `[context]` thread → 04.03 (seq-adjacent after seq 36).
-    tMs: 32500,
-    frame: {
-      t: "system_message",
-      seq: 37,
-      text: "[context] → 04.03: chart exposes onSegmentPress.",
-    },
-  },
+    });
 
-  // ---- Leaf 04.03 — Reviews ----
-  {
-    // seq 38 — leaf 04.03 narration (top-level).
-    tMs: 33200,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 38,
-        kind: "assistant_text",
-        text: "04.03 · Reviews — deep-linking to elevation segments.",
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 39 — Write tool_use for 04.03 (atomic with seq 40).
-    tMs: 34000,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 39,
-        kind: "tool_use",
-        id: WRITE_0403_ID,
-        tool: "Write",
-        input: { file_path: "src/screens/TrailDetail/Reviews.tsx" },
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 40 — Write result for 04.03 (atomic with seq 39).
-    tMs: 34000,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 40,
-        kind: "tool_result",
-        tool_use_id: WRITE_0403_ID,
-        content: "Wrote src/screens/TrailDetail/Reviews.tsx",
-        is_error: false,
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 41 — leaf 04.03 OUTPUT (top-level).
-    tMs: 34600,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 41,
-        kind: "assistant_text",
-        text: "Done — reviews with segment deep-links.",
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 42 — DEMO-AUTHORED `[context]` thread → 04.04 (seq-adjacent after seq 41).
-    tMs: 35100,
-    frame: {
-      t: "system_message",
-      seq: 42,
-      text: "[context] → 04.04: reviews surface the shareable highlights.",
-    },
-  },
+    // The atomic leaf tool pairs (parent = taskId). Each tool_use + tool_result SHARES a tMs.
+    let leafIdx = 0;
+    for (const leaf of sp.leaves) {
+      step();
+      const leafTMs = tMs;
+      const leafId = `${sp.taskId}_leaf_${leafIdx++}`;
+      frames.push({
+        tMs: leafTMs,
+        frame: {
+          t: "conv",
+          ev: {
+            seq: seq++,
+            kind: "tool_use",
+            id: leafId,
+            tool: leaf.tool,
+            input: leaf.input,
+            parent_tool_use_id: sp.taskId,
+          },
+        },
+      });
+      frames.push({
+        tMs: leafTMs,
+        frame: {
+          t: "conv",
+          ev: {
+            seq: seq++,
+            kind: "tool_result",
+            tool_use_id: leafId,
+            content: leaf.result,
+            is_error: false,
+            parent_tool_use_id: sp.taskId,
+          },
+        },
+      });
+    }
 
-  // ---- Leaf 04.04 — Save / share ----
-  {
-    // seq 43 — leaf 04.04 narration (top-level).
-    tMs: 35800,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 43,
-        kind: "assistant_text",
-        text: "04.04 · Save / share — wiring the share sheet.",
-        parent_tool_use_id: null,
+    // In-group summary (parent = taskId) naming the produced artifact.
+    step();
+    frames.push({
+      tMs,
+      frame: {
+        t: "conv",
+        revealMs: 800,
+        ev: { seq: seq++, kind: "assistant_text", text: sp.summary, parent_tool_use_id: sp.taskId },
       },
-    },
-  },
-  {
-    // seq 44 — Write tool_use for 04.04 (atomic with seq 45).
-    tMs: 36600,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 44,
-        kind: "tool_use",
-        id: WRITE_0404_ID,
-        tool: "Write",
-        input: { file_path: "src/screens/TrailDetail/ShareSheet.tsx" },
-        parent_tool_use_id: null,
+    });
+
+    // DEFERRED top-level Task tool_result (tool_use_id = taskId, parent null) — flips the Task done and
+    // carries the subplan's artifact summary (the handoff the NEXT subplan's prompt references).
+    step();
+    frames.push({
+      tMs,
+      frame: {
+        t: "conv",
+        ev: {
+          seq: seq++,
+          kind: "tool_result",
+          tool_use_id: sp.taskId,
+          content: sp.taskResult,
+          is_error: false,
+          parent_tool_use_id: null,
+        },
       },
-    },
-  },
-  {
-    // seq 45 — Write result for 04.04 (atomic with seq 44).
-    tMs: 36600,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 45,
-        kind: "tool_result",
-        tool_use_id: WRITE_0404_ID,
-        content: "Wrote src/screens/TrailDetail/ShareSheet.tsx",
-        is_error: false,
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 46 — leaf 04.04 OUTPUT (top-level).
-    tMs: 37200,
-    frame: {
-      t: "conv",
-      ev: {
-        seq: 46,
-        kind: "assistant_text",
-        text: "Done — save + share with review highlights.",
-        parent_tool_use_id: null,
-      },
-    },
-  },
-  {
-    // seq 47 — DEMO-AUTHORED `[context]` thread → integration (seq-adjacent after seq 46).
-    tMs: 37700,
-    frame: {
-      t: "system_message",
-      seq: 47,
-      text: "[context] → integration: all four leaves compose the Trail-detail screen.",
-    },
-  },
-  {
-    // seq 48 — integration wrap-up (streams via revealMs; top-level).
-    tMs: 38600,
+    });
+  }
+
+  // Integration wrap-up (top-level).
+  step();
+  frames.push({
+    tMs,
     frame: {
       t: "conv",
       revealMs: 1000,
       ev: {
-        seq: 48,
+        seq: seq++,
         kind: "assistant_text",
-        text: "Integrated all four detail leaves into the Trail-detail screen — Trailhead is ready to ship.",
+        text: "Integrated all subplans — data (01) → map & navigation (02) → hike logging (03) → the four trail-detail leaves (04.01–04.04). Trailhead is ready to ship.",
         parent_tool_use_id: null,
       },
     },
-  },
-  {
-    // seq 49 — terminal `result` frame: the turn FINISHES. STRICTLY the highest seq (49) AND tMs (40000),
-    // so `working` is non-null for every mid-run T but null at T = storyDurationMs (a finished thought,
-    // not a perpetual spinner). It lands on the Conversation tab (no plan open since the open_plan{null}
-    // at 27000); the terminal only clears `working`. The non-wire bookkeeping fields are benign fixture
-    // values — derive() never keys rendering off them (only `is_error`/`result`).
-    tMs: 40000,
+  });
+
+  // Terminal `result` — STRICTLY the highest seq AND tMs (so `working` is non-null mid-run but null at
+  // duration: a finished thought). The non-wire bookkeeping fields are benign fixture values.
+  step();
+  const terminalSeq = seq++;
+  const terminalMs = tMs;
+  frames.push({
+    tMs: terminalMs,
     chapterLabel: "Done",
     frame: {
       t: "conv",
       ev: {
-        seq: 49,
+        seq: terminalSeq,
         kind: "result",
         subtype: "success",
         is_error: false,
@@ -1270,5 +2502,24 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
         session_id: "mock-animate-trailhead",
       },
     },
-  },
-];
+  });
+
+  return { frames, terminalSeq, terminalMs };
+}
+
+const EXEC_BUILT = buildExecution();
+
+// The terminal `result` seq + tMs are COMPUTED from the Execution builder (strictly highest of each).
+// Re-timing/re-counting the Execution chapter updates these automatically (one-line base change above).
+export const TERMINAL_SEQ = EXEC_BUILT.terminalSeq;
+export const TERMINAL_MS = EXEC_BUILT.terminalMs;
+
+// Splice the P4-shifted nested-plan/comment-and-iterate chapters (shift by + PROTO_ACT_SHIFT), then the
+// P5 Execution chapter (already authored at FINAL tMs/seq — pushed verbatim, no shift). chapterLabels
+// preserved; monotonic tMs preserved (the comment act ends at 68000, the Execution opens at EXEC_BASE_MS).
+for (const sf of DOWNSTREAM_AFTER_PROTOTYPE) {
+  TRAILHEAD_BEAT.push({ ...sf, tMs: sf.tMs + PROTO_ACT_SHIFT });
+}
+for (const sf of EXEC_BUILT.frames) {
+  TRAILHEAD_BEAT.push(sf);
+}

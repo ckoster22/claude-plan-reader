@@ -31,8 +31,18 @@ export const TRAILHEAD_TREE_ID = "tree-trailhead-7f3a91c2";
 //
 // Opened by the storyboard in the reading pane. Body STARTS with the H1 (NO leading `---` frontmatter
 // — this constant is the already-stripped body, not a raw on-disk file). Short Context + Decomposition
-// prose plus a real ```mermaid fence. The mermaid uses SAFE alphanumeric node ids (M, S1..S4, L1..L4)
-// with the dotted ids inside the bracketed labels — a bare `04.01[…]` mis-parses as a node id.
+// prose plus a real ```mermaid fence: a `flowchart TD` ARCHITECTURE diagram with subgraphs (Navigation
+// / Screens / Data / the 04 trail-detail decomposition) and cross-edges (TrailList→TrailDetail,
+// TrailDetail→{HeaderBadge, Elevation, Reviews, SaveShare}, Data→Search). All node ids are SAFE
+// alphanumeric (NavRoot, TrailList, HeaderBadge, …) with the dotted "04.01" labels INSIDE the brackets —
+// a bare `04.01[…]` mis-parses as a node id.
+//
+// COMMENT-ANCHOR INVARIANT (load-bearing): the Slice-06 comment records (TRAILHEAD_COMMENT_1..3 in
+// storyboard.ts) anchor to VERBATIM prose substrings in THIS doc: "decomposes the build into four
+// subplans", "the difficulty-badge work the reviewer asked for has a home", and "Subplans run in order".
+// Those three substrings MUST remain present in the PROSE (outside the ```mermaid fence — mermaid text is
+// excluded from the comment scan) and MUST NOT be duplicated earlier in the prose (a duplicate shifts the
+// occurrence:0 match). The highlight-anchor test (storyboard.test.ts) is the falsifiable guard.
 export const TRAILHEAD_MASTER_DOC = `# Master Plan: Trailhead — trail-finder mobile app
 
 ## Context
@@ -51,14 +61,39 @@ four leaves so the difficulty-badge work the reviewer asked for has a home.
 
 \`\`\`mermaid
 flowchart TD
-  M["Master · Trailhead"] --> S1["01 · Trail data & search"]
-  M --> S2["02 · Map & navigation"]
-  M --> S3["03 · Hike logging"]
-  M --> S4["04 · Trail detail screen"]
-  S4 --> L1["04.01 · Header + difficulty badge"]
-  S4 --> L2["04.02 · Elevation chart"]
-  S4 --> L3["04.03 · Reviews"]
-  S4 --> L4["04.04 · Save / share"]
+  subgraph Nav["Navigation"]
+    NavRoot["App shell · tab bar"]
+  end
+  subgraph Screens["Screens"]
+    TrailList["Trail list"]
+    TrailDetail["Trail detail (04)"]
+    MapScreen["Map & navigation"]
+    LogScreen["Hike logging"]
+  end
+  subgraph Data["Data"]
+    Catalog["Trail catalog"]
+    Search["Search & filter"]
+    Tracks["Saved hikes"]
+  end
+  subgraph Detail["04 · Trail detail decomposition"]
+    HeaderBadge["04.01 · Header + difficulty badge"]
+    Elevation["04.02 · Elevation chart"]
+    Reviews["04.03 · Reviews"]
+    SaveShare["04.04 · Save / share"]
+  end
+  NavRoot --> TrailList
+  NavRoot --> MapScreen
+  NavRoot --> LogScreen
+  TrailList --> TrailDetail
+  TrailList --> Search
+  Search --> Catalog
+  Data --> Search
+  Catalog --> TrailList
+  Tracks --> LogScreen
+  TrailDetail --> HeaderBadge
+  TrailDetail --> Elevation
+  TrailDetail --> Reviews
+  TrailDetail --> SaveShare
 \`\`\`
 
 Subplans run in order; the trail-detail leaves (04.01–04.04) compose into the detail screen last.
@@ -99,14 +134,39 @@ length — so the most-scanned screen reads cleanly on a phone.
 
 \`\`\`mermaid
 flowchart TD
-  M["Master · Trailhead (revised)"] --> S1["01 · Trail data & search"]
-  M --> S2["02 · Map & navigation"]
-  M --> S3["03 · Hike logging"]
-  M --> S4["04 · Trail detail screen"]
-  S4 --> L1["04.01 · Header + difficulty badge"]
-  S4 --> L2["04.02 · Elevation chart"]
-  S4 --> L3["04.03 · Reviews"]
-  S4 --> L4["04.04 · Save / share"]
+  subgraph Nav["Navigation"]
+    NavRoot["App shell · tab bar"]
+  end
+  subgraph Screens["Screens"]
+    TrailList["Trail list · larger cards"]
+    TrailDetail["Trail detail (04)"]
+    MapScreen["Map & navigation"]
+    LogScreen["Hike logging"]
+  end
+  subgraph Data["Data"]
+    Catalog["Trail catalog · difficulty"]
+    Search["Search & filter"]
+    Tracks["Saved hikes"]
+  end
+  subgraph Detail["04 · Trail detail decomposition"]
+    HeaderBadge["04.01 · Header + difficulty badge"]
+    Elevation["04.02 · Elevation chart"]
+    Reviews["04.03 · Reviews"]
+    SaveShare["04.04 · Save / share"]
+  end
+  NavRoot --> TrailList
+  NavRoot --> MapScreen
+  NavRoot --> LogScreen
+  TrailList --> TrailDetail
+  TrailList --> Search
+  Search --> Catalog
+  Data --> Search
+  Catalog --> TrailList
+  Tracks --> LogScreen
+  TrailDetail --> HeaderBadge
+  TrailDetail --> Elevation
+  TrailDetail --> Reviews
+  TrailDetail --> SaveShare
 \`\`\`
 
 Subplans run in order; the trail-detail leaves (04.01–04.04) compose into the detail screen last.

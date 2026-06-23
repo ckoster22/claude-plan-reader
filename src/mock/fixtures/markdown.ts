@@ -177,22 +177,84 @@ Text after the image, so the pane shows the image is inlined mid-document.
 // ---- ANIMATE prototype-review beat — the visual prototype the gate previews -------------------
 //
 // The TRAILHEAD_BEAT (src/mock/animate/storyboard.ts) opens THIS plan in the reading pane during the
-// prototype-gate window (its open_plan…open_plan{null} bracket). Its body is a short title plus a
-// ```mermaid fence whose flowchart MATCHES MOCK_PROTOTYPE_GATE.inlinePreview
-// ("flowchart LR\n  A[Request] --> B[Prototype] --> C[Review]" in src/mock/fixtures/reviews.ts) — so
-// the reading pane shows a coherent Trailhead prototype diagram regardless of whether the animate
-// reconciler's renderInto or production's renderPrototypePreview paints last. It is registered in the
-// served markdown map (read_plan_contents serves it) but NOT in the plan LIST / sidebar fixtures.
+// prototype-gate window (its open_plan…open_plan{null} bracket). It is a TINY title-only doc that acts
+// as the BACKDROP for the player-owned `#demo-proto-card` trail-card overlay (below) — the actual
+// prototype is the HTML card, NOT markdown (the reading pane is MarkdownIt({ html: false }), so card
+// HTML in a doc would be escaped). It is registered in the served markdown map (read_plan_contents
+// serves it) but NOT in the plan LIST / sidebar fixtures.
 export const PROTO_PREVIEW_PATH = `${PLANS}/trailhead-prototype-preview.md`;
 
-const PROTO_PREVIEW_DOC = `# Trailhead prototype — hike search flow
+// A deliberately TINY title-only reading-pane doc. The prototype is shown as a PLAYER OVERLAY (the
+// `#demo-proto-card` trail card, below), NOT through this markdown — the reading pane uses
+// MarkdownIt({ html: false }) so raw card HTML in a doc would be escaped. This doc is just the backdrop
+// the open_plan bracket opens while the trail-card overlay floats over it. (The old trivial mermaid was
+// removed; the card replaces it as the prototype's visual.)
+const PROTO_PREVIEW_DOC = `# Trailhead prototype — trail card
 
-A quick visual prototype of how a hike search moves through the screens.
+A quick visual prototype of the trail-list card.
+`;
 
-\`\`\`mermaid
-flowchart LR
-  A[Request] --> B[Prototype] --> C[Review]
-\`\`\`
+// ---- ANIMATE prototype trail-card — the player-owned `#demo-proto-card` overlay -----------------
+//
+// PLAYER-AUTHORED, SAFE HTML (NOT user content): the reconciler injects these strings into the
+// `#demo-proto-card` overlay node (src/mock/animate/index.ts setProtoCard). They are NOT rendered
+// through a markdown doc — the reading pane is MarkdownIt({ html: false }), so card HTML in a doc
+// would be escaped; the card is an overlay only.
+//
+// Round 1 = a clean trail card: a photo-placeholder block, a trail name, and distance/elevation stats.
+// Round 2 = the SAME card but visibly LARGER (the player bumps `--tc-scale`) AND with a difficulty
+// badge (`.tc-badge`, a green "Moderate" pill) — the exact prototype feedback the storyboard types.
+//
+// Markup is namespaced (`.tc-card`, `.tc-thumb`, `.tc-title`, `.tc-meta`, `.tc-badge`) so it cannot
+// collide with app styles. `--tc-scale` is owned by the player (set on `#demo-proto-card`), so the same
+// HTML scales by round; round 2 adds the badge node the player would otherwise omit.
+export const TRAILHEAD_PROTO_CARD_R1_HTML =
+  `<div class="tc-card">` +
+  `<div class="tc-thumb" aria-hidden="true"></div>` +
+  `<div class="tc-title">Eagle Peak Loop</div>` +
+  `<div class="tc-meta">6.2 mi · +1,400 ft</div>` +
+  `</div>`;
+
+export const TRAILHEAD_PROTO_CARD_R2_HTML =
+  `<div class="tc-card">` +
+  `<div class="tc-thumb" aria-hidden="true"></div>` +
+  `<div class="tc-title">Eagle Peak Loop</div>` +
+  `<div class="tc-badge">Moderate</div>` +
+  `<div class="tc-meta">6.2 mi · +1,400 ft</div>` +
+  `</div>`;
+
+// The trail-card CSS (namespaced to `#demo-proto-card` descendants). Injected by the player alongside
+// ANIM_CSS. `--tc-scale` (set by the player per round) drives every size so round 2 is uniformly larger;
+// `.tc-badge` is hidden by round 1's HTML omitting it (round 2's HTML adds it). The card chrome itself
+// (`#demo-proto-card` position/background/shadow) lives in ANIM_CSS — this is the card INTERIOR only.
+export const TRAILHEAD_PROTO_CARD_CSS = `
+#demo-proto-card .tc-card {
+  display: flex;
+  flex-direction: column;
+  gap: calc(8px * var(--tc-scale, 1));
+}
+#demo-proto-card .tc-thumb {
+  height: calc(74px * var(--tc-scale, 1));
+  border-radius: 8px;
+  background: linear-gradient(135deg, #3a5f3a, #6aa3ff);
+}
+#demo-proto-card .tc-title {
+  font-size: calc(15px * var(--tc-scale, 1));
+  font-weight: 600;
+}
+#demo-proto-card .tc-meta {
+  font-size: calc(12px * var(--tc-scale, 1));
+  opacity: 0.75;
+}
+#demo-proto-card .tc-badge {
+  align-self: flex-start;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: calc(11px * var(--tc-scale, 1));
+  font-weight: 600;
+  color: #10210f;
+  background: #7ed47e;
+}
 `;
 
 // The path -> document map consumed by state.ts / the mock read_plan_contents.
@@ -209,9 +271,9 @@ export const MOCK_MARKDOWN: Record<string, string> = {
   [`${PLANS}/variant-image.md`]: IMAGE_DOC,
   // The reviewed plan's file (its row is opened by the external-review flow).
   [`${PLANS}/review-pending.md`]: "# Plan under review\n\n- Step one\n- Step two\n\nReview this in the bar above.\n",
-  // The ANIMATE prototype-review preview (opened by TRAILHEAD_BEAT's open_plan bracket). NOT a
-  // sidebar/list plan — markdown map only, so read_plan_contents serves it. Its mermaid matches
-  // MOCK_PROTOTYPE_GATE.inlinePreview.
+  // The ANIMATE prototype-review backdrop (opened by TRAILHEAD_BEAT's open_plan bracket). NOT a
+  // sidebar/list plan — markdown map only, so read_plan_contents serves it. The trail-card overlay
+  // (#demo-proto-card) floats over it; the doc is just a title.
   [PROTO_PREVIEW_PATH]: PROTO_PREVIEW_DOC,
   // The REAL "Chompy Asteroids" nested tree — nine VERBATIM plan files (frontmatter intact; the
   // mock read_plan_contents strips it on read, mirroring the real backend). Keys match NESTED_PLANS.
