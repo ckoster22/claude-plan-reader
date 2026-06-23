@@ -378,6 +378,20 @@ function mountPlayer(): void {
       cursorNode.style.display = "none";
       return;
     }
+    // In-viewport visibility gate (pure fn of the per-tick computed position): when the resolved cursor
+    // position falls OUTSIDE the viewport it would park off-screen (e.g. below the fold following a
+    // last-waypoint target at rest), so hide it rather than leave a stray arrow. The reconciler calls
+    // setCursor every tick, so this self-corrects the instant the position re-enters the viewport. The
+    // transform/lerp is unchanged — we only toggle display based on the resolved x/y.
+    const outside =
+      state.x < 0 ||
+      state.y < 0 ||
+      state.x > window.innerWidth ||
+      state.y > window.innerHeight;
+    if (outside) {
+      cursorNode.style.display = "none";
+      return;
+    }
     cursorNode.style.display = "block";
     const scale = state.pressing ? " scale(0.82)" : "";
     cursorNode.style.transform = `translate(${state.x}px, ${state.y}px)${scale}`;

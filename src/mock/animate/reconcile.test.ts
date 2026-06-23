@@ -19,7 +19,7 @@ import {
   type ReconcilerSeams,
   QUESTION_OTHER_TEXT_SELECTOR,
 } from "./reconcile";
-import type { StoryFrame } from "./storyboard";
+import { type StoryFrame, TRAILHEAD_BEAT, TERMINAL_MS } from "./storyboard";
 import { clonePlans } from "../fixtures/plans";
 import {
   TRAILHEAD_PLANS,
@@ -702,5 +702,75 @@ describe("reconcile — question Other-answer UI (derived from field text) + rev
     expect(lastCall(seams, "setQuestionAnswerUI")[0]).toBeNull();
     // FALSIFIABILITY: if the UI latched on after first turning on (never re-deriving null), the backward
     // scrub would leave the last call as the on-state → the final `toBeNull()` goes RED. Confirmed.
+  });
+});
+
+// ====================================================================================================
+// (P6) WHOLE-TIMELINE SCRUB-REVERT — the reconciler-level companion to the projection-purity property
+// test in storyboard.test.ts. Sweeps a reconciler FORWARD across many T over the real TRAILHEAD_BEAT,
+// then drives it BACK to an early T, and asserts the final OVERLAY seam-driven state (cursor, pulse set,
+// composer, popover, proto-card, question-UI) matches driving DIRECTLY to that early T from a FRESH
+// reconciler. Because each overlay seam is a pure projection of T and the reconciler re-derives the full
+// state every tick (un-invertible surfaces rebuilt from scratch), forward-then-back == direct.
+//
+// A fresh reconciler's FIRST reconcile(earlyT) always fires every seam (no prior memo), so its last-call
+// per seam is the canonical state at earlyT. The swept reconciler, after its back-scrub to earlyT, must
+// have re-driven each seam to that same last value (a changed value re-fires; an unchanged value was
+// already correct). jsdom rects are all-zero, so cursor/popover positions are deterministic across both
+// paths — we compare the two drive paths, not absolute pixels.
+//
+// FALSIFIABILITY (verified): temporarily make the proto-card pass LATCH (skip re-driving when the gate
+// goes off after having been on — i.e. never emit {round:null} once shown) and the swept-back early-T
+// last call for setProtoCard becomes {round:2} while the direct path is {round:null} → the deep-equal
+// goes RED. Restoring the re-derive turns it green. Confirmed locally before commit.
+describe("reconcile — (P6) whole-timeline forward-then-back == direct (overlay seams)", () => {
+  // The overlay seams whose last call is a pure fn of T (their projected value carries no host-DOM
+  // identity that would differ between two reconcilers over the same all-zero-rect jsdom).
+  const OVERLAY_SEAMS = [
+    "setCursor",
+    "setPulseTargets",
+    "setComposerOpen",
+    "setSelPopover",
+    "setProtoCard",
+    "setQuestionAnswerUI",
+  ] as const;
+
+  // Normalize a last-call arg to a deep-comparable string (Set → sorted array).
+  function ser(arg: unknown): string {
+    if (arg instanceof Set) return JSON.stringify([...arg].sort());
+    return JSON.stringify(arg ?? null);
+  }
+
+  it("sweeping forward across the whole beat then back to an early T equals driving directly there", () => {
+    const end = TERMINAL_MS;
+    // A grid of forward sweep stops across the whole timeline, then back DOWN to each early target.
+    const forwardGrid = Array.from({ length: 41 }, (_, i) => Math.round((i / 40) * end));
+    // The early targets to land on after the forward sweep (spread across the front + mid of the beat).
+    const earlyTargets = [0, Math.round(end * 0.1), Math.round(end * 0.41), Math.round(end * 0.7)];
+
+    for (const earlyT of earlyTargets) {
+      // ---- DIRECT path: a FRESH reconciler driven straight to earlyT (first tick fires every seam). ----
+      const direct = makeSeams();
+      const dr = createReconciler(direct.seams, TRAILHEAD_BEAT);
+      dr.reconcile(earlyT);
+
+      // ---- SWEPT path: sweep all the way forward, then back to earlyT. ----
+      const swept = makeSeams();
+      const sr = createReconciler(swept.seams, TRAILHEAD_BEAT);
+      for (const T of forwardGrid) sr.reconcile(T);
+      sr.reconcile(earlyT); // back-scrub to the early target.
+
+      for (const seam of OVERLAY_SEAMS) {
+        const directLast = lastCall(direct.seams, seam);
+        const sweptLast = lastCall(swept.seams, seam);
+        // Both paths MUST have driven the seam at least once (the direct first-tick always does).
+        expect(directLast, `direct ${seam} drove at earlyT=${earlyT}`).toBeDefined();
+        expect(sweptLast, `swept ${seam} drove by earlyT=${earlyT}`).toBeDefined();
+        expect(
+          ser(sweptLast?.[0]),
+          `${seam} forward-then-back == direct at earlyT=${earlyT}`,
+        ).toBe(ser(directLast?.[0]));
+      }
+    }
   });
 });

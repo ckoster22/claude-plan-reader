@@ -1123,6 +1123,80 @@ describe("storyboard — backward seek equals from-zero rebuild", () => {
   });
 });
 
+// ---- (P6) Overlay projections are PURE fns of T — scrub-revert across the WHOLE timeline ----------
+//
+// EXTENDS the backward-seek-equals-rebuild guarantee (above, for the conversation MODEL) to the new
+// overlay PROJECTIONS. The conversation model is rebuilt from scratch each apply; the overlay
+// projections (projectPulseSet / projectCursorState / projectFieldText / projectModalState) are
+// likewise full re-derivations from the frame set, so each is a pure fn of (story, T) alone — its value
+// at T must NOT depend on whether a LATER T was evaluated first. We assert exactly that: for a
+// representative sweep across [0, TERMINAL_MS], evaluating at T AFTER first evaluating at a later T (the
+// "forward-then-back" path) deep-equals evaluating at T directly. Since the fns are stateless this is
+// trivially true today — the test's value is as a TRIPWIRE: introduce any order-dependence (e.g. a
+// mutable module-level cache memoizing the last-seen state) and it goes RED.
+//
+// FALSIFIABILITY (verified): temporarily wrapping projectModalState with a module-level `let last` that
+// returns the cached value when `T < lastT` (a forward-delta accumulator instead of a re-derivation)
+// makes the forward-then-back result for an EARLIER T differ from the direct result → this test goes
+// RED. Restoring the pure projection turns it green again. Confirmed locally before commit.
+describe("storyboard — (P6) overlay projections are pure fns of T (forward-then-back == direct)", () => {
+  // Serialize each projection's result into a stable, deep-comparable string. Set/Map have no useful
+  // JSON.stringify, so normalize them to SORTED arrays of entries (order-independent equality).
+  const serPulse = (s: ReadonlySet<string>): string =>
+    JSON.stringify([...s].sort());
+  const serField = (m: ReadonlyMap<string, string>): string =>
+    JSON.stringify([...m.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  const serCursor = (c: ReturnType<typeof projectCursorState>): string => JSON.stringify(c);
+  const serModal = (m: ReturnType<typeof projectModalState>): string => JSON.stringify(m);
+
+  // A representative sweep of T across the whole TRAILHEAD_BEAT timeline: the two endpoints plus an even
+  // grid of interior samples (lands inside typing windows, cursor moves, gate brackets, comment acts).
+  function sweepTimes(): number[] {
+    const end = TERMINAL_MS;
+    const grid = Array.from({ length: 41 }, (_, i) => Math.round((i / 40) * end));
+    // Dedupe + ensure 0 and TERMINAL_MS are present, ascending.
+    return [...new Set([0, ...grid, end])].sort((a, b) => a - b);
+  }
+
+  it("projectPulseSet/CursorState/FieldText/ModalState: evaluating at T after a LATER T equals direct", () => {
+    const times = sweepTimes();
+    // The "direct" baseline: each projection at each T, computed from a fresh scan (no prior eval).
+    const direct = times.map((T) => ({
+      T,
+      pulse: serPulse(projectPulseSet(TRAILHEAD_BEAT, T)),
+      cursor: serCursor(projectCursorState(TRAILHEAD_BEAT, T)),
+      field: serField(projectFieldText(TRAILHEAD_BEAT, T)),
+      modal: serModal(projectModalState(TRAILHEAD_BEAT, T)),
+    }));
+
+    // Forward-then-back: sweep ALL the way to TERMINAL_MS first (the "latest" eval), then walk BACK down
+    // through every T in DESCENDING order, re-evaluating each. A pure fn yields the same value as direct;
+    // any order-dependence (a stateful cache) would diverge on this back-walk.
+    for (let i = times.length - 1; i >= 0; i--) {
+      const T = times[i];
+      // Touch a strictly-later T first (when one exists) so this T is evaluated AFTER a later one.
+      if (i + 1 < times.length) {
+        const later = times[i + 1];
+        projectPulseSet(TRAILHEAD_BEAT, later);
+        projectCursorState(TRAILHEAD_BEAT, later);
+        projectFieldText(TRAILHEAD_BEAT, later);
+        projectModalState(TRAILHEAD_BEAT, later);
+      }
+      const back = {
+        pulse: serPulse(projectPulseSet(TRAILHEAD_BEAT, T)),
+        cursor: serCursor(projectCursorState(TRAILHEAD_BEAT, T)),
+        field: serField(projectFieldText(TRAILHEAD_BEAT, T)),
+        modal: serModal(projectModalState(TRAILHEAD_BEAT, T)),
+      };
+      const want = direct[i];
+      expect(back.pulse, `projectPulseSet purity at T=${T}`).toBe(want.pulse);
+      expect(back.cursor, `projectCursorState purity at T=${T}`).toBe(want.cursor);
+      expect(back.field, `projectFieldText purity at T=${T}`).toBe(want.field);
+      expect(back.modal, `projectModalState purity at T=${T}`).toBe(want.modal);
+    }
+  });
+});
+
 // ---- Model-direct variants (question / user / system / permission_resolved) --------------------
 //
 // A small fixture story exercising each new ModelFrame variant. The QUESTION INVARIANT holds:
