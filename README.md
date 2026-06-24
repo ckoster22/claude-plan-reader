@@ -115,3 +115,29 @@ The same states are scriptable via the **`window.__mock` API** (used by the deck
 **Fidelity caveat:** the data is hand-authored fixtures, not a live agent — frames mirror the real `AgentStream` union and the orchestrator's gate shapes, but they are canned. Because the live conversation model is single-session (a private closure with no in-place reset), a **conversation jump reloads the page** (carrying the target in the URL) to obtain a genuinely fresh model — the same way the real app gets one.
 
 A developer guide to the harness (architecture, how to add a scene/knob/command handler, and the load-bearing fidelity assumptions) lives in [`src/mock/README.md`](src/mock/README.md).
+
+### Annotating the mock-animate demo (dev-only review layer)
+
+`npm run mock-animate` boots a scrubbable, time-driven "Trailhead" walkthrough of the multiplan flow. A dev-only layer lets you mark it up and capture the feedback:
+
+```sh
+npm run mock-annotate                       # → author mode at http://localhost:1421
+```
+
+In **author mode** a toolbar appears: pick a tool (**pen / arrow / box**) and color, draw over the screen, type a comment, and **Pin** it at the current scrub time. Repeat across the timeline, then **Save** — this writes `.mock-annotations/<name>.json` (the name field, default `review`).
+
+**Replay** a saved doc by opening it at its scrub-pinned timestamps:
+
+```sh
+http://localhost:1421?annotations=<name>    # ticks + strokes + comments render from disk
+```
+
+**Capture** one settled screenshot per comment (the artifact an AI reviewer reads):
+
+```sh
+npm run capture-annotations -- <name>       # → .mock-annotations/<name>/
+```
+
+This writes `.mock-annotations/<name>/NNNN_t<tMs>.png` (one isolated, fully-rendered frame per comment) plus an `index.json` (`[{ commentId, tMs, text, png }]`). It spins up its own mock server + headless Chrome; override the ports/binary with `CAPTURE_PORT` (default `1431`), `CAPTURE_DEBUG_PORT` (default `9333`), and `CHROME_BIN` if Chrome isn't auto-detected.
+
+Everything here is dev-only — `.mock-annotations/` and the layer ship in no distributable.

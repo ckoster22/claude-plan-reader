@@ -886,6 +886,9 @@ function mountPlayer(): void {
 
   // Seek to an absolute T (clamped), pause, repaint. Used by the progress drag + chapter markers.
   const seekTo = (next: number): void => {
+    // Capture focus is a strictly capture-frame-local concern — a user scrub must never inherit a
+    // stale focus (which would hide all-but-one comment). Reset it before any seek-driven repaint.
+    captureFocusId = null;
     T = Math.max(0, Math.min(duration, next));
     stop();
     paint();
@@ -976,6 +979,19 @@ function mountPlayer(): void {
   // loadAnnotations: set the active doc, rebuild ticks, repaint (so the overlay reflects the new doc at
   // the current T). Passing null returns to the inert default.
   const loadAnnotations = (next: AnnotationDoc | null): void => {
+    // Capture focus is capture-frame-local: it must never survive a doc load (a stale focus would
+    // hide all-but-one comment in the freshly-loaded doc). Reset before anything else.
+    captureFocusId = null;
+    // Shape guard: a malformed/old doc (e.g. comments missing or not an array, or a version mismatch)
+    // would throw inside tickGroups/projectActiveComments at paint time. Warn and treat as a no-op
+    // clear instead of proceeding. The null case (clear) is preserved.
+    if (next !== null && (next.version !== 1 || !Array.isArray(next.comments))) {
+      console.warn(
+        "[mock-animate] ignoring malformed annotation doc (expected version:1 with a comments[] array)",
+        next,
+      );
+      next = null;
+    }
     currentDoc = next;
     rebuildCmtTicks();
     paint();
@@ -1009,6 +1025,12 @@ function mountPlayer(): void {
   // it shares no closure state. `getDoc`/`setDoc` bridge the player's `currentDoc` so the UI mutates
   // the SAME in-memory doc the overlay projects + the ticks are built from.
   if (authorMode) {
+    // Match the capture environment's viewport: capture pins `--hide-scrollbars`, but author mode pins
+    // nothing, so an author with classic (non-overlay) scrollbars would record a viewport inner-width
+    // that differs from capture, drifting strokes horizontally a few px. Hide the document scrollbars
+    // here so authoring measures the same inner-width capture/replay does. Author-mode ONLY — default
+    // and replay are untouched.
+    document.documentElement.style.overflow = "hidden";
     annoCanvas.style.pointerEvents = "auto";
     mountAnnotateUI({
       getT: (): number => T,

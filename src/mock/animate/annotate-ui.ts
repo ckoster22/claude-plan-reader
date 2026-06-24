@@ -454,6 +454,10 @@ export function mountAnnotateUI(deps: AnnotateDeps): void {
   // expose it via the canvas dataset-free closure by attaching to the deps' repaint cycle: the player
   // invokes `renderWorking` through the returned hook. To keep deps one-way, we register on the window.
   // (Author mode only — never present without the flag.)
+  // Drain any stale hooks before registering ours: `authorPaintHooks` is a module-global, and a dev HMR
+  // remount could otherwise accumulate closures from prior mounts that runAuthorPaintHooks() runs every
+  // paint. Only one author UI is ever mounted, so a single live hook is correct.
+  authorPaintHooks.length = 0;
   authorPaintHooks.push(() => {
     renderWorking();
     rebuildList();

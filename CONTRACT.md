@@ -4183,3 +4183,125 @@ instant a `quota_exceeded` frame is seen (before the fire-and-forget `ingestStre
 The pending flag is cleared wherever the pause resolves — `QUOTA_RESUMED` (auto-resume),
 `cancel()`/`teardown()`, and every terminal (`markTerminal`) — so it never lingers to mis-classify a
 later genuine exit as paused.
+
+## Mock-animate annotation layer (dev-only)
+
+A **dev-only review-authoring layer** over the scrubbable `mock-animate` Trailhead demo
+(`src/mock/animate/**`): draw timestamp-pinned strokes + comments over the player, save them to disk,
+replay them at their scrub time, and capture one settled screenshot per comment for an AI reviewer.
+Ships in no distributable — it exists only under `vite.mock.config.ts` (`npm run mock-animate` /
+`npm run mock-annotate`), never under production `npm run build`. Default/replay behavior is
+byte-unchanged from the plain `mock-animate` demo; nothing below mounts without the author flag.
+
+### `window.__mockAnim` — the programmatic replay/capture control surface
+
+Assigned once at the end of `mountPlayer()` (`src/mock/animate/index.ts`); idempotent (HMR-guarded).
+Lets a headless driver land EXACTLY on a comment's `tMs` (vs. fuzzing pixel-drags on
+`.mockanim-progress`) and await a fully-settled reading pane before screenshotting.
+
+- `seekTo(tMs: number): void` — seek to an absolute (clamped) scrub time, pause, repaint.
+- `seekSettled(tMs: number): Promise<void>` — `seekTo` then **await the reconciler's reading-pane
+  settle barrier**, so a caller lands on a FULLY-rendered pane. Resolves on the next microtask when no
+  plan-open is in flight, so callers can `await` it uniformly.
+- `play(): void` / `stop(): void` — start/stop wall-clock playback (50 ms ticks).
+- `getT(): number` — the current scrub time in ms.
+- `getDuration(): number` — the story duration in ms.
+- `loadAnnotations(doc: AnnotationDoc | null): void` — set the active doc, rebuild scrubber ticks,
+  repaint. `null` returns the overlay to its INERT default (cleared canvas + empty panel).
+- `getActiveComments(): AnnotationComment[]` — the comments active at the current T (window-based;
+  NOT gated on the capture-focus id).
+- `focusComment(id: string | null): void` — **capture isolation**: render ONLY the comment with this
+  id (regardless of the time window) so shared-`tMs` comments produce distinct clean frames; `null`
+  returns to normal window-based projection.
+
+The dev `?annotate=1` URL param is an author-mode fallback equivalent to the `MOCK_ANNOTATE` flag; the
+`?annotations=<name>` URL param triggers the replay-from-file boot hook (loads the saved doc via the
+load middleware).
+
+### Replay / overlay DOM (reconciler-owned; pure projection of `(doc, T)`)
+
+All created once, appended to `<body>` at the max-z player layer; INERT until a doc is loaded.
+
+- `#demo-annotation-canvas` — the full-viewport stroke canvas (`pointer-events:none` in replay; the
+  player flips it to `auto` in author mode). DPR-aware; re-cleared and re-drawn every paint.
+- `#mockanim-cmt` — the comment-text panel (fixed, bottom-center). Carries `.mockanim-cmt-on` when it
+  holds at least one active comment's text; each comment text is a `.mockanim-cmt-item` child.
+- `.mockanim-cmt-tick` — one comment tick per distinct comment `tMs` inside `.mockanim-progress`
+  (rebuilt on doc change, NOT every tick); click-to-jump (`pointer-events:auto`). A multi-comment tick
+  carries a `.mockanim-cmt-tick-badge` count. Distinct shape/color from the chapter `.mockanim-marker`.
+
+### Author-mode DOM (`src/mock/animate/annotate-ui.ts`; mounts ONLY under the author flag)
+
+- `#mockanim-author` — the author toolbar root (top-center).
+- `.maa-tool[data-tool="pen"|"arrow"|"box"]` — the tool buttons (active one carries `.maa-active`).
+- `.maa-color[data-color="<hex>"]` — the color swatches (active one carries `.maa-active`); palette is
+  `#ff5555` / `#6aa3ff` / `#8be9a8`, default stroke width `3`.
+- `#maa-text` — the comment `<textarea>` for the current pin.
+- `.maa-pin` — the "Pin comment" button (pins the working strokes + text at the current T as a new
+  `c<seq>` comment, clears the working set).
+- `#maa-name` — the save-name `<input>` (defaults to `"review"`).
+- `.maa-save` — the Save button (POSTs the in-memory doc to the save middleware).
+- `#maa-list` — the "comments at this T" list; each row is a `.maa-list-item` with a `.maa-del` delete
+  button (`data-id=<commentId>`).
+- `#mockanim-author-toast` — a transient status toast (`.maa-toast-on` while visible).
+
+Author drafts are belt-and-suspenders stashed to `sessionStorage["mockanim-annotate-draft"]` on every
+doc mutation and restored on boot (unless a `?annotations=` file is being loaded), so an accidental HMR
+reload does not lose unsaved work.
+
+### Dev persistence middleware (`vite.mock.config.ts` → `annotationsApiPlugin`)
+
+A connect middleware on the mock dev server under `/__mock_annotations` (always included — inert unless
+its routes are hit). The browser cannot write files, so save/load round-trips through it.
+
+- `POST /__mock_annotations/save` — JSON body `{ name, doc }` → `200 { path }` (the absolute file
+  written). Invalid JSON → `400`; a name failing the guard → `400`.
+- `GET /__mock_annotations/load?name=<name>` → the doc JSON (`200`), `404` when no file, `400` on a bad
+  name.
+
+**Name guard (defense in depth — BOTH must pass):** (a) a strict regex `^[a-z0-9][a-z0-9_-]{0,63}$`,
+and (b) a resolved-path containment assertion (the resolved file MUST equal the naive
+`join(dir, name+".json")` AND sit strictly under `.mock-annotations/`). Writes are ATOMIC
+(temp + rename). `server.watch.ignored` excludes `**/.mock-annotations/**` so a save does not trip
+chokidar → HMR and drop the in-memory doc mid-author.
+
+### `AnnotationDoc` JSON shape (`src/mock/animate/annotations.ts`)
+
+```ts
+interface AnnotationDoc {
+  version: 1;
+  durationMs: number;
+  viewport: { w: number; h: number };   // author's viewport, for faithful replay/capture
+  comments: AnnotationComment[];
+}
+interface AnnotationComment {
+  id: string;                            // stable per-session "c1", "c2", …
+  tMs: number;                           // the scrub time the comment is pinned at
+  text: string;
+  strokes: Stroke[];
+}
+interface Stroke {
+  tool: "pen" | "arrow" | "box";         // pen = polyline through all points; arrow/box = [start, end]
+  color: string;
+  width: number;
+  points: Array<[number, number]>;       // NORMALIZED 0..1 to the viewport
+}
+```
+
+Stroke points are normalized to `0..1` plus the author's `viewport` size, so replay/capture at that
+same size reproduces the markup over the same app layout. A comment is **active** at scrub time `T`
+when `|tMs − T| <= 180` ms (boundary inclusive).
+
+### On-disk layout (`.mock-annotations/`, repo-root, dev-only, gitignored-by-watcher)
+
+- `.mock-annotations/<name>.json` — an authored `AnnotationDoc` (written by the save middleware).
+- `.mock-annotations/<name>/` — the capture output for that doc (`scripts/capture-annotations.mjs`):
+  - `NNNN_t<tMs>.png` — one settled, per-comment isolated screenshot (1-based zero-padded index +
+    the comment's `tMs`).
+  - `index.json` — `[{ commentId, tMs, text, png }]`, in doc order.
+
+The capture script reads the doc directly from disk, spawns `MOCK_ANIMATE=1 vite` on `CAPTURE_PORT`
+(default `1431`) + headless Chrome (pinned to the doc's viewport, `deviceScaleFactor:1`, scrollbars
+hidden), drives `window.__mockAnim` over raw CDP, and for each comment runs
+`seekSettled(tMs)` → double-rAF → `focusComment(id)` → rAF → `Page.captureScreenshot`. Env overrides:
+`CAPTURE_PORT`, `CAPTURE_DEBUG_PORT` (default `9333`), `CHROME_BIN`.
