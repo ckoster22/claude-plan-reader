@@ -32,6 +32,7 @@
 
 import { ConversationModel } from "../../conversation/stream";
 import { renderTree } from "../../conversation/render";
+import { createMinimap } from "../../conversation/minimap";
 import { invoke } from "../core";
 import { setPlans, setPendingReviews } from "../state";
 import { emitMockEvent } from "../event";
@@ -469,6 +470,44 @@ function mountPlayer(): void {
     document.body.appendChild(pane);
   }
 
+  // ---- player-owned conversation minimap (Phase 6) ----
+  // The real initConversation binds its OWN createMinimap controller to #conversation-stream — which the
+  // player HIDES (mockanim-hidden-stream) and never renders into — yet that controller paints the
+  // #conversation-minimap gutter node it queried at boot. Its MutationObserver/ResizeObserver re-paint
+  // from the EMPTY hidden stream every tick and re-assert `.is-empty`. CRUCIALLY both controllers boot on
+  // DOMContentLoaded, so a player controller bound to the SAME #conversation-minimap node is repeatedly
+  // CLOBBERED back to empty by the real (empty-stream) controller (verified at runtime: two controllers
+  // fighting over one node, the empty-stream one wins).
+  //
+  // The fix gives the player its OWN gutter node that the real controller can NEVER bind to. The original
+  // #conversation-minimap is LEFT in place (the real controller keeps painting it from the empty hidden
+  // stream → it stays `.is-empty` → `display:none`, invisible + harmless). We insert a SEPARATE
+  // `.conv-minimap` node — id `mockanim-minimap`, identical styling (the `.conv-minimap` CLASS carries
+  // all CSS; the id is never a selector) — as the VISIBLE sibling of `.mockanim-pane`, and the player's
+  // controller is the SOLE writer of it. No production file, CSS, or minimap.ts is touched.
+  let paneMinimap: { rebuild(): void; destroy(): void } = {
+    rebuild: () => {},
+    destroy: () => {},
+  };
+  // jsdom guard: createMinimap constructs a ResizeObserver (and a MutationObserver), which jsdom does
+  // NOT define — the player-boot unit tests (e.g. capture-focus.test.ts) call mountPlayer under jsdom and
+  // would throw `ResizeObserver is not defined`. The minimap is a browser/WebView-only affordance (it
+  // measures real offset geometry, which jsdom reports as 0 anyway), so skip its construction when the
+  // observers are unavailable — leaving the no-op `paneMinimap` stub. Real browsers (the demo, the CDP
+  // harness) always have ResizeObserver, so this never skips at runtime. We do NOT modify minimap.ts.
+  const observersAvailable = typeof ResizeObserver !== "undefined";
+  // Idempotent across an HMR re-eval (the mountPlayer guard already blocks a second mount, but belt-and-
+  // suspenders: never insert a second gutter).
+  if (observersAvailable && wrap && !document.getElementById("mockanim-minimap")) {
+    const playerMinimapEl = el("div", "conv-minimap");
+    playerMinimapEl.id = "mockanim-minimap";
+    playerMinimapEl.setAttribute("aria-hidden", "true");
+    // Start hidden; the controller's first rebuild toggles `.is-empty` off once the pane has children.
+    playerMinimapEl.classList.add("is-empty");
+    wrap.appendChild(playerMinimapEl);
+    paneMinimap = createMinimap(pane, playerMinimapEl);
+  }
+
   // The reading pane (the production render target). May be absent in a stripped DOM (fallback null).
   const readingPane =
     document.getElementById("reading-pane") ?? document.createElement("div");
@@ -790,6 +829,15 @@ function mountPlayer(): void {
         // renderTree does replaceChildren (no scroll handling); the long Execution conversation would
         // render with the finale below the fold. Pin to the bottom so the latest bubbles stay visible.
         pane.scrollTop = pane.scrollHeight;
+        // PLAYER-OWNED MINIMAP REBUILD (Phase 6): repaint the right-gutter minimap from the pane's
+        // CURRENT children every tick — a pure reflection of the just-rendered stream, so a back-scrub
+        // (which re-renders fewer/no children) reverts it cleanly (empty stream → `.is-empty`). Called
+        // AFTER the scrollTop pin above so the viewport indicator reflects the pinned scroll position.
+        // rebuild() coalesces to one paint per animation frame; idempotent across repeated ticks at the
+        // same T. The minimap's own ResizeObserver/MutationObserver also fire, but the explicit call
+        // guarantees a rebuild on every reconcile pass (the mock player drives renders directly, not via
+        // the app's rerender()).
+        paneMinimap.rebuild();
         // SAME-PASS PULSE RE-APPLY (anti-strobe): replaceChildren above wiped `.demo-pulse` on the conv
         // nodes. During a revealMs window the pulse SET is unchanged, so the memoized reconcilePulse
         // pass would NOT re-apply it — a separate post-pass would strobe at 20Hz. Re-apply the LAST
