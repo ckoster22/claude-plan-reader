@@ -637,6 +637,9 @@ export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): str
 //     handles; emitting it through the widened ConvFrame Extract LABELS the group ("scope-recon")
 //     WITHOUT any engine change.
 const TASK_ID = "toolu_trailhead_task_scope_recon";
+// The intent-clarifier subagent's Task id (Beat 1.5). Top-level Task; its OWN result is DEFERRED to the
+// group's end (mirrors scope-recon at smaller scale) so the spanning Task flips running→done.
+const CLARIFIER_TASK_ID = "toolu_trailhead_task_intent_clarifier";
 const QUESTION_ID = "toolu_trailhead_ask_platform";
 // The plan-sizer right-sizing gate's tool id (Beat 4). Top-level Task; its result lands atomically.
 const PLAN_SIZER_ID = "toolu_trailhead_plan_sizer";
@@ -665,32 +668,58 @@ export const B1_USER_PULSE_FROM = 8000; // pulse the user bubble …
 export const B1_USER_PULSE_TO = 9800; //   … for ~1.8s
 export const B1_REPLY_MS = 9900; // seq 2 assistant reply begins streaming
 
+// Beat 1.5 — Intent-clarifier running beat (P4, #2): BEFORE the clarify question card appears, the
+// intent-clarifier agent is shown RUNNING with realistic streaming tool calls (a small mirror of the
+// scope-recon group). It launches a top-level `intent-clarifier` Task, runs 4 atomic leaf tool pairs
+// (Glob/Read/Grep), notes a brief summary, then its OWN deferred Task tool_result flips it done — so the
+// viewer sees the clarifier work the codebase before it asks "which platform?". Seqs are FRACTIONAL
+// (2.x, strictly between the seq-2 reply and the seq-3 question) so NO downstream seq shifts: the
+// question stays seq 3 and the QUESTION INVARIANT (req.seq 3 < ans.seq 4) is untouched.
+export const B1B_LEAD_MS = 11000; // seq 2.1 brief reasoning ("Let me quickly scan the codebase…")
+export const B1B_TASK_MS = 11900; // seq 2.2 intent-clarifier Task tool_use + seq 2.3 subagent_started
+export const B1B_FIRSTWORDS_MS = 12200; // seq 2.4 the clarifier's first words (inside the group)
+export const B1B_LEAF_START_MS = 12700; // first clarifier leaf pair tMs; each steps by B1B_LEAF_STEP_MS
+export const B1B_LEAF_STEP_MS = 450; // the inter-leaf gap (atomic pair shares one tMs)
+export const B1B_SUMMARY_MS = 14800; // the clarifier's closing in-group summary
+export const B1B_TASK_RESULT_MS = 15300; // the clarifier Task's OWN deferred tool_result (flips it done)
+
+// CLARIFIER_SHIFT (load-bearing, P4 #2): the intent-clarifier running beat (B1B_*, above) is INSERTED
+// between the seq-2 reply (B1_REPLY_MS) and the (formerly tMs-11000) clarify question. It adds TIME only
+// (its model frames carry FRACTIONAL 2.x seqs, so no seq renumbering). EVERYTHING downstream of the reply
+// — the question (B2_*), scope-recon (B3_*), plan-sizer (B4_*), prototype review (PROTO_*), and the
+// programmatic Execution chapter (EXEC_BASE_MS) — slides later by exactly this much. The B2_/B3_/B4_/
+// PROTO_* literal constants below each add `+ CLARIFIER_SHIFT` (their pre-clarifier literal stays visible
+// as documentation); EXEC_BASE_MS adds it too; and the DOWNSTREAM_AFTER_PROTOTYPE splice .map adds it on
+// top of PROTO_ACT_SHIFT. SCROLL_* are NOT bumped here — they live only inside DOWNSTREAM_AFTER_PROTOTYPE,
+// which the .map already shifts by + CLARIFIER_SHIFT (bumping them too would double-shift).
+export const CLARIFIER_SHIFT = 4400; // B2_QUESTION_MS moves 11000 → 15400, after the clarifier result (15300).
+
 // Beat 2 — Clarify (the user is shown ENTERING the Other answer):
-export const B2_QUESTION_MS = 11000; // seq 3 question_request (the AskUserQuestion card)
-export const B2_QUESTION_PULSE_FROM = 11200; // pulse .conv-question …
-export const B2_QUESTION_PULSE_TO = 13200; //   … for ~2s (pause+pulse on the card)
-export const B2_ANSWER_TYPE_FROM = 13400; // field_type [data-other="text"] begins (reconciler auto-checks Other)
-export const B2_ANSWER_TYPE_TO = 15600; //   … typed over ~2.2s
-export const B2_SUBMIT_MOVE_MS = 15800; // cursor travels to .conv-question-submit
-export const B2_SUBMIT_CLICK_MS = 16200; // cosmetic click on .conv-question-submit
-export const B2_ANSWER_MS = 16400; // seq 4 question_answered (folds onto the card — source of truth) + seq 5 echo
+export const B2_QUESTION_MS = 11000 + CLARIFIER_SHIFT; // seq 3 question_request (the AskUserQuestion card)
+export const B2_QUESTION_PULSE_FROM = 11200 + CLARIFIER_SHIFT; // pulse .conv-question …
+export const B2_QUESTION_PULSE_TO = 13200 + CLARIFIER_SHIFT; //   … for ~2s (pause+pulse on the card)
+export const B2_ANSWER_TYPE_FROM = 13400 + CLARIFIER_SHIFT; // field_type [data-other="text"] begins (reconciler auto-checks Other)
+export const B2_ANSWER_TYPE_TO = 15600 + CLARIFIER_SHIFT; //   … typed over ~2.2s
+export const B2_SUBMIT_MOVE_MS = 15800 + CLARIFIER_SHIFT; // cursor travels to .conv-question-submit
+export const B2_SUBMIT_CLICK_MS = 16200 + CLARIFIER_SHIFT; // cosmetic click on .conv-question-submit
+export const B2_ANSWER_MS = 16400 + CLARIFIER_SHIFT; // seq 4 question_answered (folds onto the card — source of truth) + seq 5 echo
 
 // Beat 3 — Scope recon ×5 (~20 atomic leaf tool pairs under the scope-recon Task):
-export const B3_ACK_MS = 17600; // seq 6 assistant ack
-export const B3_TASK_MS = 18800; // seq 7 Task tool_use + seq 8 subagent_started
-export const B3_FIRSTWORDS_MS = 19100; // seq 9 subagent's first words
-export const B3_LEAF_START_MS = 20000; // first leaf pair tMs; each subsequent pair steps by B3_LEAF_STEP_MS
+export const B3_ACK_MS = 17600 + CLARIFIER_SHIFT; // seq 6 assistant ack
+export const B3_TASK_MS = 18800 + CLARIFIER_SHIFT; // seq 7 Task tool_use + seq 8 subagent_started
+export const B3_FIRSTWORDS_MS = 19100 + CLARIFIER_SHIFT; // seq 9 subagent's first words
+export const B3_LEAF_START_MS = 20000 + CLARIFIER_SHIFT; // first leaf pair tMs; each subsequent pair steps by B3_LEAF_STEP_MS
 export const B3_LEAF_STEP_MS = 450; // the inter-leaf gap (atomic pair shares one tMs)
-export const B3_SUMMARY_MS = 31000; // the subagent's closing summary
-export const B3_TASK_RESULT_MS = 31900; // the Task's OWN deferred tool_result (flips it done)
-export const B3_WRAPUP_MS = 32800; // the top-level wrap-up
+export const B3_SUMMARY_MS = 31000 + CLARIFIER_SHIFT; // the subagent's closing summary
+export const B3_TASK_RESULT_MS = 31900 + CLARIFIER_SHIFT; // the Task's OWN deferred tool_result (flips it done)
+export const B3_WRAPUP_MS = 32800 + CLARIFIER_SHIFT; // the top-level wrap-up
 
 // Beat 4 — Plan-sizer (NEW): the right-sizing gate between scope-recon and the drafted plan:
-export const B4_NARRATION_MS = 34200; // short narration announcing the right-sizing gate
-export const B4_SIZER_MS = 35400; // the plan-sizer Task tool_use + its atomic tool_result
-export const B4_SIZER_PULSE_FROM = 35600; // brief pulse on the plan-sizer row …
-export const B4_SIZER_PULSE_TO = 37200; //   … ~1.6s
-export const B4_OUTCOME_MS = 37600; // narration of the split decision
+export const B4_NARRATION_MS = 34200 + CLARIFIER_SHIFT; // short narration announcing the right-sizing gate
+export const B4_SIZER_MS = 35400 + CLARIFIER_SHIFT; // the plan-sizer Task tool_use + its atomic tool_result
+export const B4_SIZER_PULSE_FROM = 35600 + CLARIFIER_SHIFT; // brief pulse on the plan-sizer row …
+export const B4_SIZER_PULSE_TO = 37200 + CLARIFIER_SHIFT; //   … ~1.6s
+export const B4_OUTCOME_MS = 37600 + CLARIFIER_SHIFT; // narration of the split decision
 
 // EXEC_SHIFT / SEQ_SHIFT (load-bearing): the rewritten front (beats 1-4) is LONGER and uses MORE seqs
 // than the original. The downstream beats (prototype review … execution … terminal) are kept VERBATIM
@@ -733,7 +762,7 @@ export const COMMENT_ACT_SHIFT = 5000;
 // literals from the scroll beat onward shifted by + SCROLL_BEAT_SHIFT, so the comment chapter's last
 // model frame (the seq-64 system echo, literal 58400 + SCROLL_BEAT_SHIFT) lands at final
 // 58400 + SCROLL_BEAT_SHIFT + PROTO_ACT_SHIFT. EXEC_BASE_MS must stay strictly greater than that.
-export const EXEC_BASE_MS = 80000; // Execution open_plan{null}; > the comment act's last frame (79000).
+export const EXEC_BASE_MS = 80000 + CLARIFIER_SHIFT; // Execution open_plan{null}; > the comment act's last frame (79000 + CLARIFIER_SHIFT).
 export const EXEC_SEQ_BASE = 65; // first Execution model seq (= old 64 + 1, contiguous after the comment chapter).
 
 // ---- (P2) Scroll beat + c2-act constants (tests pin to THESE) -----------------------------------
@@ -756,25 +785,27 @@ export const SCROLL_UP_TO = 55600; //   … reaching the top over ~2.2s
 // ---- Named tMs constants for the P4 prototype ACT (tests pin to THESE, not magic numbers) -------
 // The prototype chapter narration (seq 59) lands at PROTO_NARR_MS; the act then plays out as a sequence
 // of dwells (pulses spanning tMs gaps) the player's hold-state covers. All overlay frames; no seqs.
-export const PROTO_NARR_MS = 39800; // seq 59 "I put together a quick visual prototype…"
-export const PROTO_NARR_PULSE_FROM = 40700; // pulse the narration bubble (by data-seq) …
-export const PROTO_NARR_PULSE_TO = 42700; //   … ~2s pause (the viewer reads it)
-export const PROTO_OPEN_MS = 40600; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → round-1 card shows
-export const PROTO_CARD1_PULSE_FROM = 42800; // pulse #demo-proto-card (round 1) …
-export const PROTO_CARD1_PULSE_TO = 44800; //   … ~2s
-export const PROTO_FEEDBACK_MOVE_MS = 44900; // cursor → #prototype-feedback
-export const PROTO_FEEDBACK_TYPE_FROM = 45200; // field_type #prototype-feedback begins …
-export const PROTO_FEEDBACK_TYPE_TO = 47700; //   … typed over ~2.5s (also pulsed across this window)
-export const PROTO_SUBMIT_MOVE_MS = 47900; // cursor → #review-submit
-export const PROTO_SUBMIT_CLICK_MS = 48200; // cosmetic click on #review-submit ("Request changes")
-export const PROTO_ROUND2_MS = 48400; // prototype_gate{on,round:2} → the card MORPHS larger + difficulty badge
-export const PROTO_CARD2_PULSE_FROM = 48600; // pulse #demo-proto-card (round 2) …
-export const PROTO_CARD2_PULSE_TO = 50600; //   … ~2s pause
-export const PROTO_APPROVE_MOVE_MS = 50800; // cursor → #review-approve
-export const PROTO_APPROVE_CLICK_MS = 51100; // cosmetic click on #review-approve ("Approve visual")
-export const PROTO_CLOSE_MS = 51300; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
-export const PROTO_FEEDBACK_MS = 51600; // seq 60 user feedback bubble + seq 61 approval echo (land together)
-export const PROTO_ACK_MS = 52400; // seq 62 assistant ack
+// (All PROTO_* add + CLARIFIER_SHIFT — the intent-clarifier beat slid the whole back half later; the
+// pre-clarifier literal stays visible as documentation, tests pin to the constants.)
+export const PROTO_NARR_MS = 39800 + CLARIFIER_SHIFT; // seq 59 "I put together a quick visual prototype…"
+export const PROTO_NARR_PULSE_FROM = 40700 + CLARIFIER_SHIFT; // pulse the narration bubble (by data-seq) …
+export const PROTO_NARR_PULSE_TO = 42700 + CLARIFIER_SHIFT; //   … ~2s pause (the viewer reads it)
+export const PROTO_OPEN_MS = 40600 + CLARIFIER_SHIFT; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → round-1 card shows
+export const PROTO_CARD1_PULSE_FROM = 42800 + CLARIFIER_SHIFT; // pulse #demo-proto-card (round 1) …
+export const PROTO_CARD1_PULSE_TO = 44800 + CLARIFIER_SHIFT; //   … ~2s
+export const PROTO_FEEDBACK_MOVE_MS = 44900 + CLARIFIER_SHIFT; // cursor → #prototype-feedback
+export const PROTO_FEEDBACK_TYPE_FROM = 45200 + CLARIFIER_SHIFT; // field_type #prototype-feedback begins …
+export const PROTO_FEEDBACK_TYPE_TO = 47700 + CLARIFIER_SHIFT; //   … typed over ~2.5s (also pulsed across this window)
+export const PROTO_SUBMIT_MOVE_MS = 47900 + CLARIFIER_SHIFT; // cursor → #review-submit
+export const PROTO_SUBMIT_CLICK_MS = 48200 + CLARIFIER_SHIFT; // cosmetic click on #review-submit ("Request changes")
+export const PROTO_ROUND2_MS = 48400 + CLARIFIER_SHIFT; // prototype_gate{on,round:2} → the card MORPHS larger + difficulty badge
+export const PROTO_CARD2_PULSE_FROM = 48600 + CLARIFIER_SHIFT; // pulse #demo-proto-card (round 2) …
+export const PROTO_CARD2_PULSE_TO = 50600 + CLARIFIER_SHIFT; //   … ~2s pause
+export const PROTO_APPROVE_MOVE_MS = 50800 + CLARIFIER_SHIFT; // cursor → #review-approve
+export const PROTO_APPROVE_CLICK_MS = 51100 + CLARIFIER_SHIFT; // cosmetic click on #review-approve ("Approve visual")
+export const PROTO_CLOSE_MS = 51300 + CLARIFIER_SHIFT; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
+export const PROTO_FEEDBACK_MS = 51600 + CLARIFIER_SHIFT; // seq 60 user feedback bubble + seq 61 approval echo (land together)
+export const PROTO_ACK_MS = 52400 + CLARIFIER_SHIFT; // seq 62 assistant ack
 // (P5) The Execution chapter is now a SEQUENCE OF SUBAGENTS — one Task subagent per subplan, each with
 // 4–6 atomic leaf tool calls + a deferred top-level Task tool_result. The per-subplan Task ids and the
 // leaf-tool ids are generated by the EXEC_SUBPLANS builder below (no hand-authored WRITE_* ids).
@@ -941,6 +972,235 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
         seq: 2,
         kind: "assistant_text",
         text: "Happy to. One quick question before I scope the codebase.",
+        parent_tool_use_id: null,
+      },
+    },
+  },
+
+  // ================================================================================================
+  // Chapter "Clarify" — Beat 1.5: intent-clarifier RUNNING beat (P4, #2)
+  // ================================================================================================
+  //
+  // BEFORE the question card lands, the intent-clarifier agent is shown RUNNING — a small mirror of the
+  // scope-recon group (Task + subagent_started label + atomic leaf tool pairs + an in-group summary + a
+  // DEFERRED top-level Task tool_result that flips it done). So the viewer sees the clarifier scan the
+  // codebase to ASK THE RIGHT QUESTION, instead of the card landing cold. Every leaf carries
+  // parent_tool_use_id = CLARIFIER_TASK_ID and is ATOMIC (tool_use + tool_result share a tMs → no
+  // lingering "running" leaf). SEQS ARE FRACTIONAL (2.1 … 2.9, strictly between the seq-2 reply and the
+  // seq-3 question) so NOTHING downstream renumbers — the question stays seq 3 (QUESTION INVARIANT intact).
+  {
+    // seq 2.1 — a brief top-level reasoning line (streams via revealMs 800).
+    tMs: B1B_LEAD_MS,
+    frame: {
+      t: "conv",
+      revealMs: 800,
+      ev: {
+        seq: 2.1,
+        kind: "assistant_text",
+        text: "Let me quickly scan the codebase so I ask the right question…",
+        parent_tool_use_id: null,
+      },
+    },
+  },
+  {
+    // seq 2.2 — the Task tool_use launching the `intent-clarifier` subagent. Top-level (parent null); its
+    // OWN result is DEFERRED to the group's end (so the Task SPANS the whole clarifier group).
+    tMs: B1B_TASK_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.2,
+        kind: "tool_use",
+        id: CLARIFIER_TASK_ID,
+        tool: "Task",
+        input: {
+          description: "Clarify intent before planning",
+          subagent_type: "intent-clarifier",
+          prompt:
+            "Skim the Trailhead repo just enough to ask ONE high-leverage clarifying question before scoping: detect the target platform(s), the package manager, and any existing platform config so the question is grounded.",
+        },
+        parent_tool_use_id: null,
+      },
+    },
+  },
+  {
+    // seq 2.3 — a `subagent_started` frame LABELS the group (header → "intent-clarifier"). Keyed by
+    // tool_use_id = CLARIFIER_TASK_ID. Produces NO timeline node; it seeds the group metadata.
+    tMs: B1B_TASK_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.3,
+        kind: "subagent_started",
+        tool_use_id: CLARIFIER_TASK_ID,
+        subagent_type: "intent-clarifier",
+        description: "Clarify intent before planning",
+        prompt:
+          "Skim the Trailhead repo just enough to ask ONE high-leverage clarifying question before scoping: detect the target platform(s), the package manager, and any existing platform config so the question is grounded.",
+      },
+    },
+  },
+  {
+    // seq 2.4 — the clarifier's first words (INSIDE the group, parent = CLARIFIER_TASK_ID).
+    tMs: B1B_FIRSTWORDS_MS,
+    frame: {
+      t: "conv",
+      revealMs: 700,
+      ev: {
+        seq: 2.4,
+        kind: "assistant_text",
+        text: "Checking which platforms the project is already set up for…",
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.41 — LEAF Glob (inside the group, parent = CLARIFIER_TASK_ID). Atomic with its result (2.42).
+    tMs: B1B_LEAF_START_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.41,
+        kind: "tool_use",
+        id: "toolu_th_ic_1",
+        tool: "Glob",
+        input: { pattern: "{android,ios}/**" },
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.42 — Glob result (SAME tMs = atomic; the leaf never lingers "running").
+    tMs: B1B_LEAF_START_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.42,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ic_1",
+        content: "android/app/build.gradle\nandroid/settings.gradle\n(no ios/ directory found)",
+        is_error: false,
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.43 — LEAF Read (parent = CLARIFIER_TASK_ID). Atomic with its result (2.44).
+    tMs: B1B_LEAF_START_MS + 1 * B1B_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.43,
+        kind: "tool_use",
+        id: "toolu_th_ic_2",
+        tool: "Read",
+        input: { file_path: "package.json" },
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.44 — Read result (SAME tMs = atomic).
+    tMs: B1B_LEAF_START_MS + 1 * B1B_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.44,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ic_2",
+        content: "{\n  \"name\": \"trailhead\",\n  \"scripts\": { \"android\": \"react-native run-android\" },\n  \"dependencies\": { \"react-native\": \"0.74.1\" }\n}",
+        is_error: false,
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.45 — LEAF Grep (parent = CLARIFIER_TASK_ID). Atomic with its result (2.46).
+    tMs: B1B_LEAF_START_MS + 2 * B1B_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.45,
+        kind: "tool_use",
+        id: "toolu_th_ic_3",
+        tool: "Grep",
+        input: { pattern: "Platform.OS", glob: "src/**/*.tsx" },
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.46 — Grep result (SAME tMs = atomic).
+    tMs: B1B_LEAF_START_MS + 2 * B1B_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.46,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ic_3",
+        content: "src/screens/MapScreen.tsx: const provider = Platform.OS === 'android' ? 'google' : 'apple';",
+        is_error: false,
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.47 — LEAF Grep (parent = CLARIFIER_TASK_ID). Atomic with its result (2.48).
+    tMs: B1B_LEAF_START_MS + 3 * B1B_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.47,
+        kind: "tool_use",
+        id: "toolu_th_ic_4",
+        tool: "Grep",
+        input: { pattern: "minSdkVersion", glob: "android/**/*.gradle" },
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.48 — Grep result (SAME tMs = atomic).
+    tMs: B1B_LEAF_START_MS + 3 * B1B_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.48,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ic_4",
+        content: "android/app/build.gradle: minSdkVersion 24",
+        is_error: false,
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.85 — the clarifier's closing in-group summary (parent = CLARIFIER_TASK_ID).
+    tMs: B1B_SUMMARY_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.85,
+        kind: "assistant_text",
+        text: "Only Android is wired up (no ios/ dir, an android run-script, minSdkVersion 24). I'll confirm the platform target with the user.",
+        parent_tool_use_id: CLARIFIER_TASK_ID,
+      },
+    },
+  },
+  {
+    // seq 2.9 — the clarifier Task's OWN DEFERRED tool_result. Top-level (parent null), tool_use_id =
+    // CLARIFIER_TASK_ID → flips the spanning Task running→done (without it the Task row stays "running"
+    // forever — the recursive no-stuck-tool invariant fails). Lands BEFORE the seq-3 question (tMs + seq).
+    tMs: B1B_TASK_RESULT_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 2.9,
+        kind: "tool_result",
+        tool_use_id: CLARIFIER_TASK_ID,
+        content:
+          "Clarifier finding: the repo is Android-only today (no ios/ directory, an `android` run-script, minSdkVersion 24). Recommend asking the user which platform the first cut should target before scoping.",
+        is_error: false,
         parent_tool_use_id: null,
       },
     },
@@ -2855,7 +3115,11 @@ function shiftStoryFrame(sf: StoryFrame, delta: number): StoryFrame {
 // FINAL tMs/seq — pushed verbatim, no shift). chapterLabels preserved; monotonic tMs preserved (the
 // comment chapter's last frame stays strictly below EXEC_BASE_MS).
 for (const sf of DOWNSTREAM_AFTER_PROTOTYPE) {
-  TRAILHEAD_BEAT.push(shiftStoryFrame(sf, PROTO_ACT_SHIFT));
+  // + CLARIFIER_SHIFT on top of PROTO_ACT_SHIFT: the intent-clarifier running beat (B1B_*) inserted in
+  // the front slides this whole block (nested-plan … comment & iterate) later by CLARIFIER_SHIFT too.
+  // (The SCROLL_* frames live only here, so this single .map is the one place their inner windows pick up
+  // CLARIFIER_SHIFT — the SCROLL_* CONSTANTS are deliberately NOT bumped, to avoid double-shifting.)
+  TRAILHEAD_BEAT.push(shiftStoryFrame(sf, PROTO_ACT_SHIFT + CLARIFIER_SHIFT));
 }
 for (const sf of EXEC_BUILT.frames) {
   TRAILHEAD_BEAT.push(sf);

@@ -46,7 +46,7 @@ import {
   TERMINAL_SEQ,
   EXEC_SHIFT,
   PROTO_ACT_SHIFT,
-  COMMENT_ACT_SHIFT,
+  CLARIFIER_SHIFT,
   PROTO_NARR_MS,
   PROTO_OPEN_MS,
   PROTO_CARD1_PULSE_FROM,
@@ -63,6 +63,10 @@ import {
   B1_COMPOSER_CLOSE_MS,
   B1_USER_MSG_MS,
   B1_REPLY_MS,
+  B1B_LEAD_MS,
+  B1B_TASK_MS,
+  B1B_LEAF_START_MS,
+  B1B_TASK_RESULT_MS,
   B2_QUESTION_MS,
   B2_ANSWER_TYPE_FROM,
   B2_ANSWER_TYPE_TO,
@@ -191,7 +195,7 @@ describe("storyboard — applyUpToTime invariants", () => {
     expect(model.derive().working).not.toBeNull();
 
     // Inside the "Execution" chapter (old 33000 + all shifts) — still generating, working is live.
-    applyUpToTime(model, TRAILHEAD_BEAT, 33000 + EXEC_SHIFT + PROTO_ACT_SHIFT + COMMENT_ACT_SHIFT);
+    applyUpToTime(model, TRAILHEAD_BEAT, EXEC_BASE_MS + 6000);
     expect(model.derive().working).not.toBeNull();
 
     // At the end of the story the terminal `result` frame has landed → the turn is complete.
@@ -403,9 +407,12 @@ describe("storyboard — P3 front (opening / clarify / scope×20 / plan-sizer)",
   it("BEAT 3 — no leaf tool is left 'running' anywhere in the scope-recon group (recursive, at duration)", () => {
     const model = new ConversationModel();
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
-    const group = model.derive().nodes.find((n) => n.type === "subagent") as
-      | { children: Array<{ type: string; status?: string }> }
-      | undefined;
+    // Select the scope-recon group BY agentId — the beat now has MULTIPLE subagent groups (the
+    // intent-clarifier beat runs its own smaller group EARLIER, so it sorts first); the scope-recon group
+    // is the one keyed by the scope-recon Task id.
+    const group = model.derive().nodes.find(
+      (n) => n.type === "subagent" && (n as { agentId: string }).agentId === "toolu_trailhead_task_scope_recon",
+    ) as { children: Array<{ type: string; status?: string }> } | undefined;
     expect(group).toBeDefined();
     const leafTools = group!.children.filter((c) => c.type === "tool");
     // ~20 leaf tools nested in the group, none running.
@@ -461,7 +468,7 @@ describe("storyboard — P3 front (opening / clarify / scope×20 / plan-sizer)",
 
   it("BEAT 4 — the plan-sizer narration outcome lands AFTER scope-recon completes and BEFORE the prototype review", () => {
     // The plan-sizer outcome (B4_OUTCOME_MS) is the last front beat before the (shifted) prototype review.
-    expect(B4_OUTCOME_MS).toBeLessThan(13000 + EXEC_SHIFT); // the prototype-review chapter's shifted open.
+    expect(B4_OUTCOME_MS).toBeLessThan(13000 + EXEC_SHIFT + CLARIFIER_SHIFT); // the prototype-review chapter's shifted open.
     // And it follows the scope-recon Task's deferred result.
     const taskResult = TRAILHEAD_BEAT.find(
       (sf) =>
@@ -484,6 +491,148 @@ describe("storyboard — P3 front (opening / clarify / scope×20 / plan-sizer)",
 //   • a "Prototype review" chapter label opens it;
 //   • projectSurfaceState makes prototypeGate.on AND activeTab="plan" true exactly inside the window;
 //   • the terminal result is still STRICTLY the last frame (highest seq AND tMs).
+
+// ---- (P4 #2) TRAILHEAD_BEAT — intent-clarifier RUNNING beat (before the question card) ----------
+//
+// Before the clarify question card lands (B2_QUESTION_MS) the intent-clarifier agent is shown RUNNING:
+// a top-level `intent-clarifier` Task + a `subagent_started` label + >=3 atomic leaf tool pairs + an
+// in-group summary + a DEFERRED top-level Task tool_result (which flips the spanning Task done). These
+// assert that group exists and resolves BEFORE the question — so the viewer sees the clarifier work the
+// codebase before it asks. The seqs are FRACTIONAL (2.x) so no downstream renumbering. Each is FALSIFIABLE
+// (the cited inversion turns it RED — verified by hand).
+
+describe("storyboard — (P4 #2) intent-clarifier running beat (before the question)", () => {
+  const CLARIFIER_TASK_ID = "toolu_trailhead_task_intent_clarifier";
+
+  // Every leaf tool_use whose parent is the clarifier Task (excluding the Task itself).
+  function clarifierLeafUses(): StoryFrame[] {
+    return TRAILHEAD_BEAT.filter((sf) => {
+      if (sf.frame.t !== "conv") return false;
+      const ev = (sf.frame as { ev: { kind: string; parent_tool_use_id: string | null; tool?: string } }).ev;
+      return ev.kind === "tool_use" && ev.parent_tool_use_id === CLARIFIER_TASK_ID && ev.tool !== "Task";
+    });
+  }
+
+  it("a labeled intent-clarifier Task + subagent_started group with >=3 ATOMIC leaves runs BEFORE the question card", () => {
+    // (1) The top-level Task tool_use launching the clarifier subagent, before the question.
+    const taskUse = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; id?: string; tool?: string } }).ev.kind === "tool_use" &&
+        (sf.frame as { ev: { id?: string } }).ev.id === CLARIFIER_TASK_ID &&
+        (sf.frame as { ev: { tool?: string } }).ev.tool === "Task",
+    );
+    // FALSIFIABILITY: remove the clarifier Task tool_use and this find goes undefined → RED.
+    expect(taskUse, "clarifier Task tool_use").toBeDefined();
+    expect(taskUse!.tMs).toBe(B1B_TASK_MS);
+    expect((taskUse!.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id).toBeNull();
+    expect((taskUse!.frame as { ev: { input: { subagent_type: string } } }).ev.input.subagent_type).toBe(
+      "intent-clarifier",
+    );
+    // The whole clarifier group runs BEFORE the question card.
+    expect(taskUse!.tMs).toBeLessThan(B2_QUESTION_MS);
+
+    // (2) The `subagent_started` LABEL frame keyed to the Task id (names the group).
+    const started = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; tool_use_id?: string } }).ev.kind === "subagent_started" &&
+        (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === CLARIFIER_TASK_ID,
+    );
+    // FALSIFIABILITY: drop the subagent_started frame → undefined → RED (and the derived group loses its label).
+    expect(started, "clarifier subagent_started label").toBeDefined();
+
+    // (3) >=3 leaf tool pairs, ALL parented to the Task, EACH atomic (use+result share a tMs), ALL before
+    // the question. FALSIFIABILITY: move a leaf's result to a later tMs → the shared-tMs assert goes RED.
+    const leafUses = clarifierLeafUses();
+    expect(leafUses.length, "clarifier leaf count").toBeGreaterThanOrEqual(3);
+    for (const useSf of leafUses) {
+      const useEv = (useSf.frame as { ev: { id: string } }).ev;
+      expect(useSf.tMs, "leaf before question").toBeLessThan(B2_QUESTION_MS);
+      expect(useSf.tMs, "leaf at/after clarifier leaf-start").toBeGreaterThanOrEqual(B1B_LEAF_START_MS);
+      const resultSf = TRAILHEAD_BEAT.find(
+        (sf) =>
+          sf.frame.t === "conv" &&
+          (sf.frame as { ev: { kind: string; tool_use_id?: string } }).ev.kind === "tool_result" &&
+          (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === useEv.id,
+      );
+      expect(resultSf, `tool_result for clarifier leaf ${useEv.id}`).toBeDefined();
+      expect(resultSf!.tMs, `atomic tMs for clarifier leaf ${useEv.id}`).toBe(useSf.tMs);
+      expect(
+        (resultSf!.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id,
+        "leaf result parented to clarifier Task",
+      ).toBe(CLARIFIER_TASK_ID);
+    }
+    // The leaf MIX is realistic (Glob/Read/Grep present — the clarifier's grounding scan).
+    const tools = new Set(leafUses.map((sf) => (sf.frame as { ev: { tool: string } }).ev.tool));
+    expect(tools.has("Glob")).toBe(true);
+    expect(tools.has("Read")).toBe(true);
+    expect(tools.has("Grep")).toBe(true);
+  });
+
+  it("the clarifier lead + group all precede the question card (lead < Task < result < question)", () => {
+    // The reasoning lead, the Task, its deferred result, and the question card are strictly ordered in tMs.
+    expect(B1B_LEAD_MS).toBeLessThan(B1B_TASK_MS);
+    expect(B1B_TASK_MS).toBeLessThan(B1B_TASK_RESULT_MS);
+    // FALSIFIABILITY: if the question were hoisted before the clarifier result (no shift), this goes RED.
+    expect(B1B_TASK_RESULT_MS).toBeLessThan(B2_QUESTION_MS);
+  });
+
+  it("the clarifier Task RESOLVES — a deferred top-level Task tool_result flips it done (no stuck tool)", () => {
+    // The DEFERRED result: a top-level tool_result (parent null) whose tool_use_id = the clarifier Task id.
+    const deferred = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; tool_use_id?: string; parent_tool_use_id: string | null } }).ev.kind === "tool_result" &&
+        (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === CLARIFIER_TASK_ID &&
+        (sf.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id === null,
+    );
+    // FALSIFIABILITY: delete the deferred clarifier Task tool_result → undefined here, AND the derived
+    // clarifier Task node is left 'running' at duration (the assertion below + no-stuck invariant go RED).
+    expect(deferred, "deferred clarifier Task tool_result").toBeDefined();
+    expect(deferred!.tMs).toBe(B1B_TASK_RESULT_MS);
+
+    // Derived: at duration the clarifier group exists, is LABELED, has >=3 child tools, NONE running.
+    const model = new ConversationModel();
+    applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
+    const group = model.derive().nodes.find(
+      (n) => n.type === "subagent" && (n as { agentId: string }).agentId === CLARIFIER_TASK_ID,
+    ) as { children: Array<{ type: string; status?: string }>; subagentType: string | null } | undefined;
+    expect(group, "derived clarifier subagent group").toBeDefined();
+    expect(group!.subagentType).toBe("intent-clarifier");
+    const childTools = group!.children.filter((c) => c.type === "tool");
+    expect(childTools.length, "clarifier child tools").toBeGreaterThanOrEqual(3);
+    for (const c of childTools) expect(c.status).not.toBe("running");
+
+    // The spanning clarifier Task node itself is NOT running at duration (the deferred result flipped it).
+    const taskNode = model
+      .derive()
+      .nodes.find((n) => n.type === "tool" && (n as { input?: { subagent_type?: string } }).input?.subagent_type === "intent-clarifier") as
+      | { status: string }
+      | undefined;
+    expect(taskNode, "clarifier Task node").toBeDefined();
+    expect(taskNode!.status).not.toBe("running");
+  });
+
+  it("at a T inside the clarifier window (before the question) the clarifier group is rendering and the question card is ABSENT", () => {
+    // Sample a T after the leaves start but before the question: the clarifier subagent group is present
+    // (the agent is visibly working) and NO question_request node exists yet.
+    const model = new ConversationModel();
+    const midClarifier = B1B_LEAF_START_MS + 100;
+    expect(midClarifier).toBeLessThan(B2_QUESTION_MS);
+    applyUpToTime(model, TRAILHEAD_BEAT, midClarifier);
+    const tree = model.derive();
+    const group = tree.nodes.find(
+      (n) => n.type === "subagent" && (n as { agentId: string }).agentId === CLARIFIER_TASK_ID,
+    );
+    // FALSIFIABILITY: if the clarifier group were dropped (or moved after the question) this group find →
+    // undefined → RED; and the question would appear cold (no preceding agent activity).
+    expect(group, "clarifier group rendering mid-window").toBeDefined();
+    expect(tree.nodes.some((n) => n.type === "question_request"), "question absent before its tMs").toBe(false);
+    // The turn is still generating while the clarifier runs (working non-null).
+    expect(tree.working).not.toBeNull();
+  });
+});
 
 describe("storyboard — TRAILHEAD_BEAT prototype-review chapter", () => {
   // P4: the gate + open_plan bracket span the WHOLE scripted prototype act — opening at PROTO_OPEN_MS,
@@ -631,8 +780,9 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
   });
 
   // Nested-plan + comment chapters shift by + PROTO_ACT_SHIFT (the P4 prototype act lengthened the
-  // upstream chapter); the literals are unchanged, the shift is added.
-  const NESTED_SHIFT = EXEC_SHIFT + PROTO_ACT_SHIFT;
+  // upstream chapter) + CLARIFIER_SHIFT (the P4#2 intent-clarifier beat slid the whole back half later);
+  // the literals are unchanged, the shift is added.
+  const NESTED_SHIFT = EXEC_SHIFT + PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
   const PLAN_CHANGED_MS = 19800 + NESTED_SHIFT;
 
   it("(P1) sidebar is EMPTY ([]) before the reveal, then ONLY the master appears (NOT the whole tree); the full tree lands only at duration", () => {
@@ -685,7 +835,7 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
   it("FINISHED THOUGHT — working is non-null in the nested-plan gap but null at duration", () => {
     // Inside the "Nested plan" gap (after the plan_changed reveal, before the terminal result) — still
     // generating, so working is live.
-    applyUpToTime(model, TRAILHEAD_BEAT, 20000 + EXEC_SHIFT + PROTO_ACT_SHIFT);
+    applyUpToTime(model, TRAILHEAD_BEAT, 20000 + EXEC_SHIFT + PROTO_ACT_SHIFT + CLARIFIER_SHIFT);
     expect(model.derive().working).not.toBeNull();
     // At duration the terminal result has landed → the turn is complete, working is null.
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
@@ -907,7 +1057,9 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
   // c2 got its OWN full popover act, so each comment's highlight paints AFTER its act: set_comments land
   // at literal 59800 ([c1]) / 63800 ([c1,c2]) / 67800 ([c1,c2,c3]); V2 opens at literal 69000 (all +
   // PROTO_ACT_SHIFT).
-  const CMT_SHIFT = PROTO_ACT_SHIFT;
+  // + CLARIFIER_SHIFT: the intent-clarifier beat slid the whole back half (incl. this comment chapter)
+  // later by CLARIFIER_SHIFT, applied via the DOWNSTREAM_AFTER_PROTOTYPE splice .map.
+  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
   const C1_PAINT_MS = 59800 + CMT_SHIFT;
   const C2_PAINT_MS = 63800 + CMT_SHIFT;
   const C3_PAINT_MS = 67800 + CMT_SHIFT;
@@ -1008,7 +1160,7 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
     // Inside the Execution chapter (old 33000 + all shifts, before the terminal result) — still
     // generating, so working is live. FALSIFIABILITY: relocate the terminal to a non-last tMs and the
     // `working === null at duration` assertion goes RED (working stays non-null at the end).
-    applyUpToTime(model, TRAILHEAD_BEAT, 33000 + EXEC_SHIFT + PROTO_ACT_SHIFT + COMMENT_ACT_SHIFT);
+    applyUpToTime(model, TRAILHEAD_BEAT, EXEC_BASE_MS + 6000);
     expect(model.derive().working).not.toBeNull();
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
     expect(model.derive().working).toBeNull();
@@ -1260,7 +1412,7 @@ describe("storyboard — TRAILHEAD_BEAT execution chapter (the final beat)", () 
       .filter((t) => t.type === "tool" && (t as { status: string }).status === "running");
     expect(running).toHaveLength(0);
     // Finished thought: working is live mid-Execution (old 33000 + all shifts) and null once the terminal lands.
-    applyUpToTime(model, TRAILHEAD_BEAT, 33000 + EXEC_SHIFT + PROTO_ACT_SHIFT + COMMENT_ACT_SHIFT);
+    applyUpToTime(model, TRAILHEAD_BEAT, EXEC_BASE_MS + 6000);
     expect(model.derive().working).not.toBeNull();
     applyUpToTime(model, TRAILHEAD_BEAT, duration);
     expect(model.derive().working).toBeNull();
