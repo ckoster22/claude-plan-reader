@@ -46,8 +46,15 @@ function injectAnimatePlugin(): Plugin {
     name: "mock-inject-animate",
     transformIndexHtml(html: string): string {
       const tag = '<script type="module" src="/src/mock/animate/index.ts"></script>';
+      // Author mode (`npm run mock-annotate`, MOCK_ANNOTATE=1): set window.__MOCK_ANNOTATE BEFORE the
+      // player module evaluates, so index.ts boots paused + mounts the author UI. A plain inline
+      // (non-module) <script> runs synchronously at parse time, before the deferred module below.
+      const flag = process.env.MOCK_ANNOTATE
+        ? "<script>window.__MOCK_ANNOTATE=true</script>\n  "
+        : "";
+      const inject = `${flag}${tag}`;
       // Insert before the closing body tag; fall back to appending if it is somehow absent.
-      return html.includes("</body>") ? html.replace("</body>", `  ${tag}\n  </body>`) : html + tag;
+      return html.includes("</body>") ? html.replace("</body>", `  ${inject}\n  </body>`) : html + inject;
     },
   };
 }

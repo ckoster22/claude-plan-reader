@@ -7,6 +7,7 @@
     "dev": "vite",
     "mock": "vite --config vite.mock.config.ts",
     "mock-animate": "MOCK_ANIMATE=1 vite --config vite.mock.config.ts",
+    "mock-annotate": "MOCK_ANIMATE=1 MOCK_ANNOTATE=1 vite --config vite.mock.config.ts",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",

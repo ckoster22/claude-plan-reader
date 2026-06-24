@@ -57,7 +57,8 @@ import {
   type AnnotationComment,
   type Stroke,
 } from "./annotations";
-import { loadDoc } from "./annotations-io";
+import { loadDoc, saveDoc } from "./annotations-io";
+import { mountAnnotateUI, runAuthorPaintHooks } from "./annotate-ui";
 import type { PlanRecord, ReviewRequest } from "../../types";
 
 // ---- window globals: the programmatic seek hook + the author-mode flag --------------------------
@@ -432,6 +433,16 @@ function mountPlayer(): void {
   if (document.getElementById("mock-anim")) return;
   injectStyle();
 
+  // AUTHOR MODE (Phase 3): the one interactive path. Gated on the injected flag OR a `?annotate=1`
+  // runtime fallback. When ON: boot PAUSED, mount the author toolbar, let the canvas capture pointer
+  // input, and SUPPRESS the cosmetic demo overlays (#demo-cursor / .demo-pulse) — they are demo-internal
+  // presentation, not part of the screen being annotated, and the reconciler re-asserts them every tick
+  // (Risk #3), so we suppress at the seam (below) and after every paint. Default/replay: authorMode is
+  // false and NOTHING below changes — behavior is byte-unchanged.
+  const authorMode =
+    window.__MOCK_ANNOTATE === true ||
+    new URLSearchParams(window.location.search).has("annotate");
+
   // Presentation: render the demo dark.
   forceDarkTheme();
 
@@ -595,6 +606,20 @@ function mountPlayer(): void {
     cursorNode.style.transform = `translate(${state.x}px, ${state.y}px)${scale}`;
   };
 
+  // AUTHOR-MODE cursor suppression: the reconciler calls setCursor every tick with the projected
+  // position; in author mode we hard-hide it instead (the cosmetic cursor must not float over the
+  // drawing surface). This wraps the real seam so suppression is enforced AFTER each paint's reconcile
+  // pass (a seek that re-runs paint() can't resurrect it). Default/replay uses the raw setCursor.
+  const setCursorMaybeSuppressed = (
+    state: { x: number; y: number; pressing: boolean } | null,
+  ): void => {
+    if (authorMode) {
+      cursorNode.style.display = "none";
+      return;
+    }
+    setCursor(state);
+  };
+
   // Drive `.demo-pulse` to EXACTLY the projected selector set: remove from elements no longer targeted,
   // add to elements matching the new selectors. A missing selector is a no-op (no match → nothing added).
   const setPulseTargets = (selectors: ReadonlySet<string>): void => {
@@ -619,8 +644,14 @@ function mountPlayer(): void {
   // so we re-derive from the selectors the reconciler last passed. We cache that selector set here.
   let lastPulseSelectors: ReadonlySet<string> = new Set();
   const setPulseTargetsTracked = (selectors: ReadonlySet<string>): void => {
-    lastPulseSelectors = selectors;
-    setPulseTargets(selectors);
+    // AUTHOR-MODE pulse suppression: drive the live set to EMPTY so no `.demo-pulse` outline appears
+    // over the drawing surface. Passing the empty set (not the projected one) makes setPulseTargets
+    // remove the class from every previously-pulsed element and add to none — and because the
+    // reconciler + the same-pass renderConv re-apply both route through here, suppression holds across
+    // ticks and across a seek-triggered repaint (Risk #3). Default/replay passes the projected set.
+    const effective = authorMode ? new Set<string>() : selectors;
+    lastPulseSelectors = effective;
+    setPulseTargets(effective);
   };
 
   // Type into a real field: set .value to the prefix and dispatch a real `input` event (so the app's
@@ -763,7 +794,9 @@ function mountPlayer(): void {
         clickTab(tab);
       },
       // ---- overlay seams (cosmetic; reconciler-owned DOM) ----
-      setCursor,
+      // Author mode routes through the suppression wrapper (cursor hard-hidden); default/replay uses
+      // the raw seam.
+      setCursor: setCursorMaybeSuppressed,
       // Use the tracked variant so the LAST projected pulse selectors are cached for the same-pass
       // re-apply inside renderConv (anti-strobe).
       setPulseTargets: setPulseTargetsTracked,
@@ -824,6 +857,9 @@ function mountPlayer(): void {
     const pct = duration > 0 ? Math.min(100, (T / duration) * 100) : 100;
     fill.style.width = `${pct}%`;
     renderAnnotations(T);
+    // Author mode: AFTER the pinned projection renders, overlay the in-progress working strokes and
+    // refresh the "comments at this T" list. No-op (empty hooks) in default/replay.
+    if (authorMode) runAuthorPaintHooks();
   };
 
   const stop = (): void => {
@@ -946,6 +982,35 @@ function mountPlayer(): void {
     loadAnnotations,
     getActiveComments,
   };
+
+  // ---- author mode: enable canvas capture + mount the toolbar (Phase 3) ----
+  // Only in author mode: flip the annotation canvas to capture pointer input (replay/default keeps it
+  // pointer-events:none) and mount the author UI. The UI reaches the player ONLY through these deps —
+  // it shares no closure state. `getDoc`/`setDoc` bridge the player's `currentDoc` so the UI mutates
+  // the SAME in-memory doc the overlay projects + the ticks are built from.
+  if (authorMode) {
+    annoCanvas.style.pointerEvents = "auto";
+    mountAnnotateUI({
+      getT: (): number => T,
+      // An author session always edits a concrete doc; seed an empty one if none is loaded yet so the
+      // UI never has to special-case null. loadAnnotations(null) is never reached in author mode.
+      getDoc: (): AnnotationDoc =>
+        currentDoc ?? {
+          version: 1,
+          durationMs: duration,
+          viewport: { w: window.innerWidth, h: window.innerHeight },
+          comments: [],
+        },
+      setDoc: (doc: AnnotationDoc): void => {
+        currentDoc = doc;
+      },
+      repaint: (): void => paint(),
+      rebuildTicks: (): void => rebuildCmtTicks(),
+      saveDoc,
+      canvas: annoCanvas,
+      drawStroke,
+    });
+  }
 
   // Initial paint at T=0 (the opening frame), paused. The reconciler will activate the Conversation
   // tab (no plan open at T=0 → activeTab "conversation").
