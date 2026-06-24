@@ -765,6 +765,20 @@ function mountPlayer(): void {
     }
   };
 
+  // Drive a scroll container's scrollTop to the projected FRACTION of its max scroll range. Resolves
+  // the target selector against the LIVE DOM each call (the container's scrollHeight/clientHeight move
+  // as content renders). null ⇒ NO active scroll window → do NOT touch scrollTop (leave the pane put).
+  // Idempotent: only writes scrollTop when it actually differs (avoids fighting user/native scrolling).
+  const setScroll = (state: { target: string; frac: number } | null): void => {
+    if (state === null) return;
+    const container = document.querySelector(state.target) as HTMLElement | null;
+    if (!container) return;
+    const range = container.scrollHeight - container.clientHeight;
+    if (range <= 0) return; // nothing to scroll (content fits) → no-op.
+    const next = Math.round(state.frac * range);
+    if (Math.abs(container.scrollTop - next) > 0.5) container.scrollTop = next;
+  };
+
   // ---- the reconciler: wired to the REAL host seams ----
   const reconciler = createReconciler(
     {
@@ -821,6 +835,7 @@ function mountPlayer(): void {
       setSelPopover,
       setProtoCard,
       setQuestionAnswerUI,
+      setScroll,
     },
     story,
     model,

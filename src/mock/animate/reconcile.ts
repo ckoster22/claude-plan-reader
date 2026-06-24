@@ -27,6 +27,7 @@ import {
   projectCursorState,
   projectFieldText,
   projectModalState,
+  projectScroll,
 } from "./storyboard";
 import type { ConversationModel } from "../../conversation/stream";
 import type { CommentRecord, PlanRecord, ReviewRequest } from "../../types";
@@ -97,6 +98,11 @@ export interface ReconcilerSeams {
   // Drive the reconciler-owned question-card Other-toggle (`.checked` + dispatched change) + its text
   // input. `null` ⇒ the answer UI is off (toggle unchecked, input empty/hidden).
   setQuestionAnswerUI?: (state: { otherChecked: boolean; otherText: string } | null) => void;
+  // Drive a scroll container's scrollTop to the projected FRACTION of its max range. `target` is the
+  // scroll-container selector (e.g. `#reader-scroll`); `frac` is 0..1. The player resolves the element
+  // and sets `el.scrollTop = frac * (el.scrollHeight - el.clientHeight)`. `null` ⇒ NO active scroll
+  // window at T → the player must NOT touch scrollTop (leave the pane where it is).
+  setScroll?: (state: { target: string; frac: number } | null) => void;
 }
 
 // A reconciler instance holds the last-applied model signature + surface so each reconcile(T) re-drives
@@ -388,6 +394,19 @@ export function createReconciler(
     seams.setCursor({ x: pos.x, y: pos.y, pressing: cur.pressing });
   }
 
+  // Drive the scroll container to the projected scrollTop FRACTION. Runs EVERY tick (NO change-memo),
+  // mirroring reconcileCursor's discipline AND placed AFTER reconcileReadingPane in reconcile(): the
+  // reading-pane rebuild (a set_comments-triggered renderInto) resets the container's scrollTop to 0,
+  // so re-driving the projected fraction every tick self-heals that reset within one tick. When
+  // projectScroll returns null (no active scroll window at T) we do NOT touch scrollTop — the pane is
+  // left wherever it is (so a non-scroll chapter is unaffected). Resolving fraction→pixels (against the
+  // live scrollHeight/clientHeight) is the player's job; the reconciler passes the pure {target, frac}.
+  function reconcileScroll(T: number): void {
+    if (!seams.setScroll) return;
+    const scroll = projectScroll(story, T);
+    seams.setScroll(scroll);
+  }
+
   function reconcile(T: number): void {
     // ---- conversation: re-render only when the model signature changes ----
     const sig = modelSignature(story, T);
@@ -400,6 +419,9 @@ export function createReconciler(
     const surface = projectSurfaceState(story, T);
     const prev = lastSurface;
     reconcileReadingPane(surface);
+    // Scroll runs EVERY tick immediately AFTER the reading-pane rebuild (no memo) so a set_comments
+    // rebuild's scrollTop reset self-heals within one tick (see reconcileScroll).
+    reconcileScroll(T);
     reconcileSidebar(surface, prev);
     reconcileReviewBar(surface, prev);
     reconcileGate(surface, prev);

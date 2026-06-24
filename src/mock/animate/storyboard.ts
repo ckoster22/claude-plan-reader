@@ -110,7 +110,14 @@ export type OverlayFrame =
   | { t: "cursor_click"; target: string; pressMs?: number }
   | { t: "pulse"; target: string; fromMs: number; toMs: number }
   | { t: "field_type"; target: string; text: string; fromMs: number; toMs: number }
-  | { t: "overlay_modal"; kind: "composer" | "popover"; on: boolean; target?: string };
+  | { t: "overlay_modal"; kind: "composer" | "popover"; on: boolean; target?: string }
+  // A scroll-timeline window: lerp the scroll-container `target`'s scrollTop FRACTION (0..1 of its
+  // max scroll range) from `fromFrac` → `toFrac` over [fromMs, toMs). `target` is a SCROLL CONTAINER
+  // selector (e.g. `#reader-scroll`, the `.reader` element with overflow-y:auto), NOT the inner
+  // content div (`#reading-pane`/`.md` has no overflow — setting its scrollTop is a silent no-op).
+  // Projected by projectScroll (last-active window, lerped) and reconciled by the setScroll seam,
+  // which resolves the fraction to pixels (frac * (scrollHeight - clientHeight)) against the live DOM.
+  | { t: "scroll"; target: string; fromFrac: number; toFrac: number; fromMs: number; toMs: number };
 
 // The unified storyboard frame envelope.
 export type Frame = ModelFrame | SurfaceFrame | OverlayFrame;
@@ -132,6 +139,7 @@ const OVERLAY_KINDS = new Set<Frame["t"]>([
   "pulse",
   "field_type",
   "overlay_modal",
+  "scroll",
 ]);
 
 // Is this a SurfaceFrame (vs a ModelFrame)?
@@ -212,6 +220,7 @@ export function applyModelFrame(
     case "pulse":
     case "field_type":
     case "overlay_modal":
+    case "scroll":
       break;
     default: {
       // Exhaustiveness guard — a new Frame variant must add a case above.
@@ -459,6 +468,38 @@ export function projectModalState(story: ReadonlyArray<StoryFrame>, T: number): 
   return { composer, popover: { on: popoverOn, target: popoverTarget } };
 }
 
+// The projected scroll override at T: the scroll container `target` selector + the lerped scrollTop
+// FRACTION (0..1 of the container's max scroll range). null ⇒ no scroll window is active at T (the
+// reconciler then leaves the pane where it is — never forces a scrollTop).
+export interface ScrollState {
+  target: string;
+  frac: number;
+}
+
+// PURE: project the scroll override at T. Scans every `scroll` OverlayFrame; the ACTIVE one is the
+// LAST (story order) whose window contains T (fromMs <= T < toMs). Inside that window the fraction is
+// lerped fromFrac → toFrac by clamp01((T - fromMs)/(toMs - fromMs)); a zero-length window yields toFrac.
+// Returns null when NO scroll window contains T — outside any window the reconciler does not touch the
+// pane. A backward scrub reverts cleanly because this is a full re-derivation from the frame set (not a
+// forward delta): the active window at an earlier T is re-selected and re-lerped from scratch, so
+// scrub-forward-then-back yields the identical fraction.
+export function projectScroll(story: ReadonlyArray<StoryFrame>, T: number): ScrollState | null {
+  let active: { target: string; fromFrac: number; toFrac: number; fromMs: number; toMs: number } | null = null;
+  for (const sf of story) {
+    const frame = sf.frame;
+    if (frame.t !== "scroll") continue;
+    if (frame.fromMs <= T && T < frame.toMs) {
+      // Last-active-window: a later scroll window whose span contains T supersedes an earlier one.
+      active = frame;
+    }
+  }
+  if (active === null) return null;
+  const span = active.toMs - active.fromMs;
+  const f = span > 0 ? clamp01((T - active.fromMs) / span) : 1;
+  const frac = active.fromFrac + (active.toFrac - active.fromFrac) * f;
+  return { target: active.target, frac };
+}
+
 // ---- Model signature (memo key) ----------------------------------------------------------------
 
 // An INJECTIVE string over the applied MODEL-frame SET at T plus the in-progress reveal prefix. The
@@ -687,8 +728,30 @@ export const COMMENT_ACT_SHIFT = 5000;
 // is the Execution open_plan{null} tMs; EXEC_SEQ_BASE is the first Execution model seq (the exec-open
 // narration). The builder steps from there; TERMINAL_MS / TERMINAL_SEQ are COMPUTED from its output
 // (see after EXEC_FRAMES) so a re-time/re-count is a one-line base change, never a literal edit.
-export const EXEC_BASE_MS = 69000; // Execution open_plan{null}; > the comment act's last frame (68000).
+// EXEC_BASE_MS bumped (P2): the comment chapter LENGTHENED — a slow-scroll beat (down then up, ~4s) now
+// plays before the comments AND comment c2 got its own full popover act. The DOWNSTREAM_AFTER_PROTOTYPE
+// literals from the scroll beat onward shifted by + SCROLL_BEAT_SHIFT, so the comment chapter's last
+// model frame (the seq-64 system echo, literal 58400 + SCROLL_BEAT_SHIFT) lands at final
+// 58400 + SCROLL_BEAT_SHIFT + PROTO_ACT_SHIFT. EXEC_BASE_MS must stay strictly greater than that.
+export const EXEC_BASE_MS = 80000; // Execution open_plan{null}; > the comment act's last frame (79000).
 export const EXEC_SEQ_BASE = 65; // first Execution model seq (= old 64 + 1, contiguous after the comment chapter).
+
+// ---- (P2) Scroll beat + c2-act constants (tests pin to THESE) -----------------------------------
+//
+// SCROLL_BEAT_SHIFT (load-bearing, P2): a slow-scroll-down-then-up beat over the master-plan pane was
+// inserted AFTER the master opens (DOWNSTREAM literal 47000) and BEFORE the first comment act, and c2
+// gained a full popover act. Both add TIME (overlay frames carry no seq). Every DOWNSTREAM literal from
+// the scroll beat onward (the whole comment chapter + V2 open + the seq-64 echo) is written at its
+// post-shift value DIRECTLY in the array below; SCROLL_BEAT_SHIFT names the amount the comment chapter
+// moved later (vs the pre-P2 literals) so the tMs-pinned tests express the relationship.
+export const SCROLL_BEAT_SHIFT = 7600; // comment chapter slid later by this much (vs pre-P2 literals).
+// The slow-scroll window over #reader-scroll (the .reader scroll container). Two scroll frames:
+// down (0→1) over [SCROLL_DOWN_FROM, SCROLL_DOWN_TO), then up (1→0) over [SCROLL_UP_FROM, SCROLL_UP_TO).
+export const SCROLL_TARGET = "#reader-scroll";
+export const SCROLL_DOWN_FROM = 50800; // begin scrolling the master pane DOWN …
+export const SCROLL_DOWN_TO = 53000; //   … reaching the bottom over ~2.2s
+export const SCROLL_UP_FROM = 53400; // dwell ~0.4s at the bottom, then scroll back UP …
+export const SCROLL_UP_TO = 55600; //   … reaching the top over ~2.2s
 
 // ---- Named tMs constants for the P4 prototype ACT (tests pin to THESE, not magic numbers) -------
 // The prototype chapter narration (seq 59) lands at PROTO_NARR_MS; the act then plays out as a sequence
@@ -2034,112 +2097,204 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
     frame: { t: "open_plan", path: TRAILHEAD_MASTER_PATH },
   },
 
-  // ---- Chapter "Comment & iterate" (P4: the scripted popover ACT) ------------------------------
+  // ---- (P2) Slow-scroll beat over the master pane ----------------------------------------------
   //
-  // The master (TRAILHEAD_MASTER_PATH) is still open on the Plan tab. The user now leaves comments on it
-  // — and (P4) the demo SCRIPTS the act for two of them (c1 + c3, which anchor to DISTINCT reading-pane
-  // blocks): the cursor moves to the block, the selection popover opens under it (#sel-popover, driven by
-  // overlay_modal{popover,on,target} — the reconciler is its exclusive writer, setting #sp-quote +
-  // positioning it), it is pulsed, the comment is TYPED into #sp-text, a cosmetic #sp-save click lands,
-  // the popover closes, and THEN the `set_comments` SurfaceFrame paints the persisted `.cmt-hl` highlight
-  // (the SOLE source of truth — the real #sp-save handler stays inert). The comment SET still grows
-  // 1 → 2 → 3 (c2 lands as a plain set_comments between c1's and c3's acts; its quote shares c1's block).
-  // HIGHLIGHTS-ONLY: no pending_reviews frame (driving the review bar would auto-open + wipe highlights).
+  // Before the user comments, the master plan pane SLOW-SCROLLS down to the bottom then back up to the
+  // top so the viewer reads the whole drafted plan (its mermaid decomposition is below the fold). Two
+  // `scroll` OverlayFrames over #reader-scroll (the .reader scroll container — NOT #reading-pane, which
+  // has no overflow): down 0→1, then up 1→0. A pulse on the pane spans the beat as a "watch here" cue.
+  // The scroll is a PURE fn of T (projectScroll, lerped, scrub-revertable) driven by the setScroll seam
+  // EVERY tick AFTER the reading-pane rebuild — so the c1 set_comments rebuild (which resets scrollTop)
+  // self-heals within one tick. The cursor anchor blocks ([data-source-line=…]) are viewport-resolved
+  // each tick, so they still resolve after the scroll returns the pane to the top.
+  {
+    // OVERLAY — scroll the master pane DOWN to the bottom over ~2.2s.
+    tMs: SCROLL_DOWN_FROM,
+    chapterLabel: "Comment & iterate",
+    frame: {
+      t: "scroll",
+      target: SCROLL_TARGET,
+      fromFrac: 0,
+      toFrac: 1,
+      fromMs: SCROLL_DOWN_FROM,
+      toMs: SCROLL_DOWN_TO,
+    },
+  },
+  {
+    // OVERLAY — then scroll back UP to the top over ~2.2s (after a brief ~0.4s dwell at the bottom).
+    tMs: SCROLL_UP_FROM,
+    frame: {
+      t: "scroll",
+      target: SCROLL_TARGET,
+      fromFrac: 1,
+      toFrac: 0,
+      fromMs: SCROLL_UP_FROM,
+      toMs: SCROLL_UP_TO,
+    },
+  },
+  {
+    // OVERLAY — pulse the reading pane across the whole scroll beat (a "read the plan" attention cue).
+    tMs: SCROLL_DOWN_FROM,
+    frame: { t: "pulse", target: "#reading-pane", fromMs: SCROLL_DOWN_FROM, toMs: SCROLL_UP_TO },
+  },
+
+  // ---- Chapter "Comment & iterate" (P2: every comment gets a full popover ACT) ------------------
+  //
+  // The master (TRAILHEAD_MASTER_PATH) is still open on the Plan tab. The user now leaves THREE comments
+  // on it — and (P2) the demo SCRIPTS a full act for EACH (c1, c2, c3): the target block is EMPHASIZED
+  // (a pulse on the block), the cursor moves to it, the selection popover opens under it (#sel-popover,
+  // driven by overlay_modal{popover,on,target} — the reconciler is its exclusive writer, setting
+  // #sp-quote + positioning it), the popover is pulsed, the comment is TYPED into #sp-text, a cosmetic
+  // #sp-save click lands, the popover closes, and THEN the `set_comments` SurfaceFrame paints the
+  // persisted `.cmt-hl` highlight (the SOLE source of truth — the real #sp-save handler stays inert).
+  // The comment SET grows 1 → 2 → 3. HIGHLIGHTS-ONLY: no pending_reviews frame (driving the review bar
+  // would auto-open + wipe highlights).
   //
   // The popover anchor selectors are stable reading-pane blocks by `data-source-line` (the V1 master's
-  // Context paragraph = line 4 carries c1's quote; the closing paragraph = line 53 carries c3's quote).
+  // Context paragraph = line 4 carries BOTH c1's and c2's quotes; the closing paragraph = line 53 carries
+  // c3's quote). c1 + c2 share the Context block; c3 anchors the distinct closing block.
 
   // ---- Comment 1 act (anchors to the Context paragraph, data-source-line="4") ----
   {
+    // OVERLAY — EMPHASIZE the target block before typing (pulse the Context block ~1s).
+    tMs: 56200,
+    frame: { t: "pulse", target: '#reading-pane [data-source-line="4"]', fromMs: 56200, toMs: 57200 },
+  },
+  {
     // OVERLAY — the cursor travels to the Context block (carries c1's quote).
-    tMs: 48800,
-    chapterLabel: "Comment & iterate",
+    tMs: 56400,
     frame: { t: "cursor_move", target: '#reading-pane [data-source-line="4"]', moveMs: 400 },
   },
   {
     // OVERLAY — the selection popover opens UNDER that block (reconciler shows #sel-popover, sets
     // #sp-quote from the block text, positions it). Backward scrub closes it (last-≤-T per kind).
-    tMs: 49200,
+    tMs: 56800,
     frame: { t: "overlay_modal", kind: "popover", on: true, target: '#reading-pane [data-source-line="4"]' },
   },
   {
     // OVERLAY — pulse the open popover (~1s).
-    tMs: 49400,
-    frame: { t: "pulse", target: "#sel-popover", fromMs: 49400, toMs: 50600 },
+    tMs: 57000,
+    frame: { t: "pulse", target: "#sel-popover", fromMs: 57000, toMs: 58200 },
   },
   {
     // OVERLAY — TYPE the comment into #sp-text over ~1.8s (the popover's textarea).
-    tMs: 49600,
-    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_1.comment, fromMs: 49600, toMs: 51400 },
+    tMs: 57200,
+    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_1.comment, fromMs: 57200, toMs: 59000 },
   },
   {
     // OVERLAY — the cursor travels to the popover's save button.
-    tMs: 51500,
+    tMs: 59100,
     frame: { t: "cursor_move", target: "#sp-save", moveMs: 300 },
   },
   {
     // OVERLAY — a COSMETIC press on #sp-save (the real handler is inert; the highlight is painted by the
     // set_comments below, the SOLE source of truth).
-    tMs: 51800,
+    tMs: 59400,
     frame: { t: "cursor_click", target: "#sp-save" },
   },
   {
     // OVERLAY — the popover closes (frame-driven).
-    tMs: 52000,
+    tMs: 59600,
     frame: { t: "overlay_modal", kind: "popover", on: false },
   },
   {
     // SURFACE — comment 1's persisted highlight paints (1 highlight). This lands AFTER the popover act
     // (the popover-on + typing precede this highlight, the ordering the test asserts).
-    tMs: 52200,
+    tMs: 59800,
     frame: { t: "set_comments", path: TRAILHEAD_MASTER_PATH, comments: [TRAILHEAD_COMMENT_1] },
   },
+
+  // ---- Comment 2 act (P2: now a FULL act; anchors to the SAME Context block, data-source-line="4") ----
   {
-    // SURFACE — comment 2 lands (full set [c1, c2] → 2 highlights). Its quote shares c1's block, so it is
-    // not separately scripted; it simply grows the persisted set.
-    tMs: 52800,
+    // OVERLAY — EMPHASIZE the target block before typing (pulse the Context block ~1s).
+    tMs: 60200,
+    frame: { t: "pulse", target: '#reading-pane [data-source-line="4"]', fromMs: 60200, toMs: 61200 },
+  },
+  {
+    // OVERLAY — the cursor travels to the Context block (c2's quote shares c1's block).
+    tMs: 60400,
+    frame: { t: "cursor_move", target: '#reading-pane [data-source-line="4"]', moveMs: 400 },
+  },
+  {
+    // OVERLAY — the selection popover opens under that block again (a fresh act for c2).
+    tMs: 60800,
+    frame: { t: "overlay_modal", kind: "popover", on: true, target: '#reading-pane [data-source-line="4"]' },
+  },
+  {
+    // OVERLAY — pulse the open popover (~1s).
+    tMs: 61000,
+    frame: { t: "pulse", target: "#sel-popover", fromMs: 61000, toMs: 62200 },
+  },
+  {
+    // OVERLAY — TYPE comment 2 into #sp-text over ~1.8s.
+    tMs: 61200,
+    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_2.comment, fromMs: 61200, toMs: 63000 },
+  },
+  {
+    // OVERLAY — the cursor travels to the save button.
+    tMs: 63100,
+    frame: { t: "cursor_move", target: "#sp-save", moveMs: 300 },
+  },
+  {
+    // OVERLAY — a COSMETIC press on #sp-save.
+    tMs: 63400,
+    frame: { t: "cursor_click", target: "#sp-save" },
+  },
+  {
+    // OVERLAY — the popover closes.
+    tMs: 63600,
+    frame: { t: "overlay_modal", kind: "popover", on: false },
+  },
+  {
+    // SURFACE — comment 2's persisted highlight paints (full set [c1, c2] → 2 highlights).
+    tMs: 63800,
     frame: { t: "set_comments", path: TRAILHEAD_MASTER_PATH, comments: [TRAILHEAD_COMMENT_1, TRAILHEAD_COMMENT_2] },
   },
 
   // ---- Comment 3 act (anchors to the closing paragraph, data-source-line="53") ----
   {
+    // OVERLAY — EMPHASIZE the target block before typing (pulse the closing block ~1s).
+    tMs: 64200,
+    frame: { t: "pulse", target: '#reading-pane [data-source-line="53"]', fromMs: 64200, toMs: 65200 },
+  },
+  {
     // OVERLAY — the cursor travels to the closing block (carries c3's quote, a DISTINCT block from c1/c2).
-    tMs: 53400,
+    tMs: 64400,
     frame: { t: "cursor_move", target: '#reading-pane [data-source-line="53"]', moveMs: 400 },
   },
   {
     // OVERLAY — the popover opens under that block.
-    tMs: 53800,
+    tMs: 64800,
     frame: { t: "overlay_modal", kind: "popover", on: true, target: '#reading-pane [data-source-line="53"]' },
   },
   {
     // OVERLAY — pulse the popover (~1s).
-    tMs: 54000,
-    frame: { t: "pulse", target: "#sel-popover", fromMs: 54000, toMs: 55200 },
+    tMs: 65000,
+    frame: { t: "pulse", target: "#sel-popover", fromMs: 65000, toMs: 66200 },
   },
   {
     // OVERLAY — TYPE comment 3 into #sp-text over ~1.8s.
-    tMs: 54200,
-    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_3.comment, fromMs: 54200, toMs: 56000 },
+    tMs: 65200,
+    frame: { t: "field_type", target: "#sp-text", text: TRAILHEAD_COMMENT_3.comment, fromMs: 65200, toMs: 67000 },
   },
   {
     // OVERLAY — the cursor travels to the save button.
-    tMs: 56100,
+    tMs: 67100,
     frame: { t: "cursor_move", target: "#sp-save", moveMs: 300 },
   },
   {
     // OVERLAY — a COSMETIC press on #sp-save.
-    tMs: 56400,
+    tMs: 67400,
     frame: { t: "cursor_click", target: "#sp-save" },
   },
   {
     // OVERLAY — the popover closes.
-    tMs: 56600,
+    tMs: 67600,
     frame: { t: "overlay_modal", kind: "popover", on: false },
   },
   {
     // SURFACE — comment 3's persisted highlight paints (full set [c1, c2, c3] → 3 highlights).
-    tMs: 56800,
+    tMs: 67800,
     frame: {
       t: "set_comments",
       path: TRAILHEAD_MASTER_PATH,
@@ -2148,12 +2303,12 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
   },
   {
     // OVERLAY — the cursor travels to "Request changes" (#review-submit) to send the comments back.
-    tMs: 57400,
+    tMs: 68400,
     frame: { t: "cursor_move", target: "#review-submit", moveMs: 300 },
   },
   {
     // OVERLAY — a COSMETIC press on #review-submit ("Request changes"); the V2 load below is frame-driven.
-    tMs: 57700,
+    tMs: 68700,
     frame: { t: "cursor_click", target: "#review-submit" },
   },
   {
@@ -2161,12 +2316,12 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
     // master stays open, so the beat ends on the Plan tab showing the revised doc. Because comments are
     // scoped to the OPEN path (projectSurfaceState), and V2 has no set_comments, projectSurfaceState
     // .comments is [] for T ≥ this frame (the V1 comments do not paint on V2 — a clean iteration reveal).
-    tMs: 58000,
+    tMs: 69000,
     frame: { t: "open_plan", path: TRAILHEAD_MASTER_V2_PATH },
   },
   {
     // seq 26 — a system echo announcing the revision (a system bubble on the hidden Conversation tab).
-    tMs: 58400,
+    tMs: 69400,
     frame: {
       t: "system_message",
       seq: 64,
@@ -2681,11 +2836,25 @@ const EXEC_BUILT = buildExecution();
 export const TERMINAL_SEQ = EXEC_BUILT.terminalSeq;
 export const TERMINAL_MS = EXEC_BUILT.terminalMs;
 
-// Splice the P4-shifted nested-plan/comment-and-iterate chapters (shift by + PROTO_ACT_SHIFT), then the
-// P5 Execution chapter (already authored at FINAL tMs/seq — pushed verbatim, no shift). chapterLabels
-// preserved; monotonic tMs preserved (the comment act ends at 68000, the Execution opens at EXEC_BASE_MS).
+// Shift a StoryFrame by `delta` ms. The outer `tMs` ALWAYS shifts; for OVERLAY frames carrying their
+// OWN time windows (pulse / field_type / scroll have fromMs+toMs) the INNER window shifts in lockstep
+// too — otherwise the shifted frame's projection window (projectPulseSet/projectFieldText/projectScroll
+// read the INNER fromMs/toMs) would fire at the UNSHIFTED time, decoupled from the shifted outer tMs.
+// cursor_move/cursor_click/overlay_modal carry no fromMs/toMs and need only the outer-tMs shift.
+function shiftStoryFrame(sf: StoryFrame, delta: number): StoryFrame {
+  const f = sf.frame;
+  if (f.t === "pulse" || f.t === "field_type" || f.t === "scroll") {
+    return { ...sf, tMs: sf.tMs + delta, frame: { ...f, fromMs: f.fromMs + delta, toMs: f.toMs + delta } };
+  }
+  return { ...sf, tMs: sf.tMs + delta };
+}
+
+// Splice the P4-shifted nested-plan/comment-and-iterate chapters (shift by + PROTO_ACT_SHIFT, INNER
+// overlay windows included — see shiftStoryFrame), then the P5 Execution chapter (already authored at
+// FINAL tMs/seq — pushed verbatim, no shift). chapterLabels preserved; monotonic tMs preserved (the
+// comment chapter's last frame stays strictly below EXEC_BASE_MS).
 for (const sf of DOWNSTREAM_AFTER_PROTOTYPE) {
-  TRAILHEAD_BEAT.push({ ...sf, tMs: sf.tMs + PROTO_ACT_SHIFT });
+  TRAILHEAD_BEAT.push(shiftStoryFrame(sf, PROTO_ACT_SHIFT));
 }
 for (const sf of EXEC_BUILT.frames) {
   TRAILHEAD_BEAT.push(sf);

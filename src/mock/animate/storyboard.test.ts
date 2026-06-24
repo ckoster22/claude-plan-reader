@@ -32,6 +32,12 @@ import {
   projectCursorState,
   projectFieldText,
   projectModalState,
+  projectScroll,
+  SCROLL_TARGET,
+  SCROLL_DOWN_FROM,
+  SCROLL_DOWN_TO,
+  SCROLL_UP_FROM,
+  SCROLL_UP_TO,
   TRAILHEAD_BEAT,
   TRAILHEAD_COMMENT_1,
   TRAILHEAD_COMMENT_2,
@@ -653,9 +659,9 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
 
   it("the V2 master is open just before Execution but closed at duration (Execution)", () => {
     // Just before the Execution chapter the open_plan{V2} is still the last open_plan, so the revised
-    // master is on the Plan tab. Execution's open_plan{null} is at old 27000 + EXEC + PROTO_ACT +
-    // COMMENT_ACT, so sample just before that close.
-    const execOpenNull = 27000 + EXEC_SHIFT + PROTO_ACT_SHIFT + COMMENT_ACT_SHIFT;
+    // master is on the Plan tab. (P2) the Execution chapter is built directly at FINAL tMs from
+    // EXEC_BASE_MS (its first frame is the open_plan{null}); sample just before that close.
+    const execOpenNull = EXEC_BASE_MS;
     const beforeExec = projectSurfaceState(TRAILHEAD_BEAT, execOpenNull - 1);
     expect(beforeExec.openPlanPath).toBe(TRAILHEAD_MASTER_V2_PATH);
     expect(beforeExec.openPlanPath).not.toBe(TRAILHEAD_MASTER_PATH);
@@ -896,14 +902,16 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
   });
 
   // The comment chapter lives in DOWNSTREAM_AFTER_PROTOTYPE — its literals already bake in EXEC_SHIFT
-  // (they continue the nested-plan scheme), and the push adds + PROTO_ACT_SHIFT. The P4 popover act
-  // paints each highlight AFTER its popover act: set_comments land at literal 52200 ([c1]) / 52800
-  // ([c1,c2]) / 56800 ([c1,c2,c3]); V2 opens at literal 58000 (all + PROTO_ACT_SHIFT).
+  // (they continue the nested-plan scheme), and the push adds + PROTO_ACT_SHIFT (inner overlay windows
+  // included). (P2) the chapter LENGTHENED: a slow-scroll beat now plays before the comments AND comment
+  // c2 got its OWN full popover act, so each comment's highlight paints AFTER its act: set_comments land
+  // at literal 59800 ([c1]) / 63800 ([c1,c2]) / 67800 ([c1,c2,c3]); V2 opens at literal 69000 (all +
+  // PROTO_ACT_SHIFT).
   const CMT_SHIFT = PROTO_ACT_SHIFT;
-  const C1_PAINT_MS = 52200 + CMT_SHIFT;
-  const C2_PAINT_MS = 52800 + CMT_SHIFT;
-  const C3_PAINT_MS = 56800 + CMT_SHIFT;
-  const V2_OPEN_MS = 58000 + CMT_SHIFT;
+  const C1_PAINT_MS = 59800 + CMT_SHIFT;
+  const C2_PAINT_MS = 63800 + CMT_SHIFT;
+  const C3_PAINT_MS = 67800 + CMT_SHIFT;
+  const V2_OPEN_MS = 69000 + CMT_SHIFT;
 
   it("projectSurfaceState.comments grows 1 → 2 → 3 over the set_comments frames (on the open V1 master)", () => {
     // The V1 master is open; comments are scoped to that open path.
@@ -915,28 +923,58 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
     expect(projectSurfaceState(TRAILHEAD_BEAT, C1_PAINT_MS - 1).comments).toHaveLength(0);
   });
 
-  it("PER COMMENT the popover act precedes the highlight: a popover-on overlay + an #sp-text field_type land BEFORE the set_comments paint", () => {
-    // For comment 1 and comment 3 (the two SCRIPTED ones), assert the ordering popover-on → typing →
-    // highlight. The popover-on overlay_modal and the #sp-text field_type must precede the set_comments.
+  it("(P2) COMMENT-ACT-COUNT — ALL THREE comments have a typed-text act: 3 popover-on overlays + 3 #sp-text field_types, each preceding its highlight", () => {
+    // (P2) EVERY comment now gets a full popover act (c2 was previously a plain set_comments with NO act).
+    // Assert the ordering popover-on → typing → highlight for all three. FALSIFIABILITY: remove c2's act
+    // (delete its popover-on + #sp-text field_type frames) and these length-3 assertions go RED (back to 2).
     const popoverOns = TRAILHEAD_BEAT.filter(
       (sf) => sf.frame.t === "overlay_modal" && sf.frame.kind === "popover" && sf.frame.on === true,
     );
-    // Two scripted popovers (c1 + c3).
-    expect(popoverOns.length).toBe(2);
+    expect(popoverOns.length).toBe(3);
     const spTextTypes = TRAILHEAD_BEAT.filter(
       (sf) => sf.frame.t === "field_type" && sf.frame.target === "#sp-text",
     );
-    expect(spTextTypes.length).toBe(2);
-    // Comment 1: the first popover-on + the first #sp-text typing both precede C1_PAINT_MS.
-    expect(popoverOns[0].tMs).toBeLessThan(C1_PAINT_MS);
-    expect(spTextTypes[0].tMs).toBeLessThan(C1_PAINT_MS);
-    // Comment 3: the second popover-on + the second #sp-text typing both precede C3_PAINT_MS.
-    expect(popoverOns[1].tMs).toBeLessThan(C3_PAINT_MS);
-    expect(spTextTypes[1].tMs).toBeLessThan(C3_PAINT_MS);
-    // … and the second popover act lands AFTER comment 1's paint (a distinct, later act).
-    expect(popoverOns[1].tMs).toBeGreaterThan(C1_PAINT_MS);
-    // FALSIFIABILITY: if the highlight painted BEFORE the popover (set_comments hoisted above the act),
-    // popoverOns[0].tMs < C1_PAINT_MS would flip false.
+    expect(spTextTypes.length).toBe(3);
+    // The three typed comments are c1, c2, c3 in order (each act types its own comment text).
+    expect((spTextTypes[0].frame as { text: string }).text).toBe(TRAILHEAD_COMMENT_1.comment);
+    expect((spTextTypes[1].frame as { text: string }).text).toBe(TRAILHEAD_COMMENT_2.comment);
+    expect((spTextTypes[2].frame as { text: string }).text).toBe(TRAILHEAD_COMMENT_3.comment);
+    // Per-comment ordering: each comment's popover-on + #sp-text typing precede its highlight paint, and
+    // the act lands AFTER the prior comment's paint (distinct, sequential acts).
+    const paints = [C1_PAINT_MS, C2_PAINT_MS, C3_PAINT_MS];
+    for (let i = 0; i < 3; i++) {
+      expect(popoverOns[i].tMs, `c${i + 1} popover before paint`).toBeLessThan(paints[i]);
+      expect(spTextTypes[i].tMs, `c${i + 1} typing before paint`).toBeLessThan(paints[i]);
+      if (i > 0) {
+        expect(popoverOns[i].tMs, `c${i + 1} act after c${i} paint`).toBeGreaterThan(paints[i - 1]);
+      }
+    }
+  });
+
+  it("(P2) each comment EMPHASIZES its target block before typing: a pulse on the block precedes the #sp-text typing", () => {
+    // Each comment's act begins by pulsing its anchor block (a "look here" cue) BEFORE the popover types.
+    // FALSIFIABILITY: drop a block-pulse frame and the per-comment block-pulse-before-typing find goes RED.
+    const spTextTypes = TRAILHEAD_BEAT.filter(
+      (sf) => sf.frame.t === "field_type" && sf.frame.target === "#sp-text",
+    );
+    expect(spTextTypes.length).toBe(3);
+    // c1 + c2 anchor data-source-line="4"; c3 anchors data-source-line="53".
+    const blockSelectors = [
+      '#reading-pane [data-source-line="4"]',
+      '#reading-pane [data-source-line="4"]',
+      '#reading-pane [data-source-line="53"]',
+    ];
+    for (let i = 0; i < 3; i++) {
+      const typingFrom = (spTextTypes[i].frame as { fromMs: number }).fromMs;
+      const blockPulse = TRAILHEAD_BEAT.find(
+        (sf) =>
+          sf.frame.t === "pulse" &&
+          sf.frame.target === blockSelectors[i] &&
+          sf.frame.toMs <= typingFrom + 200 && // the block pulse spans up to (around) when typing starts
+          sf.frame.fromMs < typingFrom,
+      );
+      expect(blockPulse, `block emphasis pulse before c${i + 1} typing`).toBeDefined();
+    }
   });
 
   it("after switching to V2 the open path is V2 and its comments are [] (highlights clear)", () => {
@@ -974,6 +1012,80 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
     expect(model.derive().working).not.toBeNull();
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
     expect(model.derive().working).toBeNull();
+  });
+});
+
+// ---- (P2) projectScroll — PURE scroll-timeline projection + scrub-revert ------------------------
+//
+// projectScroll(story, T) returns the active scroll window's {target, frac} lerped fromFrac→toFrac over
+// [fromMs, toMs), or null outside any window. These tests pin to the named SCROLL_* constants and assert
+// it is a PURE fn of T (scrub-forward-then-back yields the identical frac). FALSIFIABILITY (verified by
+// hand): make projectScroll stateful/incremental (accumulate from the last call rather than re-derive
+// from fromMs each call) and the scrub-revert property test goes RED — the back-scrub frac would carry
+// forward-sweep state instead of matching the direct value.
+
+describe("storyboard — (P2) projectScroll purity + scrub-revert", () => {
+  // A self-contained two-window scroll story (down 0→1 then up 1→0) at the named constants, mirroring
+  // the comment chapter's beat shape but isolated so the assertions don't depend on the full-beat tMs.
+  const scrollStory: StoryFrame[] = [
+    { tMs: SCROLL_DOWN_FROM, frame: { t: "scroll", target: SCROLL_TARGET, fromFrac: 0, toFrac: 1, fromMs: SCROLL_DOWN_FROM, toMs: SCROLL_DOWN_TO } },
+    { tMs: SCROLL_UP_FROM, frame: { t: "scroll", target: SCROLL_TARGET, fromFrac: 1, toFrac: 0, fromMs: SCROLL_UP_FROM, toMs: SCROLL_UP_TO } },
+  ];
+
+  it("null OUTSIDE any window; exact frac at the window EDGES; lerped MID-window", () => {
+    // Before the first window → null (no override).
+    expect(projectScroll(scrollStory, SCROLL_DOWN_FROM - 1)).toBeNull();
+    // Down window: frac 0 at the start edge, 0.5 at the midpoint, near-1 just before the end edge.
+    expect(projectScroll(scrollStory, SCROLL_DOWN_FROM)).toEqual({ target: SCROLL_TARGET, frac: 0 });
+    const downMid = (SCROLL_DOWN_FROM + SCROLL_DOWN_TO) / 2;
+    expect(projectScroll(scrollStory, downMid)!.frac).toBeCloseTo(0.5, 5);
+    // The end edge toMs is HALF-OPEN [fromMs, toMs): at toMs the down window no longer contains T. The
+    // GAP between the down and up windows → null (no active window in the dwell).
+    expect(projectScroll(scrollStory, SCROLL_DOWN_TO)).toBeNull();
+    expect(projectScroll(scrollStory, (SCROLL_DOWN_TO + SCROLL_UP_FROM) / 2)).toBeNull();
+    // Up window: frac 1 at the start edge, 0.5 at the midpoint.
+    expect(projectScroll(scrollStory, SCROLL_UP_FROM)).toEqual({ target: SCROLL_TARGET, frac: 1 });
+    const upMid = (SCROLL_UP_FROM + SCROLL_UP_TO) / 2;
+    expect(projectScroll(scrollStory, upMid)!.frac).toBeCloseTo(0.5, 5);
+    // After the last window → null again.
+    expect(projectScroll(scrollStory, SCROLL_UP_TO)).toBeNull();
+    expect(projectScroll(scrollStory, SCROLL_UP_TO + 1000)).toBeNull();
+  });
+
+  it("SCRUB-REVERT (property): evaluating at T after sweeping forward equals evaluating at T directly", () => {
+    // A grid of forward sweep stops across both windows + the surrounding gaps, then for each early
+    // target assert projectScroll(early) is IDENTICAL whether reached directly or after the sweep. Because
+    // projectScroll is a pure re-derivation from the frame set (NOT an incremental accumulator), the two
+    // are byte-identical. FALSIFIABILITY: a stateful/incremental implementation drifts here → RED.
+    const lo = SCROLL_DOWN_FROM - 500;
+    const hi = SCROLL_UP_TO + 500;
+    const grid = Array.from({ length: 61 }, (_, i) => Math.round(lo + (i / 60) * (hi - lo)));
+    const ser = (s: ReturnType<typeof projectScroll>): string => JSON.stringify(s ?? null);
+    for (const earlyT of [lo, SCROLL_DOWN_FROM, downMidOf(), SCROLL_UP_FROM, hi]) {
+      const direct = ser(projectScroll(scrollStory, earlyT));
+      // "Sweep forward" is just evaluating across the grid (the fn is stateless), then evaluate at earlyT.
+      for (const T of grid) projectScroll(scrollStory, T);
+      const afterSweep = ser(projectScroll(scrollStory, earlyT));
+      expect(afterSweep, `projectScroll(${earlyT}) forward-then-back == direct`).toBe(direct);
+    }
+    function downMidOf(): number {
+      return (SCROLL_DOWN_FROM + SCROLL_DOWN_TO) / 2;
+    }
+  });
+
+  it("the REAL TRAILHEAD_BEAT carries the slow-scroll beat over #reader-scroll (down 0→1 then up 1→0)", () => {
+    const scrolls = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "scroll");
+    expect(scrolls.length).toBe(2);
+    for (const sf of scrolls) {
+      expect((sf.frame as { target: string }).target).toBe(SCROLL_TARGET);
+    }
+    const down = scrolls.find((sf) => (sf.frame as { fromFrac: number; toFrac: number }).toFrac === 1);
+    const up = scrolls.find((sf) => (sf.frame as { fromFrac: number; toFrac: number }).toFrac === 0);
+    expect(down, "down-scroll 0→1").toBeDefined();
+    expect(up, "up-scroll 1→0").toBeDefined();
+    // The down beat precedes the up beat (down then back up), and BOTH precede the first comment paint.
+    expect(down!.tMs).toBeLessThan(up!.tMs);
+    // FALSIFIABILITY: drop the up-scroll frame and the `up` find goes undefined → RED.
   });
 });
 

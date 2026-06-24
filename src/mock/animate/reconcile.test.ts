@@ -87,6 +87,7 @@ function makeSeams(over?: Partial<ReconcilerSeams>): {
     setSelPopover: vi.fn(),
     setProtoCard: vi.fn(),
     setQuestionAnswerUI: vi.fn(),
+    setScroll: vi.fn(),
     ...over,
   };
   return { seams, spies: seams as never, pane };
@@ -702,6 +703,86 @@ describe("reconcile — question Other-answer UI (derived from field text) + rev
     expect(lastCall(seams, "setQuestionAnswerUI")[0]).toBeNull();
     // FALSIFIABILITY: if the UI latched on after first turning on (never re-deriving null), the backward
     // scrub would leave the last call as the on-state → the final `toBeNull()` goes RED. Confirmed.
+  });
+});
+
+describe("reconcile — (P2) setScroll seam: lerped frac, #reader-scroll target, self-heals a rebuild", () => {
+  it("drives setScroll with the lerped frac targeting #reader-scroll inside the window; null outside", () => {
+    const story: StoryFrame[] = [
+      { tMs: 100, frame: { t: "scroll", target: "#reader-scroll", fromFrac: 0, toFrac: 1, fromMs: 100, toMs: 300 } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    // Before the window → null (no scroll override).
+    r.reconcile(50);
+    expect(lastCall(seams, "setScroll")[0]).toBeNull();
+    // Mid-window (T=200, halfway through [100,300)) → frac 0.5, target #reader-scroll.
+    r.reconcile(200);
+    expect(lastCall(seams, "setScroll")[0]).toEqual({ target: "#reader-scroll", frac: 0.5 });
+    // After the window → null again (clean revert).
+    r.reconcile(300);
+    expect(lastCall(seams, "setScroll")[0]).toBeNull();
+    // FALSIFIABILITY: if reconcileScroll memoized on a changed-value key (like the other passes) it would
+    // still drive the right value here; the self-heal test below is what pins the every-tick discipline.
+  });
+
+  it("runs EVERY tick (no memo) so a set_comments reading-pane rebuild's scroll reset self-heals", async () => {
+    // A scroll window that stays active ACROSS a set_comments frame (which triggers a reading-pane rebuild
+    // — renderInto resets the container scrollTop to 0). setScroll must fire on EVERY tick (not memoized)
+    // so the projected frac is re-asserted after the rebuild within the same/next tick. We assert setScroll
+    // is called on each tick with the (changing) projected frac — including the tick carrying the rebuild.
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "open_plan", path: PLAN_A } },
+      { tMs: 0, frame: { t: "scroll", target: "#reader-scroll", fromFrac: 0, toFrac: 1, fromMs: 0, toMs: 1000 } },
+      // A set_comments AT T=500 mid-window → rebuilds the pane (resets scrollTop) → must self-heal.
+      { tMs: 500, frame: { t: "set_comments", path: PLAN_A, comments: [comment(1)] } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(0); // open + scroll frac 0
+    await flush();
+    r.reconcile(500); // the set_comments rebuild tick — scroll frac 0.5 re-asserted
+    await flush();
+    r.reconcile(600); // next tick — scroll frac 0.6 re-asserted (proves no memo: a changed AND unchanged
+    r.reconcile(600); //   re-tick at the SAME T still re-drives every tick (no change-memo skip).
+    await flush();
+
+    const calls = (seams.setScroll as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    // One setScroll call PER reconcile tick (4 ticks above) — proves it is NOT memoized (a memoized pass
+    // would skip the duplicate T=600 tick). FALSIFIABILITY: add a changed-value memo to reconcileScroll
+    // and the duplicate-T tick would be skipped → this length check goes RED.
+    expect(calls.length).toBe(4);
+    // The tick carrying the set_comments rebuild (T=500) re-asserted the projected frac (0.5) — the
+    // self-heal. FALSIFIABILITY: move reconcileScroll BEFORE reconcileReadingPane (or memoize it) and the
+    // post-rebuild frac would not be re-driven on that tick.
+    expect(calls[1]).toEqual({ target: "#reader-scroll", frac: 0.5 });
+    expect(calls[3]).toEqual({ target: "#reader-scroll", frac: 0.6 });
+  });
+
+  it("setScroll runs AFTER reconcileReadingPane in the pass order (synchronous empty-pane rebuild)", () => {
+    // Source-order guarantee: in reconcile(), reconcileScroll is invoked AFTER reconcileReadingPane. The
+    // open-PATH reading-pane render is async (a detached microtask chain), so to observe pass ORDER on a
+    // single synchronous tick we use the EMPTY-pane branch (open_plan{null}), whose renderInto is
+    // SYNCHRONOUS. setScroll must fire AFTER that renderInto. FALSIFIABILITY: move reconcileScroll above
+    // reconcileReadingPane in reconcile() and the recorded order flips → RED.
+    const order: string[] = [];
+    const { seams } = makeSeams({
+      renderInto: vi.fn(() => order.push("renderInto")),
+      setScroll: vi.fn(() => order.push("setScroll")),
+    });
+    const story: StoryFrame[] = [
+      // open_plan{null} → the synchronous empty render; a scroll window active at the same T.
+      { tMs: 0, frame: { t: "open_plan", path: null } },
+      { tMs: 0, frame: { t: "scroll", target: "#reader-scroll", fromFrac: 0, toFrac: 1, fromMs: 0, toMs: 1000 } },
+    ];
+    const r = createReconciler(seams, story);
+    r.reconcile(0);
+    const firstRender = order.indexOf("renderInto");
+    const firstScroll = order.indexOf("setScroll");
+    expect(firstRender).toBeGreaterThanOrEqual(0);
+    expect(firstScroll).toBeGreaterThan(firstRender);
   });
 });
 
