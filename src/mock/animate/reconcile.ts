@@ -103,6 +103,13 @@ export interface ReconcilerSeams {
 // ONLY the seams whose projected value changed.
 export interface Reconciler {
   reconcile: (T: number) => void;
+  // Await the in-flight reading-pane render+settle (read → renderInto → applyComments → settle). Resolves
+  // immediately (already-resolved promise) when no async open is in flight. The player wires this into
+  // `window.__mockAnim.seekSettled` so a capture/replay caller can await a FULLY-rendered pane before
+  // screenshotting (seekTo → paint → reconcileReadingPane kicks off a detached async chain that returns
+  // BEFORE the pane finishes rendering — this barrier closes that race). Pure addition: existing callers
+  // never call it, so reconcile behavior is unchanged.
+  settleBarrier: () => Promise<void>;
 }
 
 // Stable JSON of a comment-record array (order-sensitive, which is fine — the projection preserves
@@ -138,6 +145,11 @@ export function createReconciler(
   // its post-await pane mutations so two back-to-back open_plans never let the FIRST plan's settle
   // clobber the SECOND plan's content.
   let openEpoch = 0;
+  // The promise of the CURRENT in-flight reading-pane async chain (read → renderInto → applyComments →
+  // settle), or null when idle. `settleBarrier()` awaits this so a caller can wait for a fully-rendered
+  // pane. It is set BEFORE the IIFE awaits anything and cleared only when the LATEST chain finishes (a
+  // superseded chain leaves the field pointing at the newest open). It never rejects (the chain swallows).
+  let inFlightSettle: Promise<void> | null = null;
 
   // ---- overlay-pass memo state ------------------------------------------------------------------
   // Pulse: the sorted-JSON key of the last-applied pulse SET (mirrors plansKey). null ⇒ never applied.
@@ -165,13 +177,20 @@ export function createReconciler(
       // Bump the epoch so any in-flight async read aborts (it would otherwise re-fill the pane).
       void ++openEpoch;
       seams.renderInto(seams.readingPane, "", seams.planDirOf(""));
+      // Synchronous, fully-settled close: nothing async is pending, so any prior in-flight barrier is
+      // now superseded and the pane is in its final empty state. Drop the barrier to idle.
+      inFlightSettle = null;
       return;
     }
 
     const path = surface.openPlanPath;
     const comments = surface.comments;
     const gen = ++openEpoch;
-    void (async () => {
+    // Capture the detached async chain into inFlightSettle so settleBarrier() can await it. The chain
+    // resolves AFTER renderInto + applyComments + settle for THIS epoch; a superseded chain returns
+    // early (the epoch guard) WITHOUT clearing inFlightSettle, so the field always points at the newest
+    // open. The latest chain clears it to null on completion.
+    const chain = (async () => {
       const md = await seams.readPlan(path);
       // Stale-read guard: a newer open superseded this read — abort BEFORE any pane mutation.
       if (gen !== openEpoch) return;
@@ -181,7 +200,10 @@ export function createReconciler(
       seams.applyComments(seams.readingPane, comments);
       // Guard again before the (async) settle so a delayed settle from a superseded read can't run.
       if (gen === openEpoch) await seams.settle(seams.readingPane);
+      // Only the LATEST chain clears the barrier (a stale chain returned above without touching it).
+      if (gen === openEpoch) inFlightSettle = null;
     })();
+    inFlightSettle = chain;
   }
 
   function reconcileSidebar(surface: SurfaceState, prev: SurfaceState | null): void {
@@ -398,5 +420,10 @@ export function createReconciler(
     lastSurface = surface;
   }
 
-  return { reconcile };
+  // Await the in-flight reading-pane chain (or resolve immediately when idle). Wrapped in
+  // Promise.resolve so the returned promise is always a fresh, never-rejecting microtask boundary.
+  const settleBarrier = (): Promise<void> =>
+    inFlightSettle === null ? Promise.resolve() : Promise.resolve(inFlightSettle);
+
+  return { reconcile, settleBarrier };
 }

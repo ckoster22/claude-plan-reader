@@ -49,7 +49,39 @@ import {
   type StoryFrame,
 } from "./storyboard";
 import { createReconciler } from "./reconcile";
+import {
+  projectActiveComments,
+  tickGroups,
+  denorm,
+  type AnnotationDoc,
+  type AnnotationComment,
+  type Stroke,
+} from "./annotations";
 import type { PlanRecord, ReviewRequest } from "../../types";
+
+// ---- window globals: the programmatic seek hook + the author-mode flag --------------------------
+//
+// `window.__mockAnim` is the capture/replay control surface (exposed at the end of mountPlayer). It
+// lets a headless driver land EXACTLY on a comment's tMs (vs fuzzing pixel-drags on .mockanim-progress)
+// and await a fully-settled reading pane before screenshotting. `window.__MOCK_ANNOTATE` is the
+// author-mode flag injected by the dev plugin (Phase 3); declared now so later phases need no re-decl.
+export interface MockAnimApi {
+  seekTo: (tMs: number) => void;
+  seekSettled: (tMs: number) => Promise<void>;
+  play: () => void;
+  stop: () => void;
+  getT: () => number;
+  getDuration: () => number;
+  loadAnnotations: (doc: AnnotationDoc | null) => void;
+  getActiveComments: () => AnnotationComment[];
+}
+
+declare global {
+  interface Window {
+    __mockAnim?: MockAnimApi;
+    __MOCK_ANNOTATE?: boolean | undefined;
+  }
+}
 
 // ---- namespaced stylesheet -------------------------------------------------------------------
 
@@ -245,6 +277,78 @@ const ANIM_CSS = `
   font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   transition: width 200ms ease, padding 200ms ease;
 }
+
+/* ---- annotation overlay (Phase 1: replay/capture; pure projection of (doc, T)) ----------------
+   Z-ORDER STACK (load-bearing, pinned explicitly):
+     transport #mock-anim ........ 2147483647  (topmost; pointer-events:auto on its controls — must
+                                                 stay clickable, so it is the LAST body child appended)
+     #demo-annotation-canvas ..... 2147483647  (ABOVE #demo-cursor + #demo-proto-card — annotations are
+       #mockanim-cmt panel                       the thing being reviewed, so they sit over the cosmetic
+                                                 overlays. Equal numeric z to the transport, but appended
+                                                 BEFORE it, so paint order places the transport on top and
+                                                 the canvas above cursor/proto-card. pointer-events:none.)
+     #demo-cursor ................ 2147483647  (cosmetic; appended before the canvas → painted under it)
+     #demo-proto-card ............ 2147483646  (cosmetic; strictly below the canvas)
+   The canvas + panel are pure projections re-derived every paint (back-scrub clears them like every
+   other overlay). They are INERT until a doc is loaded (no doc ⇒ cleared canvas + empty panel). */
+#demo-annotation-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+  width: 100vw;
+  height: 100vh;
+}
+#mockanim-cmt {
+  position: fixed;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  pointer-events: none;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(640px, 80vw);
+}
+#mockanim-cmt.mockanim-cmt-on { display: flex; }
+#mockanim-cmt .mockanim-cmt-item {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(22, 22, 26, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  color: #f3f3f3;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  white-space: pre-wrap;
+}
+/* Comment ticks on the scrubber — a distinct shape/color from the chapter .mockanim-marker so the two
+   read apart. Click-to-jump (pointer-events:auto). A multi-comment tick carries a small count badge. */
+#mock-anim .mockanim-cmt-tick {
+  position: absolute;
+  bottom: -4px;
+  width: 7px;
+  height: 7px;
+  margin-left: -3.5px;
+  border-radius: 50%;
+  background: #8be9a8;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+  pointer-events: auto;
+}
+#mock-anim .mockanim-cmt-tick:hover { background: #aef3c4; }
+#mock-anim .mockanim-cmt-tick-badge {
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  transform: translateX(-50%);
+  font: 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #16161a;
+  background: #8be9a8;
+  border-radius: 7px;
+  padding: 1px 4px;
+  pointer-events: none;
+}
 `;
 
 // ---- element helper (mirrors deck.ts's el()) -------------------------------------------------
@@ -364,6 +468,99 @@ function mountPlayer(): void {
   protoCard.id = "demo-proto-card";
   protoCard.style.display = "none";
   document.body.appendChild(protoCard);
+
+  // ---- annotation overlay nodes (Phase 1) ----
+  // The canvas sits ABOVE #demo-cursor/#demo-proto-card (it is appended AFTER them, below the transport
+  // root appended later — see the z-order comment in ANIM_CSS). Both nodes are created ONCE; the player
+  // is the single writer, mirroring the #demo-cursor pattern. INERT until a doc is loaded.
+  const annoCanvas = el("canvas");
+  annoCanvas.id = "demo-annotation-canvas";
+  document.body.appendChild(annoCanvas);
+
+  const cmtPanel = el("div");
+  cmtPanel.id = "mockanim-cmt";
+  document.body.appendChild(cmtPanel);
+
+  // ---- annotation in-memory state (Phase 1: no persistence) ----
+  // The active doc, or null when none is loaded (the default — the overlay is then fully INERT). The
+  // player is the single writer via loadAnnotations(); the overlay is a PURE projection of (currentDoc, T)
+  // re-derived every paint, so a back-scrub clears it like every other reconciler-owned overlay.
+  let currentDoc: AnnotationDoc | null = null;
+
+  // Draw one stroke (already-denormalized to the current viewport) onto a 2D context. pen = polyline
+  // through all points; arrow = points[0]→points[1] with a small arrowhead; box = rect points[0]..[1].
+  const drawStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke, vw: number, vh: number): void => {
+    const pts = stroke.points.map((p) => denorm(p, vw, vh));
+    if (pts.length === 0) return;
+    ctx.strokeStyle = stroke.color;
+    ctx.fillStyle = stroke.color;
+    ctx.lineWidth = stroke.width;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    if (stroke.tool === "pen") {
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.stroke();
+      return;
+    }
+    if (pts.length < 2) return;
+    const [x0, y0] = pts[0];
+    const [x1, y1] = pts[1];
+    if (stroke.tool === "box") {
+      ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+      return;
+    }
+    // arrow: the shaft + a small arrowhead at the end, sized to the stroke width.
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    const angle = Math.atan2(y1 - y0, x1 - x0);
+    const head = Math.max(8, stroke.width * 3);
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - head * Math.cos(angle - Math.PI / 6), y1 - head * Math.sin(angle - Math.PI / 6));
+    ctx.lineTo(x1 - head * Math.cos(angle + Math.PI / 6), y1 - head * Math.sin(angle + Math.PI / 6));
+    ctx.closePath();
+    ctx.fill();
+  };
+
+  // Render the overlay as a PURE fn of (currentDoc, T): size+clear the canvas, draw the strokes of every
+  // active comment, and stack their text in the panel. No doc OR no active comment ⇒ cleared canvas +
+  // empty/hidden panel (the INERT default). Called every paint AFTER the reconcile pass.
+  const renderAnnotations = (T: number): void => {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    // DPR-aware sizing, kept simple: back the canvas at device pixels, draw in CSS pixels via a scale.
+    const dpr = window.devicePixelRatio || 1;
+    if (annoCanvas.width !== Math.round(vw * dpr)) annoCanvas.width = Math.round(vw * dpr);
+    if (annoCanvas.height !== Math.round(vh * dpr)) annoCanvas.height = Math.round(vh * dpr);
+    const ctx = annoCanvas.getContext("2d");
+    if (ctx) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, vw, vh);
+    }
+    if (currentDoc === null) {
+      cmtPanel.replaceChildren();
+      cmtPanel.classList.remove("mockanim-cmt-on");
+      return;
+    }
+    const active = projectActiveComments(currentDoc, T);
+    if (ctx) {
+      for (const cmt of active) {
+        for (const stroke of cmt.strokes) drawStroke(ctx, stroke, vw, vh);
+      }
+    }
+    // Panel: stack every active comment's text. Empty/hidden when none.
+    const items: HTMLElement[] = [];
+    for (const cmt of active) {
+      if (cmt.text.trim().length === 0) continue;
+      items.push(el("div", "mockanim-cmt-item", cmt.text));
+    }
+    cmtPanel.replaceChildren(...items);
+    cmtPanel.classList.toggle("mockanim-cmt-on", items.length > 0);
+  };
 
   // The set of elements currently carrying `.demo-pulse` (so a changed pulse set removes from the gone
   // and adds to the new). Held across reconcile passes — the player is the single writer of the class.
@@ -619,11 +816,13 @@ function mountPlayer(): void {
 
   const speed = (): number => SPEEDS[speedIdx];
 
-  // Single paint: reconcile the host seams to T + update the transport fill.
+  // Single paint: reconcile the host seams to T + update the transport fill + render the annotation
+  // overlay (a pure projection of (currentDoc, T); inert when no doc is loaded).
   const paint = (): void => {
     reconciler.reconcile(T);
     const pct = duration > 0 ? Math.min(100, (T / duration) * 100) : 100;
     fill.style.width = `${pct}%`;
+    renderAnnotations(T);
   };
 
   const stop = (): void => {
@@ -694,6 +893,58 @@ function mountPlayer(): void {
     speedIdx = (speedIdx + 1) % SPEEDS.length;
     speedBtn.textContent = `${speed()}×`;
   });
+
+  // ---- annotation comment ticks on the scrubber (rebuilt on doc change, NOT every tick) ----
+  // One `.mockanim-cmt-tick` per distinct comment tMs (tickGroups), positioned at tMs/duration, click →
+  // seekTo (mirrors the chapter .mockanim-marker). A multi-comment group carries a small count badge.
+  const rebuildCmtTicks = (): void => {
+    for (const old of Array.from(progress.querySelectorAll(".mockanim-cmt-tick"))) old.remove();
+    if (currentDoc === null) return;
+    for (const group of tickGroups(currentDoc)) {
+      const tick = el("div", "mockanim-cmt-tick");
+      tick.style.left = duration > 0 ? `${(group.tMs / duration) * 100}%` : "0%";
+      tick.title = `comment @ ${group.tMs}ms${group.count > 1 ? ` (${group.count})` : ""}`;
+      tick.addEventListener("pointerdown", (e) => {
+        e.stopPropagation(); // don't also start a track drag
+        seekTo(group.tMs);
+      });
+      if (group.count > 1) {
+        tick.appendChild(el("div", "mockanim-cmt-tick-badge", String(group.count)));
+      }
+      progress.appendChild(tick);
+    }
+  };
+
+  // ---- programmatic seek/replay control surface (window.__mockAnim) ----
+  // seekSettled: seek, then await the reconciler's reading-pane settle barrier so a caller (capture /
+  // replay) lands on a FULLY-rendered pane. The barrier resolves immediately (next microtask) when no
+  // plan-open is in flight, so callers can await it uniformly.
+  const seekSettled = async (tMs: number): Promise<void> => {
+    seekTo(tMs);
+    await reconciler.settleBarrier();
+  };
+  // loadAnnotations: set the active doc, rebuild ticks, repaint (so the overlay reflects the new doc at
+  // the current T). Passing null returns to the inert default.
+  const loadAnnotations = (next: AnnotationDoc | null): void => {
+    currentDoc = next;
+    rebuildCmtTicks();
+    paint();
+  };
+  const getActiveComments = (): AnnotationComment[] =>
+    currentDoc === null ? [] : projectActiveComments(currentDoc, T);
+
+  // Idempotent assignment (the HMR guard at the top of mountPlayer already prevents a second mount, but
+  // assigning the fresh closures is harmless if it ever runs again).
+  window.__mockAnim = {
+    seekTo,
+    seekSettled,
+    play,
+    stop,
+    getT: (): number => T,
+    getDuration: (): number => duration,
+    loadAnnotations,
+    getActiveComments,
+  };
 
   // Initial paint at T=0 (the opening frame), paused. The reconciler will activate the Conversation
   // tab (no plan open at T=0 → activeTab "conversation").
