@@ -629,13 +629,19 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
   const NESTED_SHIFT = EXEC_SHIFT + PROTO_ACT_SHIFT;
   const PLAN_CHANGED_MS = 19800 + NESTED_SHIFT;
 
-  it("sidebar is EMPTY ([]) before the plan_changed reveal and TRAILHEAD_PLANS at/after it", () => {
+  it("(P1) sidebar is EMPTY ([]) before the reveal, then ONLY the master appears (NOT the whole tree); the full tree lands only at duration", () => {
     // The explicit empty plan_changed at tMs 0 pins the sidebar to [] from the start (NOT the seed).
     expect(projectSurfaceState(TRAILHEAD_BEAT, 0).plans).toEqual([]);
     expect(projectSurfaceState(TRAILHEAD_BEAT, 10000).plans).toEqual([]);
     expect(projectSurfaceState(TRAILHEAD_BEAT, PLAN_CHANGED_MS - 1).plans).toEqual([]);
-    // At/after the reveal the drafted tree is revealed.
-    expect(projectSurfaceState(TRAILHEAD_BEAT, PLAN_CHANGED_MS).plans).toEqual(TRAILHEAD_PLANS);
+    // (P1) At the Nested-plan reveal ONLY the master row appears — the subplan rows appear ONE AT A TIME
+    // later in the progressive Execution chapter. FALSIFIABILITY: revert to the all-at-once full-tree
+    // plan_changed and the master-only length-1 assertion here goes RED (it would be the full 9 rows).
+    const atReveal = projectSurfaceState(TRAILHEAD_BEAT, PLAN_CHANGED_MS).plans;
+    expect(atReveal).toHaveLength(1);
+    expect(atReveal[0].flavor).toBe("master");
+    expect(atReveal[0]).toEqual(TRAILHEAD_PLANS[0]);
+    // The full tree is present only once the progressive Execution chapter has grown it (at duration).
     expect(projectSurfaceState(TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT)).plans).toEqual(TRAILHEAD_PLANS);
   });
 
@@ -678,6 +684,197 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
     // At duration the terminal result has landed → the turn is complete, working is null.
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
     expect(model.derive().working).toBeNull();
+  });
+});
+
+// ---- (P1) TRAILHEAD_BEAT — PROGRESSIVE multiplan reveal (the structural core) ------------------
+//
+// The back half now plays PROGRESSIVELY: the master appears alone, then each subplan's ROW materializes
+// ONE AT A TIME (a fresh `plan_changed` snapshot = the tree grown so far) just before that subplan is
+// planned + executed, with a parent-review beat between siblings. These tests assert that growth on the
+// ordered `plan_changed` SurfaceFrames — pinned to the subplan order, NOT to magic tMs numbers.
+
+describe("storyboard — (P1) progressive multiplan reveal", () => {
+  // The ordered `plan_changed` snapshots across the WHOLE beat (story order = ascending tMs).
+  function planChangedFrames(): Array<{ tMs: number; plans: PlanRecord[] }> {
+    return TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "plan_changed").map((sf) => ({
+      tMs: sf.tMs,
+      plans: (sf.frame as { plans: PlanRecord[] }).plans,
+    }));
+  }
+
+  // The nn_path set of a snapshot's subplan rows (master excluded — it carries nn_path null).
+  function subPaths(plans: PlanRecord[]): string[] {
+    return plans.filter((p) => p.flavor === "sub").map((p) => p.nn_path as string);
+  }
+
+  // The subplan reveal STAGES, in execution order. Each stage's snapshot must contain EXACTLY the master
+  // + the cumulative sub nn_paths up to and including that stage (02..04.04 ABSENT before their turn).
+  // Stage 04.01 also pulls in the "04" decomposition parent (it must precede its first leaf).
+  const STAGES: ReadonlyArray<{ id: string; cumulative: string[] }> = [
+    { id: "01", cumulative: ["01"] },
+    { id: "02", cumulative: ["01", "02"] },
+    { id: "03", cumulative: ["01", "02", "03"] },
+    { id: "04.01", cumulative: ["01", "02", "03", "04", "04.01"] },
+    { id: "04.02", cumulative: ["01", "02", "03", "04", "04.01", "04.02"] },
+    { id: "04.03", cumulative: ["01", "02", "03", "04", "04.01", "04.02", "04.03"] },
+    { id: "04.04", cumulative: ["01", "02", "03", "04", "04.01", "04.02", "04.03", "04.04"] },
+  ];
+
+  it("the first snapshot is the EMPTY sidebar; the second is the MASTER ALONE (the Nested-plan reveal)", () => {
+    const snaps = planChangedFrames();
+    // tMs-0 empty sidebar.
+    expect(snaps[0].plans).toEqual([]);
+    // The Nested-plan reveal: master alone (NOT the whole tree). FALSIFIABILITY: an all-at-once tree here
+    // makes subPaths non-empty → RED.
+    const masterReveal = snaps.find((s) => s.plans.length > 0)!;
+    expect(masterReveal.plans).toHaveLength(1);
+    expect(masterReveal.plans[0].flavor).toBe("master");
+    expect(subPaths(masterReveal.plans)).toEqual([]);
+  });
+
+  it("PROGRESSIVE APPEARANCE — at stage K the snapshot contains EXACTLY master + subs 01..K (later subs ABSENT before their turn)", () => {
+    const snaps = planChangedFrames();
+    // The progressive (non-empty, growing) snapshots are those AFTER the master-only reveal. There is one
+    // execution-stage snapshot per STAGE, in order. Match them by their cumulative sub-path set.
+    const growing = snaps.filter((s) => subPaths(s.plans).length > 0);
+    expect(growing.length).toBe(STAGES.length);
+    for (let k = 0; k < STAGES.length; k++) {
+      const stage = STAGES[k];
+      const snap = growing[k];
+      // EXACTLY the cumulative subs (a Set compare — order asserted separately by the orphan-free test).
+      // FALSIFIABILITY: include a LATER node early (e.g. push "02" into stage 01's reveals) and stage 0's
+      // set would gain "02" → this exact-set compare goes RED.
+      expect(new Set(subPaths(snap.plans)), `stage ${stage.id} cumulative subs`).toEqual(new Set(stage.cumulative));
+      // Master always present.
+      expect(snap.plans.some((p) => p.flavor === "master")).toBe(true);
+    }
+    // Concretely: stage 01's snapshot has 01 but NOT 02/03/04 (the headline invariant).
+    const stage01 = growing[0];
+    expect(subPaths(stage01.plans)).toContain("01");
+    for (const absent of ["02", "03", "04", "04.01"]) {
+      expect(subPaths(stage01.plans)).not.toContain(absent);
+    }
+  });
+
+  it("ORPHAN-FREE SNAPSHOTS — every `plan_changed` payload is master-first and parent-before-child (never trips the sidebar orphan path)", () => {
+    for (const { plans } of planChangedFrames()) {
+      if (plans.length === 0) continue;
+      // (1) master-first: the first row (if any sub exists) is the master.
+      if (plans.some((p) => p.flavor === "sub")) {
+        expect(plans[0].flavor, "master-first").toBe("master");
+      }
+      // (2) parent-before-child: for every dotted sub (04.0x) its parent prefix (04) appears EARLIER, and
+      // for every depth-1 sub its master appears earlier. We assert the dotted-parent rule (the one the
+      // sidebar's orphan path guards) AND that NO sub precedes the master.
+      const seen = new Set<string>();
+      let masterIdx = -1;
+      plans.forEach((p, i) => {
+        if (p.flavor === "master") masterIdx = i;
+      });
+      plans.forEach((p, i) => {
+        if (p.flavor !== "sub") {
+          seen.add(p.nn_path ?? "");
+          return;
+        }
+        // No sub before the master.
+        expect(i, "sub after master").toBeGreaterThan(masterIdx);
+        const nn = p.nn_path as string;
+        const parentPrefix = nn.split(".").slice(0, -1).join(".");
+        if (parentPrefix !== "") {
+          // A dotted sub (04.0x): its parent prefix (04) must already have appeared. FALSIFIABILITY:
+          // reorder a snapshot so 04.01 precedes 04 and this goes RED (the orphan path would fire live).
+          expect(seen.has(parentPrefix), `parent ${parentPrefix} before ${nn}`).toBe(true);
+        }
+        seen.add(nn);
+      });
+    }
+  });
+
+  it("ORDERING — subplan N's row appears at a tMs AFTER subplan N-1's done + parent-review beat", () => {
+    const growing = planChangedFrames().filter((s) => subPaths(s.plans).length > 0);
+    // Each stage's appearance tMs strictly increases (the rows appear one at a time, in order).
+    for (let k = 1; k < growing.length; k++) {
+      expect(growing[k].tMs, `stage ${STAGES[k].id} appears after stage ${STAGES[k - 1].id}`).toBeGreaterThan(growing[k - 1].tMs);
+    }
+    // Stronger: stage N's row appears AFTER stage N-1's DEFERRED execution-Task result (its "done" signal)
+    // AND after the parent-review narration that follows it. Find stage N-1's execution Task deferred
+    // result tMs, and assert stage N's appearance is strictly later.
+    const execTaskIds = [
+      "toolu_th_exec_sp01",
+      "toolu_th_exec_sp02",
+      "toolu_th_exec_sp03",
+      "toolu_th_exec_sp0401",
+      "toolu_th_exec_sp0402",
+      "toolu_th_exec_sp0403",
+    ];
+    for (let k = 1; k < growing.length; k++) {
+      const priorTaskId = execTaskIds[k - 1];
+      const deferred = TRAILHEAD_BEAT.find(
+        (sf) =>
+          sf.frame.t === "conv" &&
+          (sf.frame as { ev: { kind: string; tool_use_id?: string; parent_tool_use_id: string | null } }).ev.kind === "tool_result" &&
+          (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === priorTaskId &&
+          (sf.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id === null,
+      );
+      expect(deferred, `deferred exec result for ${priorTaskId}`).toBeDefined();
+      // The next stage's row appears strictly AFTER the prior subplan's done signal.
+      // FALSIFIABILITY: hoist the row appearance before the prior subplan's done and this goes RED.
+      expect(growing[k].tMs, `stage ${STAGES[k].id} after ${priorTaskId} done`).toBeGreaterThan(deferred!.tMs);
+    }
+  });
+
+  it("(#7) a master→01 'thinking' planning-lead group precedes the FIRST subplan row appearing", () => {
+    // The planning-lead Task (the agent reasoning about where to start) must land BEFORE subplan 01's row
+    // snapshot. FALSIFIABILITY: drop the planning-lead group and this find goes undefined → RED.
+    const lead = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; id?: string } }).ev.kind === "tool_use" &&
+        (sf.frame as { ev: { id?: string } }).ev.id === "toolu_th_plan_lead",
+    );
+    expect(lead).toBeDefined();
+    const growing = TRAILHEAD_BEAT.filter(
+      (sf) => sf.frame.t === "plan_changed" && (sf.frame as { plans: PlanRecord[] }).plans.some((p) => p.flavor === "sub"),
+    );
+    const firstRow = growing[0];
+    expect(lead!.tMs).toBeLessThan(firstRow.tMs);
+  });
+
+  it("(#11) each subplan is PLANNED just-in-time: its planning Task lands AFTER its row appears and BEFORE its execution Task", () => {
+    const stages = [
+      { reveal: ["01"], planId: "toolu_th_plan_sp01", execId: "toolu_th_exec_sp01" },
+      { reveal: ["02"], planId: "toolu_th_plan_sp02", execId: "toolu_th_exec_sp02" },
+      { reveal: ["03"], planId: "toolu_th_plan_sp03", execId: "toolu_th_exec_sp03" },
+      { reveal: ["04.01"], planId: "toolu_th_plan_sp0401", execId: "toolu_th_exec_sp0401" },
+      { reveal: ["04.02"], planId: "toolu_th_plan_sp0402", execId: "toolu_th_exec_sp0402" },
+      { reveal: ["04.03"], planId: "toolu_th_plan_sp0403", execId: "toolu_th_exec_sp0403" },
+      { reveal: ["04.04"], planId: "toolu_th_plan_sp0404", execId: "toolu_th_exec_sp0404" },
+    ];
+    const taskTMs = (id: string): number => {
+      const sf = TRAILHEAD_BEAT.find(
+        (f) =>
+          f.frame.t === "conv" &&
+          (f.frame as { ev: { kind: string; id?: string } }).ev.kind === "tool_use" &&
+          (f.frame as { ev: { id?: string } }).ev.id === id,
+      );
+      expect(sf, `Task tool_use ${id}`).toBeDefined();
+      return sf!.tMs;
+    };
+    for (const st of stages) {
+      // The row snapshot whose sub set newly contains this stage's last reveal path.
+      const path = st.reveal[st.reveal.length - 1];
+      const rowSnap = TRAILHEAD_BEAT.find(
+        (sf) => sf.frame.t === "plan_changed" && (sf.frame as { plans: PlanRecord[] }).plans.some((p) => p.nn_path === path),
+      );
+      expect(rowSnap, `row snapshot for ${path}`).toBeDefined();
+      const planMs = taskTMs(st.planId);
+      const execMs = taskTMs(st.execId);
+      // row appears ≤ planning Task < execution Task — the plan is drafted JUST-IN-TIME at the row's turn.
+      // FALSIFIABILITY: move a subplan's planning Task before its row (or after its execution) → RED.
+      expect(rowSnap!.tMs).toBeLessThanOrEqual(planMs);
+      expect(planMs).toBeLessThan(execMs);
+    }
   });
 });
 

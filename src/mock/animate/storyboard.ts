@@ -1962,6 +1962,33 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
   },
 ];
 
+// ---- (P1) PROGRESSIVE PLAN-TREE SNAPSHOTS — the sidebar grows ONE node at a time ----------------
+//
+// Phase 1 conveys progression by NODE APPEARANCE (the real sidebar has no queued/active/done node
+// styling — PlanRecord is a frozen wire contract). So instead of injecting the whole TRAILHEAD_PLANS
+// tree at once, the storyboard emits a SEQUENCE of `plan_changed` snapshots, each a FULL, PRE-ORDERED
+// `PlanRecord[]` = the tree grown SO FAR. The growth is derived from TRAILHEAD_PLANS by FILTERING it
+// (preserving its master-first, parent-before-child pre-order) down to the nn_paths revealed so far —
+// so EVERY snapshot is master-first and parent-before-child and can NEVER trip the sidebar orphan-row
+// path (main.ts renderSidebar: a sub whose master/dotted-parent isn't already present logs an orphan).
+//
+// The master (nn_path null) is ALWAYS present (it is revealed first, alone, in the Nested-plan chapter
+// via TREE_MASTER_ONLY). `treeThrough(revealedPaths)` returns master + every TRAILHEAD_PLANS row whose
+// nn_path is in `revealedPaths`, in TRAILHEAD_PLANS pre-order. Because the slice always respects that
+// pre-order, including a 04.0x leaf REQUIRES its 04 parent be in `revealedPaths` too (the per-subplan
+// snapshots in buildExecution add "04" at 04.01's turn — see each ExecSubplan.reveals).
+
+// The master row alone — the FIRST sidebar reveal (Nested-plan chapter). child_count 4 ⇒ renders as a
+// master with an (empty until populated) children container. Pre-ordered (single master, no orphans).
+const TREE_MASTER_ONLY: PlanRecord[] = TRAILHEAD_PLANS.filter((p) => p.flavor === "master");
+
+// PURE: the full pre-ordered tree grown to include the master + every row whose nn_path is in
+// `revealedPaths`. Filters TRAILHEAD_PLANS (which is already master-first, parent-before-child) so the
+// result preserves that pre-order — master-first, every parent before its children. Never re-orders.
+function treeThrough(revealedPaths: ReadonlySet<string>): PlanRecord[] {
+  return TRAILHEAD_PLANS.filter((p) => p.flavor === "master" || (p.nn_path !== null && revealedPaths.has(p.nn_path)));
+}
+
 // ---- DOWNSTREAM (P4-shifted): nested plan … comment & iterate … execution … terminal ------------
 //
 // These chapters keep their ORIGINAL shape + seqs but are shifted by + PROTO_ACT_SHIFT in tMs (the P4
@@ -1990,11 +2017,14 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
     },
   },
   {
-    // SURFACE — the drafted Trailhead plan tree pops into the (until-now empty) sidebar: master + four
-    // subs + four 04.* leaves. projectSurfaceState takes the last-≤-T plan_changed, so for any T in
-    // [0, 19800) the sidebar is [] and for T ≥ 19800 it is TRAILHEAD_PLANS (a clean reveal).
+    // SURFACE — (P1) ONLY the MASTER row pops into the (until-now empty) sidebar — NOT the whole tree.
+    // The drafted subplan rows appear ONE AT A TIME later, during the progressive Execution chapter (each
+    // subplan's row materializes at its turn). projectSurfaceState takes the last-≤-T plan_changed, so for
+    // any T in [0, 19800+shift) the sidebar is [] and for T ≥ that it is the master alone (TREE_MASTER_ONLY)
+    // until the Execution chapter grows it. The master carries child_count 4 so it renders as a master with
+    // an (empty until populated) children container — pre-ordered, never tripping the sidebar orphan path.
     tMs: 46600,
-    frame: { t: "plan_changed", plans: TRAILHEAD_PLANS },
+    frame: { t: "plan_changed", plans: TREE_MASTER_ONLY },
   },
   {
     // SURFACE — open the master plan in the reading pane. LEFT OPEN (no closing open_plan{null}): the
@@ -2166,7 +2196,7 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
 // One leaf tool inside a subplan subagent group. `tool` is the engine tool name; `input` is its tool_use
 // input; `result` is the tool_result content. Read/Write/Edit/Bash mix per subplan.
 interface ExecLeaf {
-  tool: "Read" | "Write" | "Edit" | "Bash";
+  tool: "Read" | "Write" | "Edit" | "Bash" | "Grep";
   input: Record<string, unknown>;
   result: string;
 }
@@ -2179,11 +2209,28 @@ interface ExecSubplan {
   id: string; // subplan id label, e.g. "01" / "04.01"
   taskId: string; // the Task tool_use id (= the subagent group key)
   description: string; // Task description / subagent_started description
+  // (P1) The nn_path(s) this subplan's row APPEARANCE adds to the cumulative revealed set, in pre-order.
+  // Usually just the subplan's own nn_path; for 04.01 it is ["04","04.01"] (the 04 DECOMPOSITION parent
+  // must appear WITH — and before — its first leaf so the snapshot stays parent-before-child).
+  reveals: string[];
+  planBeat: ExecPlanBeat; // (P1) the just-in-time planning beat (recon/sizing/draft) before execution
   narration: string; // top-level launch narration (threads the prior artifact)
   prompt: string; // Task.input.prompt (threads the prior artifact)
   leaves: ExecLeaf[]; // 4–6 atomic leaf tool calls
   summary: string; // in-group closing summary (names the produced artifact)
   taskResult: string; // deferred top-level Task tool_result (names the produced artifact)
+}
+
+// (P1) The just-in-time planning beat for ONE subplan: the narration the agent emits while DRAFTING that
+// subplan's plan (recon/sizing), plus a small atomic tool-call group representing the drafting work. The
+// `draftResult` is the in-group note that the subplan's own plan was written NOW (just before execution).
+interface ExecPlanBeat {
+  narration: string; // top-level "planning subplan NN now" narration (precedes the row's execution)
+  taskId: string; // the planning Task tool_use id (a distinct spanning Task per subplan's drafting)
+  description: string; // the planning Task description / subagent_started label
+  prompt: string; // the planning Task.input.prompt
+  leaves: ExecLeaf[]; // 2–3 atomic recon/sizing leaf tool calls (the drafting work)
+  draftResult: string; // deferred top-level planning-Task tool_result (the subplan's plan, drafted now)
 }
 
 // The seven subplan subagents, in execution order. Subplans 01/02/03 are top-level subplans; 04.01–04.04
@@ -2195,6 +2242,20 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "01",
     taskId: "toolu_th_exec_sp01",
     description: "Subplan 01 — Trail data & search",
+    reveals: ["01"],
+    planBeat: {
+      narration: "Planning subplan 01 · Trail data & search — recon the data shape, size the work, and draft the subplan now.",
+      taskId: "toolu_th_plan_sp01",
+      description: "Draft subplan 01 — Trail data & search",
+      prompt:
+        "Draft subplan 01 (Trail data & search): recon the existing trail data shape, size the catalog/search/filter work, and write the subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/data/trails.json" }, result: "Seed trail catalog — 42 trails, each with id/name/distance/gain/difficulty. Drives the data-layer shape." },
+        { tool: "Grep", input: { pattern: "difficulty", output_mode: "files_with_matches" }, result: "src/data/trails.json\nsrc/components/DifficultyBadge.tsx — difficulty already modelled; size as one focused subplan." },
+      ],
+      draftResult:
+        "Subplan 01 drafted — Trail data & search: a TrailRepository (`Trail` type + difficulty palette {easy/moderate/hard}) seeded from trails.json, with a search-by-name query. Sized: one focused subplan.",
+    },
     narration: "Subplan 01 · Trail data & search — building the data layer first so everything downstream has trails to render.",
     prompt:
       "Implement subplan 01 (Trail data & search): create a TrailRepository that exposes a `Trail` type and a difficulty palette {easy/moderate/hard}, seed it from trails.json, and add a search-by-name query. Report the artifact you produced.",
@@ -2212,6 +2273,20 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "02",
     taskId: "toolu_th_exec_sp02",
     description: "Subplan 02 — Map & navigation",
+    reveals: ["02"],
+    planBeat: {
+      narration: "Planning subplan 02 · Map & navigation — recon the navigation layer, size the map work against subplan 01's `TrailRepository`, and draft it.",
+      taskId: "toolu_th_plan_sp02",
+      description: "Draft subplan 02 — Map & navigation",
+      prompt:
+        "Draft subplan 02 (Map & navigation): recon the navigation layer, size plotting subplan 01's `TrailRepository` trails on a MapScreen, and write the subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/navigation/RootNavigator.tsx" }, result: "Native-stack root — a MapScreen + TrailDetail route slot in cleanly. Sized as one subplan." },
+        { tool: "Read", input: { file_path: "src/data/TrailRepository.ts" }, result: "TrailRepository exposes the `Trail` type + difficulty palette from subplan 01 — the map consumes both." },
+      ],
+      draftResult:
+        "Subplan 02 drafted — Map & navigation: a MapScreen plotting subplan 01's `TrailRepository` trails with difficulty-coloured pins, wired into native-stack navigation. Sized: one subplan.",
+    },
     narration: "Subplan 02 · Map & navigation — building on subplan 01's `TrailRepository` (`Trail` type + difficulty palette) to plot trails on the map.",
     prompt:
       "Implement subplan 02 (Map & navigation): building on subplan 01's `TrailRepository` (`Trail` type + difficulty palette), wire native-stack navigation and plot each trail on the MapScreen, colouring pins by the difficulty palette. Report the artifact you produced.",
@@ -2230,6 +2305,20 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "03",
     taskId: "toolu_th_exec_sp03",
     description: "Subplan 03 — Hike logging",
+    reveals: ["03"],
+    planBeat: {
+      narration: "Planning subplan 03 · Hike logging — recon subplan 02's `MapScreen.tsx` route, size the logging store, and draft the subplan.",
+      taskId: "toolu_th_plan_sp03",
+      description: "Draft subplan 03 — Hike logging",
+      prompt:
+        "Draft subplan 03 (Hike logging): recon subplan 02's `MapScreen.tsx` + TrailDetail route, size a hike-log store + screen that deep-links to a trail, and write the subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/screens/MapScreen.tsx" }, result: "MapScreen navigates to the TrailDetail route with a Trail param — the hike log can reuse that deep-link." },
+        { tool: "Bash", input: { command: "ls src/data" }, result: "TrailRepository.ts  useTrails.ts — a HikeLogStore slots beside them. Sized as one subplan." },
+      ],
+      draftResult:
+        "Subplan 03 drafted — Hike logging: a HikeLogStore recording hikes against a `Trail` + a LogHikeScreen that deep-links to subplan 02's TrailDetail route. Sized: one subplan.",
+    },
     narration: "Subplan 03 · Hike logging — building on subplan 02's `MapScreen.tsx` + TrailDetail route so a logged hike deep-links back to its trail.",
     prompt:
       "Implement subplan 03 (Hike logging): building on subplan 02's `MapScreen.tsx` + TrailDetail route, add a HikeLogStore that records completed hikes against a `Trail` and a LogHikeScreen that deep-links to the trail. Report the artifact you produced.",
@@ -2248,6 +2337,22 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "04.01",
     taskId: "toolu_th_exec_sp0401",
     description: "Subplan 04.01 — Trail header + difficulty badge",
+    // The 04 DECOMPOSITION parent appears HERE, WITH (and pre-ordered before) its first leaf 04.01 —
+    // treeThrough preserves TRAILHEAD_PLANS pre-order so "04" sorts before "04.01" in the snapshot.
+    reveals: ["04", "04.01"],
+    planBeat: {
+      narration: "Planning subplan 04 · Trail detail — decomposing into four leaves; drafting 04.01 (header + difficulty badge) first, reusing subplan 01's palette.",
+      taskId: "toolu_th_plan_sp0401",
+      description: "Draft subplan 04.01 — Trail header + difficulty badge",
+      prompt:
+        "Draft subplan 04.01 (Trail header + difficulty badge): recon subplan 01's `TrailRepository` difficulty palette {easy/moderate/hard}, size a `<DifficultyBadge>` + TrailHeader, and write the leaf subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/data/TrailRepository.ts" }, result: "DIFFICULTY_PALETTE {easy/moderate/hard} from subplan 01 — the badge reuses it. Sized as a small leaf." },
+        { tool: "Read", input: { file_path: "src/screens/TrailDetailScreen.tsx" }, result: "TrailDetail has a TODO for header/badge/chart/reviews/share — confirms the four-leaf decomposition." },
+      ],
+      draftResult:
+        "Subplan 04.01 drafted — Trail header + difficulty badge: a `<DifficultyBadge>` coloured from subplan 01's palette {easy/moderate/hard}, shown in TrailHeader. Sized: the first of four 04.* leaves.",
+    },
     narration: "Subplan 04.01 · Trail header + difficulty badge — reusing subplan 01's `TrailRepository` difficulty palette {easy/moderate/hard} for the badge colours.",
     prompt:
       "Implement subplan 04.01 (Trail header + difficulty badge): reusing subplan 01's `TrailRepository` difficulty palette {easy/moderate/hard}, build a `<DifficultyBadge>` and a TrailHeader that shows it. Report the artifact you produced.",
@@ -2265,6 +2370,20 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "04.02",
     taskId: "toolu_th_exec_sp0402",
     description: "Subplan 04.02 — Elevation chart",
+    reveals: ["04.02"],
+    planBeat: {
+      narration: "Planning subplan 04.02 · Elevation chart — recon subplan 04.01's `<DifficultyBadge>` palette, size the chart, and draft the leaf.",
+      taskId: "toolu_th_plan_sp0402",
+      description: "Draft subplan 04.02 — Elevation chart",
+      prompt:
+        "Draft subplan 04.02 (Elevation chart): recon subplan 04.01's `<DifficultyBadge>` palette, size an ElevationChart tinted by difficulty with onSegmentPress, and write the leaf subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/screens/TrailDetail/DifficultyBadge.tsx" }, result: "DifficultyBadge maps difficulty → palette colour — the chart line reuses the same map. Small leaf." },
+        { tool: "Grep", input: { pattern: "elevation", output_mode: "files_with_matches" }, result: "src/components/ElevationSparkline.tsx — an existing sparkline to build the full chart from." },
+      ],
+      draftResult:
+        "Subplan 04.02 drafted — Elevation chart: an ElevationChart whose line is tinted by subplan 04.01's `<DifficultyBadge>` palette, exposing onSegmentPress. Sized: the second of four 04.* leaves.",
+    },
     narration: "Subplan 04.02 · Elevation chart — reusing subplan 04.01's `<DifficultyBadge>` palette to tint the elevation line.",
     prompt:
       "Implement subplan 04.02 (Elevation chart): reusing subplan 04.01's `<DifficultyBadge>` palette, draw an ElevationChart whose line is tinted by the trail's difficulty and expose onSegmentPress. Report the artifact you produced.",
@@ -2282,6 +2401,20 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "04.03",
     taskId: "toolu_th_exec_sp0403",
     description: "Subplan 04.03 — Reviews",
+    reveals: ["04.03"],
+    planBeat: {
+      narration: "Planning subplan 04.03 · Reviews — recon subplan 04.02's `ElevationChart.tsx` onSegmentPress, size the reviews list, and draft the leaf.",
+      taskId: "toolu_th_plan_sp0403",
+      description: "Draft subplan 04.03 — Reviews",
+      prompt:
+        "Draft subplan 04.03 (Reviews): recon subplan 04.02's `ElevationChart.tsx` onSegmentPress, size a Reviews list deep-linking to elevation segments, and write the leaf subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/screens/TrailDetail/ElevationChart.tsx" }, result: "ElevationChart exposes onSegmentPress(segmentIndex) — Reviews subscribe to it. Small leaf." },
+        { tool: "Bash", input: { command: "ls src/screens/TrailDetail" }, result: "DifficultyBadge.tsx  ElevationChart.tsx  TrailHeader.tsx — Reviews.tsx slots in next." },
+      ],
+      draftResult:
+        "Subplan 04.03 drafted — Reviews: a Reviews list whose entries deep-link to subplan 04.02's `ElevationChart.tsx` segments (onSegmentPress), surfacing shareable highlights. Sized: third of four 04.* leaves.",
+    },
     narration: "Subplan 04.03 · Reviews — wiring subplan 04.02's `ElevationChart.tsx` onSegmentPress so a review deep-links to its elevation segment.",
     prompt:
       "Implement subplan 04.03 (Reviews): wiring subplan 04.02's `ElevationChart.tsx` onSegmentPress, add a Reviews list whose entries deep-link to the elevation segment they describe, and surface shareable highlights. Report the artifact you produced.",
@@ -2299,6 +2432,20 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
     id: "04.04",
     taskId: "toolu_th_exec_sp0404",
     description: "Subplan 04.04 — Save / share",
+    reveals: ["04.04"],
+    planBeat: {
+      narration: "Planning subplan 04.04 · Save / share — recon subplan 04.03's `Reviews.tsx` shareable highlights, size the share sheet, and draft the final leaf.",
+      taskId: "toolu_th_plan_sp0404",
+      description: "Draft subplan 04.04 — Save / share",
+      prompt:
+        "Draft subplan 04.04 (Save / share): recon subplan 04.03's `Reviews.tsx` shareable highlights, size a ShareSheet that saves a trail and shares them, and write the final leaf subplan. Report the drafted subplan.",
+      leaves: [
+        { tool: "Read", input: { file_path: "src/screens/TrailDetail/Reviews.tsx" }, result: "Reviews exposes shareableHighlights() — the share sheet feeds on them. Final small leaf." },
+        { tool: "Bash", input: { command: "ls src/screens/TrailDetail" }, result: "DifficultyBadge.tsx  ElevationChart.tsx  Reviews.tsx  TrailHeader.tsx — ShareSheet.tsx completes the screen." },
+      ],
+      draftResult:
+        "Subplan 04.04 drafted — Save / share: a ShareSheet that saves a trail and shares subplan 04.03's `Reviews.tsx` highlights, completing the trail-detail decomposition. Sized: last of four 04.* leaves.",
+    },
     narration: "Subplan 04.04 · Save / share — surfacing subplan 04.03's `Reviews.tsx` shareable highlights through a share sheet.",
     prompt:
       "Implement subplan 04.04 (Save / share): surfacing subplan 04.03's `Reviews.tsx` shareable highlights, wire a ShareSheet that saves a trail and shares its review highlights. Report the artifact you produced.",
@@ -2314,14 +2461,25 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
   },
 ];
 
-// ---- Programmatic Execution-chapter builder (FINAL tMs/seq, no further shift) -------------------
+// ---- (P1) Programmatic PROGRESSIVE Execution-chapter builder (FINAL tMs/seq, no further shift) ---
 //
-// Walks EXEC_SUBPLANS, emitting per subplan: a top-level launch narration, the Task tool_use, the
-// `subagent_started` label, each atomic leaf pair (tool_use + tool_result share a tMs, parent = taskId),
-// an in-group summary, and the DEFERRED top-level Task tool_result (which flips the spanning Task done).
-// seqs are dense/contiguous from EXEC_SEQ_BASE; tMs steps by EXEC_STEP_MS (atomic pairs share one tMs).
-// The chapter opens with a SURFACE open_plan{null} (closes the V2 master → activeTab "conversation" for
-// the whole chapter) and ends with an integration wrap-up + the terminal `result` (strictly highest).
+// Phase 1 makes the back half play PROGRESSIVELY. The builder walks EXEC_SUBPLANS and, PER SUBPLAN,
+// emits in order:
+//   (a) the subplan's ROW(s) appear — a `plan_changed` snapshot = the tree grown SO FAR (treeThrough),
+//   (b) a just-in-time PLANNING beat — narration + a small spanning planning Task (recon/sizing leaves)
+//       + a DEFERRED planning-Task tool_result (the subplan's plan, drafted NOW),
+//   (c) the EXECUTION beat — the subplan's spanning Task + its atomic leaf tool calls + in-group summary
+//       + a DEFERRED execution-Task tool_result (flips the Task done, names the produced artifact),
+//   (d) a "done" beat — folded into the execution summary + deferred result above, and
+//   (e) a parent-REVIEW beat — a top-level narration acknowledging the subplan and queueing the next.
+// THEN the next subplan's row appears, and so on. Before subplan 01's row, a master→01 "thinking" group
+// (#7) plays (the agent reasons about WHERE to start before the first row populates).
+//
+// Every leaf tool_use+tool_result pair shares a tMs (ATOMIC). Both the planning Task AND the execution
+// Task are SPANNING (their own deferred tool_result lands at their group's end → no stuck running Task).
+// seqs are dense/contiguous from EXEC_SEQ_BASE; tMs steps by EXEC_STEP_MS. The chapter opens with a
+// SURFACE open_plan{null} (closes the V2 master → activeTab "conversation") and ends with an integration
+// wrap-up + the terminal `result` (strictly highest seq AND tMs).
 const EXEC_STEP_MS = 600; // inter-frame tMs step within the Execution chapter (atomic pairs share one tMs).
 
 function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminalMs: number } {
@@ -2332,40 +2490,30 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
     tMs += EXEC_STEP_MS;
   };
 
-  // SURFACE — close the reading pane (the V2 master is no longer shown) so projectSurfaceState flips
-  // activeTab "plan" → "conversation" for the whole Execution chapter. No seq (a surface frame).
-  frames.push({ tMs: EXEC_BASE_MS, chapterLabel: "Execution", frame: { t: "open_plan", path: null } });
+  // The cumulative set of revealed subplan nn_paths — GROWS one subplan at a time. Each subplan's
+  // `reveals` are unioned in just before that subplan's row snapshot, so the snapshot is the tree-so-far.
+  const revealed = new Set<string>();
 
-  // Top-level exec-open narration.
-  step();
-  frames.push({
-    tMs,
-    frame: {
-      t: "conv",
-      revealMs: 1000,
-      ev: {
-        seq: seq++,
-        kind: "assistant_text",
-        text: "Plan approved — executing the subplans in order, each as its own subagent. The output of each feeds the next.",
-        parent_tool_use_id: null,
-      },
-    },
-  });
-
-  for (const sp of EXEC_SUBPLANS) {
-    // Top-level launch narration (threads the prior artifact verbatim).
+  // Emit a top-level streaming assistant_text. Returns its seq (for pulse targeting if needed).
+  const narrate = (text: string, revealMs: number): number => {
     step();
-    frames.push({
-      tMs,
-      frame: {
-        t: "conv",
-        revealMs: 800,
-        ev: { seq: seq++, kind: "assistant_text", text: sp.narration, parent_tool_use_id: null },
-      },
-    });
+    const s = seq++;
+    frames.push({ tMs, frame: { t: "conv", revealMs, ev: { seq: s, kind: "assistant_text", text, parent_tool_use_id: null } } });
+    return s;
+  };
 
-    // Top-level Task tool_use — its `input.prompt` threads the prior artifact verbatim. Its OWN result
-    // is DEFERRED to the group's end (so the Task SPANS its leaves, exactly like scope-recon).
+  // Emit ONE spanning Task subagent group (planning OR execution): a top-level Task tool_use +
+  // `subagent_started` label (shared tMs), the atomic leaf pairs (each pair shares a tMs, parent=taskId),
+  // an in-group summary, and a DEFERRED top-level Task tool_result that flips the spanning Task done.
+  const emitSpanningTask = (args: {
+    taskId: string;
+    description: string;
+    prompt: string;
+    subagentType: string;
+    leaves: ExecLeaf[];
+    summary: string;
+    deferredResult: string;
+  }): void => {
     step();
     const taskTMs = tMs;
     frames.push({
@@ -2375,14 +2523,13 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
         ev: {
           seq: seq++,
           kind: "tool_use",
-          id: sp.taskId,
+          id: args.taskId,
           tool: "Task",
-          input: { description: sp.description, subagent_type: "subplan-executor", prompt: sp.prompt },
+          input: { description: args.description, subagent_type: args.subagentType, prompt: args.prompt },
           parent_tool_use_id: null,
         },
       },
     });
-    // `subagent_started` LABELS the group (header → the subplan description). Same tMs as the Task.
     frames.push({
       tMs: taskTMs,
       frame: {
@@ -2390,95 +2537,115 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
         ev: {
           seq: seq++,
           kind: "subagent_started",
-          tool_use_id: sp.taskId,
-          subagent_type: "subplan-executor",
-          description: sp.description,
-          prompt: sp.prompt,
+          tool_use_id: args.taskId,
+          subagent_type: args.subagentType,
+          description: args.description,
+          prompt: args.prompt,
         },
       },
     });
 
-    // The atomic leaf tool pairs (parent = taskId). Each tool_use + tool_result SHARES a tMs.
     let leafIdx = 0;
-    for (const leaf of sp.leaves) {
+    for (const leaf of args.leaves) {
       step();
       const leafTMs = tMs;
-      const leafId = `${sp.taskId}_leaf_${leafIdx++}`;
+      const leafId = `${args.taskId}_leaf_${leafIdx++}`;
       frames.push({
         tMs: leafTMs,
-        frame: {
-          t: "conv",
-          ev: {
-            seq: seq++,
-            kind: "tool_use",
-            id: leafId,
-            tool: leaf.tool,
-            input: leaf.input,
-            parent_tool_use_id: sp.taskId,
-          },
-        },
+        frame: { t: "conv", ev: { seq: seq++, kind: "tool_use", id: leafId, tool: leaf.tool, input: leaf.input, parent_tool_use_id: args.taskId } },
       });
       frames.push({
         tMs: leafTMs,
-        frame: {
-          t: "conv",
-          ev: {
-            seq: seq++,
-            kind: "tool_result",
-            tool_use_id: leafId,
-            content: leaf.result,
-            is_error: false,
-            parent_tool_use_id: sp.taskId,
-          },
-        },
+        frame: { t: "conv", ev: { seq: seq++, kind: "tool_result", tool_use_id: leafId, content: leaf.result, is_error: false, parent_tool_use_id: args.taskId } },
       });
     }
 
-    // In-group summary (parent = taskId) naming the produced artifact.
+    // In-group summary (parent = taskId).
     step();
     frames.push({
       tMs,
-      frame: {
-        t: "conv",
-        revealMs: 800,
-        ev: { seq: seq++, kind: "assistant_text", text: sp.summary, parent_tool_use_id: sp.taskId },
-      },
+      frame: { t: "conv", revealMs: 800, ev: { seq: seq++, kind: "assistant_text", text: args.summary, parent_tool_use_id: args.taskId } },
     });
 
-    // DEFERRED top-level Task tool_result (tool_use_id = taskId, parent null) — flips the Task done and
-    // carries the subplan's artifact summary (the handoff the NEXT subplan's prompt references).
+    // DEFERRED top-level Task tool_result — flips the spanning Task running→done.
     step();
     frames.push({
       tMs,
-      frame: {
-        t: "conv",
-        ev: {
-          seq: seq++,
-          kind: "tool_result",
-          tool_use_id: sp.taskId,
-          content: sp.taskResult,
-          is_error: false,
-          parent_tool_use_id: null,
-        },
-      },
+      frame: { t: "conv", ev: { seq: seq++, kind: "tool_result", tool_use_id: args.taskId, content: args.deferredResult, is_error: false, parent_tool_use_id: null } },
     });
+  };
+
+  // SURFACE — close the reading pane (the V2 master is no longer shown) so projectSurfaceState flips
+  // activeTab "plan" → "conversation" for the whole Execution chapter. No seq (a surface frame).
+  frames.push({ tMs: EXEC_BASE_MS, chapterLabel: "Execution", frame: { t: "open_plan", path: null } });
+
+  // Top-level exec-open narration.
+  narrate(
+    "Plan approved — I'll plan and execute the subplans one at a time, each as its own subagent. The output of each feeds the next.",
+    1000,
+  );
+
+  // (#7) The master→01 "thinking" group: BEFORE the first subplan row appears, the agent reasons about
+  // where to start. A small spanning `planning-lead` Task whose deferred result decides "data layer first".
+  narrate("Thinking about where to start — the data layer is the foundation everything else renders from.", 900);
+  emitSpanningTask({
+    taskId: "toolu_th_plan_lead",
+    description: "Decide the execution order",
+    subagentType: "planning-lead",
+    prompt:
+      "Given the approved master (subplans 01–04, with 04 decomposed into four leaves), decide which subplan to plan and execute FIRST. Report the starting point.",
+    leaves: [
+      { tool: "Read", input: { file_path: "src/data/trails.json" }, result: "The trail catalog is the root dependency — every screen renders from it. Start with the data layer (01)." },
+      { tool: "Grep", input: { pattern: "useTrails", output_mode: "files_with_matches" }, result: "src/screens/TrailListScreen.tsx\nsrc/data/useTrails.ts — downstream consumers; they need the data layer first." },
+    ],
+    summary: "Decided — execute the data layer (subplan 01) first; map/log/detail all depend on it.",
+    deferredResult: "Execution order: start with subplan 01 (Trail data & search) — it is the root dependency for 02/03/04. Subplans 01–04 then run in order.",
+  });
+
+  for (const sp of EXEC_SUBPLANS) {
+    // (a) The subplan's ROW(s) APPEAR — grow the revealed set, then emit the full pre-ordered snapshot.
+    // The snapshot frame carries a per-subplan chapterLabel so the scrubber has a navigable marker at
+    // each subplan's turn (the progressive chapter is long; one "Execution" marker would be too sparse).
+    for (const path of sp.reveals) revealed.add(path);
+    step();
+    frames.push({ tMs, chapterLabel: `Subplan ${sp.id}`, frame: { t: "plan_changed", plans: treeThrough(revealed) } });
+
+    // (b) The just-in-time PLANNING beat — narration + a spanning planning Task whose deferred result IS
+    // the subplan's plan, drafted NOW (so the row that just appeared is being planned at its turn).
+    narrate(sp.planBeat.narration, 800);
+    emitSpanningTask({
+      taskId: sp.planBeat.taskId,
+      description: sp.planBeat.description,
+      subagentType: "subplan-planner",
+      prompt: sp.planBeat.prompt,
+      leaves: sp.planBeat.leaves,
+      summary: `Drafted subplan ${sp.id} — ready to execute.`,
+      deferredResult: sp.planBeat.draftResult,
+    });
+
+    // (c)+(d) The EXECUTION beat — launch narration (threads the prior artifact) + the spanning execution
+    // Task + its atomic leaves + in-group summary + deferred result (the "done" signal naming the artifact).
+    narrate(sp.narration, 800);
+    emitSpanningTask({
+      taskId: sp.taskId,
+      description: sp.description,
+      subagentType: "subplan-executor",
+      prompt: sp.prompt,
+      leaves: sp.leaves,
+      summary: sp.summary,
+      deferredResult: sp.taskResult,
+    });
+
+    // (e) The parent-REVIEW beat — a top-level narration acknowledging the just-finished subplan and
+    // queueing the next (mirrors the real driver's parent `reviewing` beat between siblings).
+    narrate(`Subplan ${sp.id} reviewed and integrated — moving on.`, 700);
   }
 
   // Integration wrap-up (top-level).
-  step();
-  frames.push({
-    tMs,
-    frame: {
-      t: "conv",
-      revealMs: 1000,
-      ev: {
-        seq: seq++,
-        kind: "assistant_text",
-        text: "Integrated all subplans — data (01) → map & navigation (02) → hike logging (03) → the four trail-detail leaves (04.01–04.04). Trailhead is ready to ship.",
-        parent_tool_use_id: null,
-      },
-    },
-  });
+  narrate(
+    "Integrated all subplans — data (01) → map & navigation (02) → hike logging (03) → the four trail-detail leaves (04.01–04.04). Trailhead is ready to ship.",
+    1000,
+  );
 
   // Terminal `result` — STRICTLY the highest seq AND tMs (so `working` is non-null mid-run but null at
   // duration: a finished thought). The non-wire bookkeeping fields are benign fixture values.
