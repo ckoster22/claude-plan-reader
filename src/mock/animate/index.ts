@@ -227,7 +227,7 @@ const ANIM_CSS = `
   left: 0;
   width: 22px;
   height: 22px;
-  z-index: 2147483647;
+  z-index: 2147483641;
   pointer-events: none;
   transition: transform 60ms linear;
   will-change: transform;
@@ -267,7 +267,7 @@ const ANIM_CSS = `
   position: fixed;
   top: 0;
   left: 0;
-  z-index: 2147483646;
+  z-index: 2147483640;
   pointer-events: none;
   --tc-scale: 1;
   width: calc(260px * var(--tc-scale));
@@ -282,22 +282,25 @@ const ANIM_CSS = `
 }
 
 /* ---- annotation overlay (Phase 1: replay/capture; pure projection of (doc, T)) ----------------
-   Z-ORDER STACK (load-bearing, pinned explicitly):
-     transport #mock-anim ........ 2147483647  (topmost; pointer-events:auto on its controls — must
-                                                 stay clickable, so it is the LAST body child appended)
-     #demo-annotation-canvas ..... 2147483647  (ABOVE #demo-cursor + #demo-proto-card — annotations are
-       #mockanim-cmt panel                       the thing being reviewed, so they sit over the cosmetic
-                                                 overlays. Equal numeric z to the transport, but appended
-                                                 BEFORE it, so paint order places the transport on top and
-                                                 the canvas above cursor/proto-card. pointer-events:none.)
-     #demo-cursor ................ 2147483647  (cosmetic; appended before the canvas → painted under it)
-     #demo-proto-card ............ 2147483646  (cosmetic; strictly below the canvas)
+   Z-ORDER STACK (load-bearing, pinned with DISTINCT numeric z — no ties — so author chrome stays
+   clickable ABOVE the drawing canvas regardless of DOM append order):
+     transport #mock-anim controls + #mockanim-author toolbar .. 2147483647  (TOPMOST + interactive:
+                                                 clicks on the textarea/name/buttons + the scrubber must
+                                                 WIN over the canvas, so these sit strictly above it.)
+     #mockanim-cmt panel ......... 2147483643  (passive text panel; pointer-events:none — must NEVER
+                                                 intercept clicks, sits just under the chrome.)
+     #demo-annotation-canvas ..... 2147483642  (ABOVE app + #demo-cursor + #demo-proto-card so strokes
+                                                 paint over the screen; in author mode pointer-events:auto
+                                                 to capture drawing — but strictly BELOW the toolbar/
+                                                 transport so it can't eat their clicks.)
+     #demo-cursor ................ 2147483641  (cosmetic; strictly below the canvas)
+     #demo-proto-card ............ 2147483640  (cosmetic; strictly below the cursor)
    The canvas + panel are pure projections re-derived every paint (back-scrub clears them like every
    other overlay). They are INERT until a doc is loaded (no doc ⇒ cleared canvas + empty panel). */
 #demo-annotation-canvas {
   position: fixed;
   inset: 0;
-  z-index: 2147483647;
+  z-index: 2147483642;
   pointer-events: none;
   width: 100vw;
   height: 100vh;
@@ -307,7 +310,7 @@ const ANIM_CSS = `
   left: 50%;
   bottom: 64px;
   transform: translateX(-50%);
-  z-index: 2147483647;
+  z-index: 2147483643;
   pointer-events: none;
   display: none;
   flex-direction: column;

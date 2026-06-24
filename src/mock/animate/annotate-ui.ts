@@ -77,15 +77,17 @@ export interface AnnotateDeps {
 }
 
 // The CSS for the author surface — a single namespaced block (`maa-` = mock-animate-annotate). The
-// toolbar sits TOP-center (high z, BELOW the transport's 2147483647 so both stay usable); the canvas
-// pointer-capture is enabled by the player (index.ts) flipping `pointer-events:auto`.
+// toolbar sits TOP-center at the TOPMOST z (2147483647, same tier as the transport), STRICTLY ABOVE the
+// drawing canvas (2147483642) — otherwise the pointer-events:auto canvas would sit over the toolbar and
+// eat every click (textarea/name/buttons would never receive focus, and pen strokes would paint on the
+// toolbar). The canvas pointer-capture is enabled by the player (index.ts) flipping `pointer-events:auto`.
 const AUTHOR_CSS = `
 #mockanim-author {
   position: fixed;
   top: 14px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 2147483646;
+  z-index: 2147483647;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -182,7 +184,7 @@ const AUTHOR_CSS = `
   left: 50%;
   bottom: 76px;
   transform: translateX(-50%);
-  z-index: 2147483646;
+  z-index: 2147483647;
   max-width: min(640px, 80vw);
   padding: 8px 14px;
   border-radius: 8px;
