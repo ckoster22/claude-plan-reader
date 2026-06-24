@@ -76,6 +76,7 @@ export interface MockAnimApi {
   getDuration: () => number;
   loadAnnotations: (doc: AnnotationDoc | null) => void;
   getActiveComments: () => AnnotationComment[];
+  focusComment: (id: string | null) => void;
 }
 
 declare global {
@@ -499,6 +500,13 @@ function mountPlayer(): void {
   // re-derived every paint, so a back-scrub clears it like every other reconciler-owned overlay.
   let currentDoc: AnnotationDoc | null = null;
 
+  // Capture-isolation focus (Phase 4): when non-null, the CANVAS + panel render path shows ONLY the
+  // comment with this id (passed as `projectActiveComments`'s `onlyId` arg), so the capture script can
+  // shoot one clean frame per comment even when several share a tMs. null (the default) = normal
+  // window-based projection → byte-unchanged replay/author behavior. The player is the single writer
+  // via focusComment(); `getActiveComments()` stays window-based (NOT gated on this).
+  let captureFocusId: string | null = null;
+
   // Draw one stroke (already-denormalized to the current viewport) onto a 2D context. pen = polyline
   // through all points; arrow = points[0]→points[1] with a small arrowhead; box = rect points[0]..[1].
   const drawStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke, vw: number, vh: number): void => {
@@ -558,7 +566,12 @@ function mountPlayer(): void {
       cmtPanel.classList.remove("mockanim-cmt-on");
       return;
     }
-    const active = projectActiveComments(currentDoc, T);
+    const active = projectActiveComments(
+      currentDoc,
+      T,
+      undefined,
+      captureFocusId ?? undefined,
+    );
     if (ctx) {
       for (const cmt of active) {
         for (const stroke of cmt.strokes) drawStroke(ctx, stroke, vw, vh);
@@ -969,6 +982,12 @@ function mountPlayer(): void {
   };
   const getActiveComments = (): AnnotationComment[] =>
     currentDoc === null ? [] : projectActiveComments(currentDoc, T);
+  // focusComment (Phase 4 capture): set the capture-isolation id + repaint so ONLY that comment's
+  // strokes/text render (via projectActiveComments's onlyId). null returns to normal window behavior.
+  const focusComment = (id: string | null): void => {
+    captureFocusId = id;
+    paint();
+  };
 
   // Idempotent assignment (the HMR guard at the top of mountPlayer already prevents a second mount, but
   // assigning the fresh closures is harmless if it ever runs again).
@@ -981,6 +1000,7 @@ function mountPlayer(): void {
     getDuration: (): number => duration,
     loadAnnotations,
     getActiveComments,
+    focusComment,
   };
 
   // ---- author mode: enable canvas capture + mount the toolbar (Phase 3) ----
