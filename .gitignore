@@ -25,6 +25,9 @@ dist-ssr
 # session scratch / local backups (not for version control)
 .plan-tree*
 
+# dev-only mock-animate annotation artifacts (written by the mock dev-server middleware)
+.mock-annotations/
+
 # bun sidecar build temp artifacts
 *.bun-build
 

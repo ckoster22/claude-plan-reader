@@ -11,6 +11,7 @@
 // base config and merges onto it; vitest keeps reading the base config.
 
 import { defineConfig, mergeConfig, type UserConfig, type Plugin } from "vite";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import baseConfigFn from "./vite.config";
@@ -51,6 +52,111 @@ function injectAnimatePlugin(): Plugin {
   };
 }
 
+// Inline plugin: a DEV-ONLY persistence middleware for the annotation-authoring layer (Phase 2).
+// The browser can't write files, so saving/loading an AnnotationDoc round-trips through this
+// connect middleware on the mock dev server. Routes live under /__mock_annotations; everything
+// else (or any non-matching method) falls through to Vite via next().
+//
+// SAFETY — TWO INDEPENDENT name guards (defense in depth): (a) a strict regex, and (b) a
+// resolved-path containment assertion. Either failing → 400. Writes are ATOMIC (temp + rename).
+// This plugin is inert unless its routes are hit, so it is always included regardless of mode.
+function annotationsApiPlugin(): Plugin {
+  const dir = path.resolve(__dirname, ".mock-annotations");
+
+  // Both guards must pass. Returns the absolute file path for `name`, or null if either guard fails.
+  const safeFile = (name: unknown): string | null => {
+    if (typeof name !== "string") return null;
+    // Guard (a): strict charset/shape.
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) return null;
+    // Guard (b): resolved-path containment — the resolved file MUST equal the naive join AND sit
+    // strictly under the annotations dir. This catches anything the regex might miss (defense in depth).
+    const file = path.resolve(dir, name + ".json");
+    if (file !== path.join(dir, name + ".json")) return null;
+    if (!file.startsWith(dir + path.sep)) return null;
+    return file;
+  };
+
+  const readBody = (req: import("node:http").IncomingMessage): Promise<string> =>
+    new Promise((resolve, reject) => {
+      let data = "";
+      req.on("data", (chunk) => {
+        data += chunk;
+      });
+      req.on("end", () => resolve(data));
+      req.on("error", reject);
+    });
+
+  return {
+    name: "mock-annotations-api",
+    configureServer(server): void {
+      server.middlewares.use((req, res, next) => {
+        const url = req.url ?? "";
+        if (!url.startsWith("/__mock_annotations")) return next();
+
+        void (async (): Promise<void> => {
+          try {
+            const parsed = new URL(url, "http://localhost");
+            const pathname = parsed.pathname;
+
+            // ---- POST /__mock_annotations/save ----
+            if (pathname === "/__mock_annotations/save" && req.method === "POST") {
+              const raw = await readBody(req);
+              let payload: { name?: unknown; doc?: unknown };
+              try {
+                payload = JSON.parse(raw) as { name?: unknown; doc?: unknown };
+              } catch {
+                res.statusCode = 400;
+                res.end("invalid JSON body");
+                return;
+              }
+              const file = safeFile(payload.name);
+              if (file === null) {
+                res.statusCode = 400;
+                res.end("invalid name");
+                return;
+              }
+              fs.mkdirSync(dir, { recursive: true });
+              const tmp = file + ".tmp";
+              fs.writeFileSync(tmp, JSON.stringify(payload.doc));
+              fs.renameSync(tmp, file);
+              res.statusCode = 200;
+              res.setHeader("content-type", "application/json");
+              res.end(JSON.stringify({ path: file }));
+              return;
+            }
+
+            // ---- GET /__mock_annotations/load?name=<name> ----
+            if (pathname === "/__mock_annotations/load" && req.method === "GET") {
+              const file = safeFile(parsed.searchParams.get("name"));
+              if (file === null) {
+                res.statusCode = 400;
+                res.end("invalid name");
+                return;
+              }
+              if (!fs.existsSync(file)) {
+                res.statusCode = 404;
+                res.end("not found");
+                return;
+              }
+              const contents = fs.readFileSync(file, "utf8");
+              res.statusCode = 200;
+              res.setHeader("content-type", "application/json");
+              res.end(contents);
+              return;
+            }
+
+            // Any other sub-path/method under /__mock_annotations → let Vite handle it.
+            return next();
+          } catch (err) {
+            res.statusCode = 500;
+            res.end("annotations middleware error: " + (err instanceof Error ? err.message : String(err)));
+          }
+        })();
+      });
+    },
+  };
+}
+
 // The mock-only overrides merged onto the base config.
 const mockOverrides: UserConfig = {
   resolve: {
@@ -80,10 +186,18 @@ const mockOverrides: UserConfig = {
   server: {
     port: 1421,
     strictPort: true,
+    // Keep the persisted annotation artifact OUT of Vite's file watcher: a save writes into
+    // .mock-annotations/ and would otherwise trip chokidar → HMR/full reload, dropping the
+    // in-memory AnnotationDoc mid-author (Risk #1). .gitignore does NOT exclude the watcher.
+    watch: { ignored: ["**/.mock-annotations/**"] },
   },
   // Mutually exclusive: `npm run mock-animate` (MOCK_ANIMATE=1) boots the scrubbable Trailhead
-  // player INSTEAD of the control deck, so only one overlay mounts at a time.
-  plugins: [process.env.MOCK_ANIMATE ? injectAnimatePlugin() : injectDeckPlugin()],
+  // player INSTEAD of the control deck, so only one overlay mounts at a time. The annotations API
+  // middleware is included unconditionally — it is inert unless its /__mock_annotations routes are hit.
+  plugins: [
+    process.env.MOCK_ANIMATE ? injectAnimatePlugin() : injectDeckPlugin(),
+    annotationsApiPlugin(),
+  ],
 };
 
 // The base config is `defineConfig(async () => ({...}))` — a function returning a Promise. Resolve

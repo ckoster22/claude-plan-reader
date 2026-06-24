@@ -57,6 +57,7 @@ import {
   type AnnotationComment,
   type Stroke,
 } from "./annotations";
+import { loadDoc } from "./annotations-io";
 import type { PlanRecord, ReviewRequest } from "../../types";
 
 // ---- window globals: the programmatic seek hook + the author-mode flag --------------------------
@@ -971,10 +972,30 @@ function mountPlayer(): void {
 // DIRECTLY (not via window.__mock), so installMockApi() (the window.__mock hook) is NOT required.
 installMockOrchestrator();
 
+// Replay-from-file boot hook (Phase 2): when launched with `?annotations=<name>`, load the persisted
+// AnnotationDoc from the dev middleware and feed it into the just-mounted player so its ticks + overlay
+// render from disk. A missing file (null) or a fetch error is logged and NON-fatal — the demo still
+// plays unannotated. Author UI / sessionStorage draft belt are Phase 3, not here.
+async function loadAnnotationsFromUrl(): Promise<void> {
+  const name = new URLSearchParams(window.location.search).get("annotations");
+  if (name === null || name.length === 0) return;
+  try {
+    const doc = await loadDoc(name);
+    if (doc === null) {
+      console.warn(`[mock-animate] no annotations file named "${name}"`);
+      return;
+    }
+    window.__mockAnim?.loadAnnotations(doc);
+  } catch (err) {
+    console.warn(`[mock-animate] failed to load annotations "${name}":`, err);
+  }
+}
+
 // DOM-ready boot guard (mirrors deck.ts): this script loads after main.ts's deferred bundle, so
 // DOMContentLoaded may have already fired.
 function boot(): void {
   mountPlayer();
+  void loadAnnotationsFromUrl();
 }
 
 if (document.readyState === "loading") {
