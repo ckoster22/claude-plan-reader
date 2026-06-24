@@ -4305,3 +4305,75 @@ The capture script reads the doc directly from disk, spawns `MOCK_ANIMATE=1 vite
 hidden), drives `window.__mockAnim` over raw CDP, and for each comment runs
 `seekSettled(tMs)` → double-rAF → `focusComment(id)` → rAF → `Page.captureScreenshot`. Env overrides:
 `CAPTURE_PORT`, `CAPTURE_DEBUG_PORT` (default `9333`), `CHROME_BIN`.
+
+## Mock-animate timeline fidelity pass (dev-only — additive to the section above)
+
+A later fidelity pass over the same scrubbable `mock-animate` Trailhead beat (`src/mock/animate/**`)
+added four storyboard/player affordances. All are dev-only (`MOCK_ANIMATE=1`), pure functions of the
+scrub time `T`, and ship in no distributable. This is a **sibling** of the annotation-layer section
+above — neither edits the other. The total beat duration grew to ~158 s (the terminal `result` frame's
+`tMs`, `TERMINAL_MS`, is **computed** from `buildExecution()`, not a literal).
+
+### `scroll` OverlayFrame timeline primitive (`storyboard.ts` + `reconcile.ts`)
+
+A new `OverlayFrame` variant alongside `cursor_move` / `pulse` / `field_type` / `overlay_modal`:
+
+```ts
+{ t: "scroll"; target: string; fromFrac: number; toFrac: number; fromMs: number; toMs: number }
+```
+
+`target` is a **scroll-container** selector (e.g. `#reader-scroll` — the `.reader` element with
+`overflow-y:auto`), NOT the inner content div (`#reading-pane` / `.md` has no overflow, so setting its
+`scrollTop` is a silent no-op). `projectScroll(story, T)` returns the LAST `scroll` window whose
+`[fromMs, toMs)` contains `T`, with `scrollTop` lerped `fromFrac → toFrac` (a zero-length window yields
+`toFrac`); it returns `null` when no window is active at `T` — outside any window the reconciler does
+NOT touch `scrollTop` (the pane is left where it is). The `setScroll` reconciler seam resolves the
+selector against the live DOM and sets `el.scrollTop = frac * (el.scrollHeight - el.clientHeight)`.
+`reconcileScroll` runs **every tick with no change-memo, immediately AFTER `reconcileReadingPane`** in
+`reconcile()` — a `set_comments`-triggered pane rebuild resets `scrollTop` to 0, so re-driving the
+projected fraction every tick self-heals that reset within one tick. Backward scrub reverts cleanly
+(full re-derivation from the frame set, not a forward delta). `shiftStoryFrame` shifts a `scroll`
+frame's inner `fromMs`/`toMs` in lockstep with its outer `tMs` (same as `pulse` / `field_type`).
+
+### Player-owned conversation minimap gutter (`#mockanim-minimap`, `index.ts`)
+
+The real `initConversation` binds its OWN `createMinimap` controller to `#conversation-minimap`, fed
+from `#conversation-stream` — which the player HIDES (`mockanim-hidden-stream`) and never renders into.
+That controller's observers repaint `#conversation-minimap` from the EMPTY hidden stream and re-assert
+`.is-empty`, so a player controller bound to the SAME node is repeatedly clobbered back to empty (both
+controllers boot on `DOMContentLoaded`; the empty-stream one wins). The fix gives the player its OWN
+gutter node the real controller can never bind to: a SEPARATE `.conv-minimap` element with id
+**`mockanim-minimap`** (the `.conv-minimap` CLASS carries all the CSS; the id is never used as a
+selector), inserted as the visible sibling of `.mockanim-pane` inside `.conv-stream-wrap`. The player's
+controller (`createMinimap(pane, node)`) is its SOLE writer and is `rebuild()`-ed inside `renderConv`
+every tick (a pure reflection of the just-rendered player pane, so a back-scrub reverts it cleanly).
+The original `#conversation-minimap` is LEFT in place (the real controller keeps it `.is-empty` →
+`display:none`, harmless). No production file, CSS, or `minimap.ts` is touched. (jsdom guard: the node +
+controller are skipped when `ResizeObserver` is undefined, so the player-boot unit tests don't throw.)
+
+### Progressive multiplan reveal — pre-ordered `plan_changed` snapshots (`storyboard.ts`)
+
+The sidebar grows ONE subplan row at a time rather than revealing the whole tree at once. Instead of a
+delta, each step emits a FULL `plan_changed` SurfaceFrame carrying the tree-grown-so-far via
+`treeThrough(revealedPaths)`: master + every `TRAILHEAD_PLANS` row whose `nn_path` is in the cumulative
+revealed set, in `TRAILHEAD_PLANS` **pre-order** (master-first, every parent before its children). Each
+snapshot is therefore master-first and parent-before-child and can NEVER trip the sidebar orphan path
+(`main.ts` `renderSidebar` logs an orphan when a sub's master/dotted-parent isn't already present).
+`projectSurfaceState` takes the last-≤-T `plan_changed`, so the sidebar is `[]` from `tMs 0` (an
+explicit empty snapshot pins it, suppressing the `clonePlans` fixture seed), then `TREE_MASTER_ONLY`
+(the master alone) at the nested-plan reveal, then grows through `buildExecution`'s per-subplan
+snapshots. `buildExecution` is structured **plan-then-execute per subplan with parent-review beats**:
+each subplan's `reveals` (its `nn_path`s, in pre-order) are unioned into the revealed set just before
+that subplan's row snapshot, so a `04.0x` leaf snapshot always includes its `04` decomposition parent.
+
+### `ProtoPreviewOverride` — non-mermaid prototype preview (`fixtures/reviews.ts`)
+
+`gateSnapshot(which, round, protoPreview?)` / the mock orchestrator's `emitGate` now thread an optional
+`ProtoPreviewOverride { kind: PrototypeGate["kind"]; inlinePreview: string | null }` onto the held
+prototype gate. The default `MOCK_PROTOTYPE_GATE` is `kind:"mermaid"` with an `inlinePreview` of
+`flowchart LR …`, so `composePreviewMarkdown` would paint a stray `mermaid` flowchart into the reading
+pane BEHIND the floating trail-card overlay (`#demo-proto-card`). The mock-animate player passes
+`TRAILHEAD_PROTO_PREVIEW_OVERRIDE` (`kind:"ascii"`, a plain-fence note) so the detached preview render
+stays coherent with the title-only backdrop the storyboard opens. The override is applied by spreading a
+fresh gate object; the default round-1/no-override path preserves the `MOCK_PROTOTYPE_GATE` REFERENCE
+identity so existing `toBe(MOCK_PROTOTYPE_GATE)` tests stay green.
