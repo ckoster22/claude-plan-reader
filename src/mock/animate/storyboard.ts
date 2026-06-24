@@ -660,13 +660,21 @@ export const B1_COMPOSER_PULSE_TO = 3700; //   … for ~2s (a real dwell: the vi
 export const B1_REQUEST_MOVE_MS = 3700; // cursor travels to #composer-request
 export const B1_REQUEST_TYPE_FROM = 4300; // field_type #composer-request begins …
 export const B1_REQUEST_TYPE_TO = 6800; //   … typed over ~2.5s
-export const B1_START_MOVE_MS = 7100; // cursor travels to #composer-start
-export const B1_START_CLICK_MS = 7500; // cosmetic click on #composer-start
-export const B1_COMPOSER_CLOSE_MS = 7700; // overlay_modal{composer,off} — modal closes (NOT via real start())
-export const B1_USER_MSG_MS = 7900; // seq 1 user_message (the request) appears as a chat bubble
-export const B1_USER_PULSE_FROM = 8000; // pulse the user bubble …
-export const B1_USER_PULSE_TO = 9800; //   … for ~1.8s
-export const B1_REPLY_MS = 9900; // seq 2 assistant reply begins streaming
+// (P5 #1) PACING: right after typing ends the cursor re-anchors AT the request field (a fresh origin
+// waypoint), THEN travels SLOWLY to #composer-start so the viewer can follow the field→button move (no
+// jump). A dwell + pulse on Start lets the moment read before the cosmetic click. The whole tail still
+// completes before B1B_LEAD_MS (11000), so NO downstream shift is needed (it fits the pre-existing slack).
+export const B1_REQUEST_DWELL_MS = 6850; // cursor re-anchors at #composer-request (fresh origin for the slow travel)
+export const B1_START_MOVE_MS = 7150; // cursor travels SLOWLY to #composer-start …
+export const B1_START_MOVE_DUR = 750; //   … over ~0.75s (legible travel, not a jump). Arrives 7900.
+export const B1_START_PULSE_FROM = 7900; // pulse #composer-start once the cursor arrives …
+export const B1_START_PULSE_TO = 8450; //   … ~0.55s dwell so the viewer reads the moment before the click
+export const B1_START_CLICK_MS = 8450; // cosmetic click on #composer-start (after the dwell)
+export const B1_COMPOSER_CLOSE_MS = 8650; // overlay_modal{composer,off} — modal closes (NOT via real start())
+export const B1_USER_MSG_MS = 8850; // seq 1 user_message (the request) appears as a chat bubble
+export const B1_USER_PULSE_FROM = 8950; // pulse the user bubble …
+export const B1_USER_PULSE_TO = 9700; //   … for ~0.75s
+export const B1_REPLY_MS = 9800; // seq 2 assistant reply begins streaming (reveal 900 → ends 10700 < B1B_LEAD_MS)
 
 // Beat 1.5 — Intent-clarifier running beat (P4, #2): BEFORE the clarify question card appears, the
 // intent-clarifier agent is shown RUNNING with realistic streaming tool calls (a small mirror of the
@@ -700,9 +708,18 @@ export const B2_QUESTION_PULSE_FROM = 11200 + CLARIFIER_SHIFT; // pulse .conv-qu
 export const B2_QUESTION_PULSE_TO = 13200 + CLARIFIER_SHIFT; //   … for ~2s (pause+pulse on the card)
 export const B2_ANSWER_TYPE_FROM = 13400 + CLARIFIER_SHIFT; // field_type [data-other="text"] begins (reconciler auto-checks Other)
 export const B2_ANSWER_TYPE_TO = 15600 + CLARIFIER_SHIFT; //   … typed over ~2.2s
-export const B2_SUBMIT_MOVE_MS = 15800 + CLARIFIER_SHIFT; // cursor travels to .conv-question-submit
-export const B2_SUBMIT_CLICK_MS = 16200 + CLARIFIER_SHIFT; // cosmetic click on .conv-question-submit
-export const B2_ANSWER_MS = 16400 + CLARIFIER_SHIFT; // seq 4 question_answered (folds onto the card — source of truth) + seq 5 echo
+// (P5 #3) PACING: right after the answer is typed the cursor re-anchors AT the Other input (a fresh
+// origin waypoint — the cursor's prior waypoint is the far-away #composer-start from Beat 1), THEN
+// travels SLOWLY to the submit button so the field→button move is legible. A dwell + pulse on the submit
+// button lets the moment read. The whole tail still completes before B3_ACK_MS (17600 + SHIFT), so NO
+// downstream shift is needed (it fits the pre-existing slack).
+export const B2_ANSWER_DWELL_MS = 15700 + CLARIFIER_SHIFT; // cursor re-anchors at [data-other="text"] (fresh origin)
+export const B2_SUBMIT_MOVE_MS = 15900 + CLARIFIER_SHIFT; // cursor travels SLOWLY to .conv-question-submit …
+export const B2_SUBMIT_MOVE_DUR = 800; //   … over ~0.8s (legible travel, not a jump). Arrives 16700 + SHIFT.
+export const B2_SUBMIT_PULSE_FROM = 16700 + CLARIFIER_SHIFT; // pulse .conv-question-submit once the cursor arrives …
+export const B2_SUBMIT_PULSE_TO = 17250 + CLARIFIER_SHIFT; //   … ~0.55s dwell before the cosmetic click
+export const B2_SUBMIT_CLICK_MS = 17250 + CLARIFIER_SHIFT; // cosmetic click on .conv-question-submit (after the dwell)
+export const B2_ANSWER_MS = 17450 + CLARIFIER_SHIFT; // seq 4 question_answered (folds onto the card — source of truth) + seq 5 echo
 
 // Beat 3 — Scope recon ×5 (~20 atomic leaf tool pairs under the scope-recon Task):
 export const B3_ACK_MS = 17600 + CLARIFIER_SHIFT; // seq 6 assistant ack
@@ -801,11 +818,20 @@ export const PROTO_SUBMIT_CLICK_MS = 48200 + CLARIFIER_SHIFT; // cosmetic click 
 export const PROTO_ROUND2_MS = 48400 + CLARIFIER_SHIFT; // prototype_gate{on,round:2} → the card MORPHS larger + difficulty badge
 export const PROTO_CARD2_PULSE_FROM = 48600 + CLARIFIER_SHIFT; // pulse #demo-proto-card (round 2) …
 export const PROTO_CARD2_PULSE_TO = 50600 + CLARIFIER_SHIFT; //   … ~2s pause
-export const PROTO_APPROVE_MOVE_MS = 50800 + CLARIFIER_SHIFT; // cursor → #review-approve
-export const PROTO_APPROVE_CLICK_MS = 51100 + CLARIFIER_SHIFT; // cosmetic click on #review-approve ("Approve visual")
-export const PROTO_CLOSE_MS = 51300 + CLARIFIER_SHIFT; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
-export const PROTO_FEEDBACK_MS = 51600 + CLARIFIER_SHIFT; // seq 60 user feedback bubble + seq 61 approval echo (land together)
-export const PROTO_ACK_MS = 52400 + CLARIFIER_SHIFT; // seq 62 assistant ack
+// (P5 #10) PACING: before approving, make the review-bar buttons read clearly — pulse #review-approve,
+// re-anchor the cursor at the feedback field (a fresh origin — its prior waypoint is #review-submit from
+// the round-1 cosmetic click), then travel SLOWLY across the review bar to Approve so the move is
+// legible. The whole approve sequence still completes by the ORIGINAL PROTO_ACK_MS (52400 + SHIFT), so
+// PROTO_ACT_SHIFT is UNCHANGED and NO downstream chapter shifts (it fits the pre-existing slack).
+export const PROTO_APPROVE_PULSE_FROM = 50650 + CLARIFIER_SHIFT; // pulse #review-approve so the button reads clearly …
+export const PROTO_APPROVE_PULSE_TO = 51900 + CLARIFIER_SHIFT; //   … through the slow move, up to the click
+export const PROTO_APPROVE_ORIGIN_MS = 50650 + CLARIFIER_SHIFT; // cursor re-anchors at #prototype-feedback (fresh origin)
+export const PROTO_APPROVE_MOVE_MS = 50900 + CLARIFIER_SHIFT; // cursor travels SLOWLY to #review-approve …
+export const PROTO_APPROVE_MOVE_DUR = 750; //   … over ~0.75s (legible travel across the review bar). Arrives 51650 + SHIFT.
+export const PROTO_APPROVE_CLICK_MS = 51900 + CLARIFIER_SHIFT; // cosmetic click on #review-approve ("Approve visual") after the dwell
+export const PROTO_CLOSE_MS = 52050 + CLARIFIER_SHIFT; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
+export const PROTO_FEEDBACK_MS = 52200 + CLARIFIER_SHIFT; // seq 60 user feedback bubble + seq 61 approval echo (land together)
+export const PROTO_ACK_MS = 52400 + CLARIFIER_SHIFT; // seq 62 assistant ack (UNCHANGED — the approve act fits before it)
 // (P5) The Execution chapter is now a SEQUENCE OF SUBAGENTS — one Task subagent per subplan, each with
 // 4–6 atomic leaf tool calls + a deferred top-level Task tool_result. The per-subplan Task ids and the
 // leaf-tool ids are generated by the EXEC_SUBPLANS builder below (no hand-authored WRITE_* ids).
@@ -930,9 +956,23 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // OVERLAY — the cursor travels to the Start button.
+    // OVERLAY (P5 #1) — the cursor RE-ANCHORS at the request field right after typing ends. This is the
+    // fresh ORIGIN waypoint for the slow travel below: it guarantees projectCursorState's `from` is
+    // #composer-request at the start-move (a real field→button TRAVEL, not a jump). Eases in place.
+    tMs: B1_REQUEST_DWELL_MS,
+    frame: { t: "cursor_move", target: "#composer-request", moveMs: 200 },
+  },
+  {
+    // OVERLAY (P5 #1) — the cursor travels SLOWLY (B1_START_MOVE_DUR ~0.75s) from #composer-request to the
+    // Start button, so the viewer can FOLLOW the move instead of seeing it jump.
     tMs: B1_START_MOVE_MS,
-    frame: { t: "cursor_move", target: "#composer-start", moveMs: 400 },
+    frame: { t: "cursor_move", target: "#composer-start", moveMs: B1_START_MOVE_DUR },
+  },
+  {
+    // OVERLAY (P5 #1) — pulse #composer-start once the cursor arrives: a DWELL (the tMs gap to the click)
+    // so the viewer reads the button before the cosmetic press.
+    tMs: B1_START_PULSE_FROM,
+    frame: { t: "pulse", target: "#composer-start", fromMs: B1_START_PULSE_FROM, toMs: B1_START_PULSE_TO },
   },
   {
     // OVERLAY — a COSMETIC press on #composer-start (the real start() is forced to fail in the mock, so
@@ -1260,9 +1300,24 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // OVERLAY — the cursor travels to the question card's submit button.
+    // OVERLAY (P5 #3) — the cursor RE-ANCHORS at the Other input right after the answer is typed. Without
+    // this fresh origin the cursor's prior waypoint is the far-away #composer-start (Beat 1), so the
+    // submit move would jump from across the screen. This pins `from` = [data-other="text"] for a real
+    // field→button TRAVEL. Eases in place.
+    tMs: B2_ANSWER_DWELL_MS,
+    frame: { t: "cursor_move", target: '[data-other="text"]', moveMs: 200 },
+  },
+  {
+    // OVERLAY (P5 #3) — the cursor travels SLOWLY (B2_SUBMIT_MOVE_DUR ~0.8s) from the Other input to the
+    // question card's submit button, so the viewer can FOLLOW the move instead of seeing it jump.
     tMs: B2_SUBMIT_MOVE_MS,
-    frame: { t: "cursor_move", target: ".conv-question-submit", moveMs: 400 },
+    frame: { t: "cursor_move", target: ".conv-question-submit", moveMs: B2_SUBMIT_MOVE_DUR },
+  },
+  {
+    // OVERLAY (P5 #3) — pulse .conv-question-submit once the cursor arrives: a DWELL (the tMs gap to the
+    // click) so the viewer reads the submit button before the cosmetic press.
+    tMs: B2_SUBMIT_PULSE_FROM,
+    frame: { t: "pulse", target: ".conv-question-submit", fromMs: B2_SUBMIT_PULSE_FROM, toMs: B2_SUBMIT_PULSE_TO },
   },
   {
     // OVERLAY — a COSMETIC press on .conv-question-submit (the real submit is never dispatched; the fold
@@ -2229,13 +2284,30 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     frame: { t: "pulse", target: "#demo-proto-card", fromMs: PROTO_CARD2_PULSE_FROM, toMs: PROTO_CARD2_PULSE_TO },
   },
   {
-    // OVERLAY — the cursor travels to the "Approve visual" button (#review-approve).
+    // OVERLAY (P5 #10) — pulse the "Approve visual" button (#review-approve) so the review-bar buttons
+    // read clearly BEFORE and THROUGH the slow cursor travel (up to the click). Draws the viewer's eye to
+    // where the cursor is heading.
+    tMs: PROTO_APPROVE_PULSE_FROM,
+    frame: { t: "pulse", target: "#review-approve", fromMs: PROTO_APPROVE_PULSE_FROM, toMs: PROTO_APPROVE_PULSE_TO },
+  },
+  {
+    // OVERLAY (P5 #10) — the cursor RE-ANCHORS at the feedback field. Without this fresh origin the
+    // cursor's prior waypoint is #review-submit (the round-1 cosmetic click), so the move to Approve would
+    // barely travel. Re-anchoring at #prototype-feedback makes the approve move a real, legible TRAVEL
+    // across the review bar (from = #prototype-feedback → to = #review-approve). Eases in place.
+    tMs: PROTO_APPROVE_ORIGIN_MS,
+    frame: { t: "cursor_move", target: "#prototype-feedback", moveMs: 200 },
+  },
+  {
+    // OVERLAY (P5 #10) — the cursor travels SLOWLY (PROTO_APPROVE_MOVE_DUR ~0.75s) from the feedback field
+    // to the "Approve visual" button (#review-approve), so the viewer can FOLLOW the move (not a jump).
     tMs: PROTO_APPROVE_MOVE_MS,
-    frame: { t: "cursor_move", target: "#review-approve", moveMs: 300 },
+    frame: { t: "cursor_move", target: "#review-approve", moveMs: PROTO_APPROVE_MOVE_DUR },
   },
   {
     // OVERLAY — a COSMETIC press on #review-approve (the real approve handler is never triggered; the
-    // gate-off + pane-close below are frame-driven).
+    // gate-off + pane-close below are frame-driven). Lands after a brief dwell (the cursor rested under
+    // the #review-approve pulse since PROTO_APPROVE_MOVE_DUR completed).
     tMs: PROTO_APPROVE_CLICK_MS,
     frame: { t: "cursor_click", target: "#review-approve" },
   },

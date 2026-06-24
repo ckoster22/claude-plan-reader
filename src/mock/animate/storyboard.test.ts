@@ -57,6 +57,25 @@ import {
   PROTO_CLOSE_MS,
   PROTO_FEEDBACK_MS,
   PROTO_ACK_MS,
+  // (P5 #1/#3/#10) pacing/cursor-travel constants — the field→button moves + dwell pulses.
+  B1_REQUEST_DWELL_MS,
+  B1_START_MOVE_MS,
+  B1_START_MOVE_DUR,
+  B1_START_PULSE_FROM,
+  B1_START_PULSE_TO,
+  B1_START_CLICK_MS,
+  B2_ANSWER_DWELL_MS,
+  B2_SUBMIT_MOVE_MS,
+  B2_SUBMIT_MOVE_DUR,
+  B2_SUBMIT_PULSE_FROM,
+  B2_SUBMIT_PULSE_TO,
+  B2_SUBMIT_CLICK_MS,
+  PROTO_APPROVE_PULSE_FROM,
+  PROTO_APPROVE_PULSE_TO,
+  PROTO_APPROVE_ORIGIN_MS,
+  PROTO_APPROVE_MOVE_MS,
+  PROTO_APPROVE_MOVE_DUR,
+  PROTO_APPROVE_CLICK_MS,
   B1_COMPOSER_OPEN_MS,
   B1_REQUEST_TYPE_FROM,
   B1_REQUEST_TYPE_TO,
@@ -1965,6 +1984,93 @@ describe("storyboard — projectCursorState (symbolic lerp)", () => {
     // Default press is 180ms → window [50, 230).
     expect(projectCursorState(story, 229)!.pressing).toBe(true);
     expect(projectCursorState(story, 230)!.pressing).toBe(false);
+  });
+});
+
+// (P5 #1/#3/#10) PACING & CURSOR TRAVEL on the REAL TRAILHEAD_BEAT. For each of the three submit
+// moments the cursor must TRAVEL — a real field→button move (t01 strictly in (0,1) at the move's
+// midpoint, with fromTarget = the input field and toTarget = the button), NOT an instant jump — and a
+// DWELL pulse must mark the button before the cosmetic click. Every assertion is pinned to the named
+// constants (re-time = one-line change). Each "travels" assertion is FALSIFIABLE by removing/retargeting
+// the field-origin re-anchor waypoint (so fromTarget ≠ the field) → RED.
+describe("storyboard — (P5) pacing & cursor TRAVEL at the three submit moments", () => {
+  // Helper: assert the cursor is mid-TRAVEL from `field` → `button` at the midpoint of [moveMs, moveMs+dur).
+  const expectMidTravel = (moveMs: number, dur: number, field: string, button: string) => {
+    const midT = moveMs + dur / 2;
+    const c = projectCursorState(TRAILHEAD_BEAT, midT);
+    expect(c, `cursor state at mid-travel T=${midT}`).not.toBeNull();
+    // TRAVELING (not jumped/rested): a real move segment from the FIELD to the BUTTON.
+    expect(c!.fromTarget, `fromTarget at T=${midT}`).toBe(field);
+    expect(c!.toTarget, `toTarget at T=${midT}`).toBe(button);
+    // t01 STRICTLY between 0 and 1 — proves a genuine in-flight travel, not an instant arrival.
+    expect(c!.t01).toBeGreaterThan(0);
+    expect(c!.t01).toBeLessThan(1);
+  };
+
+  // Helper: assert a pulse window on `target` spanning the dwell exists and contains a sampled interior T.
+  const expectDwellPulse = (target: string, fromMs: number, toMs: number) => {
+    expect(toMs).toBeGreaterThan(fromMs); // a real (non-degenerate) dwell window
+    const mid = Math.floor((fromMs + toMs) / 2);
+    expect(projectPulseSet(TRAILHEAD_BEAT, mid).has(target), `pulse on ${target} at dwell-mid ${mid}`).toBe(true);
+  };
+
+  it("#1 New-Plan submit: a fresh #composer-request origin waypoint precedes the start move", () => {
+    // The re-anchor waypoint is the SOURCE OF the travel's origin. FALSIFIABILITY: retarget it to
+    // #composer-start and the #1 travel below loses its #composer-request fromTarget → that test goes RED.
+    const reAnchor = TRAILHEAD_BEAT.find(
+      (sf) => sf.tMs === B1_REQUEST_DWELL_MS && sf.frame.t === "cursor_move" && sf.frame.target === "#composer-request",
+    );
+    expect(reAnchor, "fresh #composer-request origin waypoint at B1_REQUEST_DWELL_MS").toBeDefined();
+  });
+
+  it("#1 New-Plan submit: the cursor TRAVELS #composer-request → #composer-start (slow, legible)", () => {
+    // The slow move is deliberately legible: not a near-instant jump.
+    expect(B1_START_MOVE_DUR).toBeGreaterThanOrEqual(700);
+    expectMidTravel(B1_START_MOVE_MS, B1_START_MOVE_DUR, "#composer-request", "#composer-start");
+  });
+
+  it("#1 New-Plan submit: a dwell pulse marks #composer-start before the cosmetic click", () => {
+    expectDwellPulse("#composer-start", B1_START_PULSE_FROM, B1_START_PULSE_TO);
+    // The click lands AT/after the dwell ends (the viewer reads the button first).
+    expect(B1_START_CLICK_MS).toBeGreaterThanOrEqual(B1_START_PULSE_TO - 1);
+  });
+
+  it("#3 Clarify submit: a fresh [data-other=text] origin waypoint precedes the submit move", () => {
+    const reAnchor = TRAILHEAD_BEAT.find(
+      (sf) => sf.tMs === B2_ANSWER_DWELL_MS && sf.frame.t === "cursor_move" && sf.frame.target === '[data-other="text"]',
+    );
+    expect(reAnchor, "fresh [data-other=text] origin waypoint at B2_ANSWER_DWELL_MS").toBeDefined();
+  });
+
+  it("#3 Clarify submit: the cursor TRAVELS [data-other=text] → .conv-question-submit (slow, legible)", () => {
+    expect(B2_SUBMIT_MOVE_DUR).toBeGreaterThanOrEqual(700);
+    expectMidTravel(B2_SUBMIT_MOVE_MS, B2_SUBMIT_MOVE_DUR, '[data-other="text"]', ".conv-question-submit");
+  });
+
+  it("#3 Clarify submit: a dwell pulse marks .conv-question-submit before the cosmetic click", () => {
+    expectDwellPulse(".conv-question-submit", B2_SUBMIT_PULSE_FROM, B2_SUBMIT_PULSE_TO);
+    expect(B2_SUBMIT_CLICK_MS).toBeGreaterThanOrEqual(B2_SUBMIT_PULSE_TO - 1);
+  });
+
+  it("#10 Prototype Approve: a fresh #prototype-feedback origin waypoint precedes the approve move", () => {
+    const reAnchor = TRAILHEAD_BEAT.find(
+      (sf) => sf.tMs === PROTO_APPROVE_ORIGIN_MS && sf.frame.t === "cursor_move" && sf.frame.target === "#prototype-feedback",
+    );
+    expect(reAnchor, "fresh #prototype-feedback origin waypoint at PROTO_APPROVE_ORIGIN_MS").toBeDefined();
+  });
+
+  it("#10 Prototype Approve: the cursor TRAVELS #prototype-feedback → #review-approve (slow, legible)", () => {
+    expect(PROTO_APPROVE_MOVE_DUR).toBeGreaterThanOrEqual(700);
+    expectMidTravel(PROTO_APPROVE_MOVE_MS, PROTO_APPROVE_MOVE_DUR, "#prototype-feedback", "#review-approve");
+  });
+
+  it("#10 Prototype Approve: #review-approve is pulsed (button reads clearly) before the cosmetic click", () => {
+    // The pulse spans the move up to the click, so the review-bar button is clearly shown the whole time.
+    expectDwellPulse("#review-approve", PROTO_APPROVE_PULSE_FROM, PROTO_APPROVE_PULSE_TO);
+    // The pulse is still active AT the mid-travel moment (button visible while the cursor crosses to it).
+    const midTravel = PROTO_APPROVE_MOVE_MS + PROTO_APPROVE_MOVE_DUR / 2;
+    expect(projectPulseSet(TRAILHEAD_BEAT, midTravel).has("#review-approve")).toBe(true);
+    expect(PROTO_APPROVE_CLICK_MS).toBeGreaterThanOrEqual(PROTO_APPROVE_PULSE_TO - 1);
   });
 });
 
