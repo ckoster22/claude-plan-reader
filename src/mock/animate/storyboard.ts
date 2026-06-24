@@ -1886,7 +1886,8 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
         seq: 59,
         kind: "assistant_text",
         text:
-          "I put together a quick visual prototype of the Trailhead trail card — take a look.",
+          "Before I build the trail-detail screen, let me validate its core UI with you — the trail card. " +
+          "Here's a quick HTML prototype of the Eagle Peak Loop card, opening in the pane now →",
         parent_tool_use_id: null,
       },
     },

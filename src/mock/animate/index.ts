@@ -41,6 +41,7 @@ import {
   TRAILHEAD_PROTO_CARD_R1_HTML,
   TRAILHEAD_PROTO_CARD_R2_HTML,
   TRAILHEAD_PROTO_CARD_CSS,
+  TRAILHEAD_PROTO_PREVIEW_OVERRIDE,
 } from "../fixtures/markdown";
 import {
   applyUpToTime,
@@ -816,8 +817,11 @@ function mountPlayer(): void {
         }),
       emitReviewCancelled: (reviewId: string): void =>
         emitMockEvent("plan-review-cancelled", { review_id: reviewId }),
-      // Prototype gate: the fake orchestrator seam.
-      emitGate: (_which: "prototype", round?: number): void => emitGate("prototype", round),
+      // Prototype gate: the fake orchestrator seam. Pass the Trailhead NON-mermaid preview override so
+      // the detached composePreviewMarkdown render behind the floating trail card is a plain-fence note,
+      // NOT the default fixture's stray `flowchart LR` mermaid (review item #6).
+      emitGate: (_which: "prototype", round?: number): void =>
+        emitGate("prototype", round, TRAILHEAD_PROTO_PREVIEW_OVERRIDE),
       clearGate,
       // Active tab: click the real tab button (never un-hide #conversation-stream).
       setActiveTab: (tab: "plan" | "conversation"): void => {

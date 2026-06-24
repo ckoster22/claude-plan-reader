@@ -126,11 +126,36 @@ function splitRoot(): TreeNode {
 // prototypeBarLabel(round) → "Visual prototype — round N of 3". `round` is clamped to the real 1..3
 // band the orchestrator emits. Passing it for an acceptance gate is harmless (acceptance also carries
 // a round, surfaced only as audit data).
-export function gateSnapshot(which: "prototype" | "acceptance", round = 1): PlanTreeSnapshot2 {
+// An optional override of the prototype gate's preview FENCE (kind + inlinePreview). The default
+// fixture is kind:"mermaid" (the knob harness demonstrates the detached mermaid-preview path). The
+// mock-ANIMATE Trailhead demo passes a NON-mermaid override here: its prototype is the floating HTML
+// trail-card overlay (#demo-proto-card), and composePreviewMarkdown(mermaid) would otherwise paint a
+// stray flowchart into the reading pane BEHIND the card (review item #6). A non-mermaid kind keeps the
+// detached-preview render coherent with the title-only backdrop the storyboard opens.
+export interface ProtoPreviewOverride {
+  kind: PrototypeGate["kind"];
+  inlinePreview: string | null;
+}
+
+export function gateSnapshot(
+  which: "prototype" | "acceptance",
+  round = 1,
+  protoPreview?: ProtoPreviewOverride,
+): PlanTreeSnapshot2 {
   const r = Math.min(3, Math.max(1, Math.floor(round)));
-  // Preserve REFERENCE identity for the fixtures' own default round (1) so existing tests asserting
-  // `toBe(MOCK_PROTOTYPE_GATE)` stay green; only spread a fresh object when a different round is asked.
-  const proto = r === MOCK_PROTOTYPE_GATE.round ? MOCK_PROTOTYPE_GATE : { ...MOCK_PROTOTYPE_GATE, round: r };
+  // Preserve REFERENCE identity for the fixtures' own default round (1, no override) so existing tests
+  // asserting `toBe(MOCK_PROTOTYPE_GATE)` stay green; spread a fresh object whenever a different round
+  // OR a preview override is asked for.
+  const proto =
+    r === MOCK_PROTOTYPE_GATE.round && protoPreview === undefined
+      ? MOCK_PROTOTYPE_GATE
+      : {
+          ...MOCK_PROTOTYPE_GATE,
+          round: r,
+          ...(protoPreview === undefined
+            ? {}
+            : { kind: protoPreview.kind, inlinePreview: protoPreview.inlinePreview }),
+        };
   const accept = r === MOCK_ACCEPTANCE_GATE.round ? MOCK_ACCEPTANCE_GATE : { ...MOCK_ACCEPTANCE_GATE, round: r };
   return {
     treeId: "tree-mock-gate",

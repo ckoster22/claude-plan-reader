@@ -223,6 +223,19 @@ export const TRAILHEAD_PROTO_CARD_R2_HTML =
   `<div class="tc-meta">6.2 mi · +1,400 ft</div>` +
   `</div>`;
 
+// The mock-ANIMATE prototype gate's detached-preview override (kind:"ascii", non-mermaid). When the
+// prototype gate fires, main.ts's real onPrototypeReview → renderPrototypePreview composes
+// composePreviewMarkdown(gate) into #reading-pane. The default MOCK_PROTOTYPE_GATE is kind:"mermaid",
+// which would paint a stray `flowchart LR` diagram BEHIND the floating trail card (review item #6 — the
+// demo's prototype is the HTML card, NOT a mermaid). The Trailhead player passes THIS override so the
+// detached preview renders as a short plain-fence note that COMPLEMENTS the card + title-only backdrop —
+// no mermaid anywhere in the prototype-review chapter. (Mermaid lives only in TRAILHEAD_MASTER_DOC.)
+export const TRAILHEAD_PROTO_PREVIEW_OVERRIDE = {
+  kind: "ascii" as const,
+  inlinePreview:
+    "Trail card — Eagle Peak Loop\n6.2 mi · +1,400 ft\n(interactive preview floats over this pane →)",
+};
+
 // The trail-card CSS (namespaced to `#demo-proto-card` descendants). Injected by the player alongside
 // ANIM_CSS. `--tc-scale` (set by the player per round) drives every size so round 2 is uniformly larger;
 // `.tc-badge` is hidden by round 1's HTML omitting it (round 2's HTML adds it). The card chrome itself

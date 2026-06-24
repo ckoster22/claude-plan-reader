@@ -21,7 +21,9 @@ import {
   acceptanceGateActive,
   prototypeBarLabel,
   acceptanceRefineTargets,
+  composePreviewMarkdown,
 } from "../prototype";
+import { TRAILHEAD_PROTO_PREVIEW_OVERRIDE } from "./fixtures/markdown";
 
 import { ConversationModel } from "../conversation/stream";
 import { renderTree } from "../conversation/render";
@@ -111,6 +113,29 @@ describe("review bar — prototype/acceptance gates drive the real gate-active f
     expect(prototypeGateActive(snap, false)).toBeNull();
     // The bar label the real applyPrototypeBar would render off gate.round.
     expect(prototypeBarLabel(gate!.round)).toBe("Visual prototype — round 1 of 3");
+  });
+
+  // Review item #6: the mock-ANIMATE Trailhead prototype gate must NOT inject a mermaid diagram into
+  // the reading pane (the demo's prototype is the floating HTML trail card; main.ts's real
+  // renderPrototypePreview → composePreviewMarkdown paints the gate's inlinePreview behind it). The
+  // default fixture is kind:"mermaid"; the player passes TRAILHEAD_PROTO_PREVIEW_OVERRIDE (kind:"ascii")
+  // so composePreviewMarkdown emits a PLAIN fence, never a ```mermaid one.
+  it("the Trailhead preview override composes WITHOUT a mermaid fence (#6); the default fixture WITH one", () => {
+    const overridden = gateSnapshot("prototype", 1, TRAILHEAD_PROTO_PREVIEW_OVERRIDE);
+    const overriddenGate = overridden.pendingPrototype!;
+    expect(overriddenGate.kind).toBe("ascii");
+    const overriddenMd = composePreviewMarkdown(overriddenGate);
+    // The fix: NO mermaid fence ⇒ the reading-pane mermaid pipeline renders nothing.
+    expect(overriddenMd).not.toContain("```mermaid");
+    // …but the trail-card text the override carries IS present (the pane shows a coherent note).
+    expect(overriddenMd).toContain("Eagle Peak Loop");
+
+    // FALSIFY: the DEFAULT (un-overridden) fixture is kind:"mermaid" and DOES emit a ```mermaid fence —
+    // exactly the stray flowchart this fix removes from the Trailhead demo. If this assertion ever flips
+    // (default no longer mermaid), the override-vs-default contract this test pins has rotted.
+    const defaultMd = composePreviewMarkdown(gateSnapshot("prototype").pendingPrototype!);
+    expect(defaultMd).toContain("```mermaid");
+    expect(defaultMd).toContain("flowchart LR");
   });
 
   it("the acceptance snapshot yields the held AcceptanceGate and 2 refine targets", () => {

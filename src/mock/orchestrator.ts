@@ -30,6 +30,7 @@ import {
   type PlanTreeSnapshot2,
 } from "../conversation/orchestrator";
 import { gateSnapshot, placeholderSnapshot } from "./fixtures/reviews";
+import type { ProtoPreviewOverride } from "./fixtures/reviews";
 
 // The observers main.ts (and anyone else) subscribes. emitGate() fans to all of them.
 const observers = new Set<OrchestratorObserver>();
@@ -98,10 +99,14 @@ export function installMockOrchestrator(): void {
 // detached prototype preview, refreshes the bar), mirroring the real orchestrator's emission pair.
 // `round` (1..3, clamped in gateSnapshot) drives the real prototypeBarLabel — the Review-bar
 // "prototype round" knob passes it.
-export function emitGate(which: "prototype" | "acceptance", round = 1): void {
+export function emitGate(
+  which: "prototype" | "acceptance",
+  round = 1,
+  protoPreview?: ProtoPreviewOverride,
+): void {
   active = true;
   __setActiveOrchestratorForTest(handle);
-  const snap = gateSnapshot(which, round);
+  const snap = gateSnapshot(which, round, protoPreview);
   lastSnapshot = snap;
   for (const o of observers) o.onSnapshot?.(snap);
   if (which === "prototype" && snap.pendingPrototype) {
