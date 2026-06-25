@@ -398,6 +398,21 @@ export function __expandTreeForMock(treeId: string): void {
   applyFilterAndRender();
 }
 
+// Mock/automation hook (review2 c5): set the module-level `openPath` WITHOUT re-rendering the reading
+// pane. The mock-ANIMATE player renders the reading pane DIRECTLY through the render facade
+// (readPlan → renderInto → applyComments) and never routes through openPlan(), so main.ts's `openPath`
+// stays null/stale during the demo. But the IN-PROCESS review bar's VIEWING derivation
+// (viewingGate(): openPath === gate.planPath; currentReviewId(): r.planFilePath === openPath) compares
+// the held gate's planPath against THIS openPath — so without it the gate is seen as a review of a
+// DIFFERENT plan → SUMMARY mode ("N plans awaiting review" + external "Submit feedback"), not the
+// in-process "Request changes" VIEWING bar. This setter aligns openPath with the plan the player has
+// rendered, so viewingGate() matches WITHOUT a re-render (the freshly-applied comment highlights
+// survive). Production never calls this — production sets openPath through openPlan(). `path: null`
+// clears it (the gate clears / the pane closes).
+export function __setOpenPathForMock(path: string | null): void {
+  openPath = path === null ? null : asAbsPath(path);
+}
+
 // ---- Sidebar filter (Fix 1) ----
 // The live filter query (raw input value) and the last full records array `list_plans`
 // returned. The Plans tab renders `filterRecords(lastRecords, filterQuery)`; the Contents tab

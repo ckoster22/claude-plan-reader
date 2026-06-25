@@ -45,7 +45,7 @@ import {
 } from "../orchestrator";
 import { applyComments, renderInto, settle } from "../../render";
 import { extractToc } from "../../render/toc";
-import { buildToc, refreshCommentCount } from "../../main";
+import { buildToc, refreshCommentCount, __setOpenPathForMock } from "../../main";
 import { trailheadProtoPreviewOverride } from "../fixtures/markdown";
 import {
   applyUpToTime,
@@ -873,6 +873,14 @@ function mountPlayer(): void {
       // re-read the count through the REAL refreshCommentCount (→ refreshReviewBar with the authoritative
       // count, so Submit is disabled at 0 / enabled at >=1). No onAwaitingApproval → highlights survive.
       emitReviewGate: (planPath: string, commentCount: number): void => {
+        // ROOT-CAUSE FIX (review2 c5 live bug): align main.ts's openPath with the plan the player has
+        // RENDERED. The player renders the reading pane DIRECTLY (readPlan→renderInto→applyComments) and
+        // NEVER calls openPlan, so main.ts's openPath would be null/stale. viewingGate() compares
+        // gate.planPath === openPath — so WITHOUT this the held gate is seen as a review of a DIFFERENT
+        // plan → SUMMARY mode ("N plans awaiting review" + external "Submit feedback"), NOT the
+        // in-process "Request changes" VIEWING bar. Set openPath FIRST so the onSnapshot→refreshReviewBar
+        // fan below derives VIEWING. No re-render → the freshly-applied comment highlights survive.
+        __setOpenPathForMock(planPath);
         setCommentCount(commentCount);
         emitApprovalGate(planPath);
         void refreshCommentCount();
