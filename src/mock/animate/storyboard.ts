@@ -807,16 +807,16 @@ export const SCROLL_UP_TO = 55600; //   … reaching the top over ~2.2s
 export const PROTO_NARR_MS = 39800 + CLARIFIER_SHIFT; // seq 59 "I put together a quick visual prototype…"
 export const PROTO_NARR_PULSE_FROM = 40700 + CLARIFIER_SHIFT; // pulse the narration bubble (by data-seq) …
 export const PROTO_NARR_PULSE_TO = 42700 + CLARIFIER_SHIFT; //   … ~2s pause (the viewer reads it)
-export const PROTO_OPEN_MS = 40600 + CLARIFIER_SHIFT; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → round-1 card shows
-export const PROTO_CARD1_PULSE_FROM = 42800 + CLARIFIER_SHIFT; // pulse #demo-proto-card (round 1) …
+export const PROTO_OPEN_MS = 40600 + CLARIFIER_SHIFT; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → inline round-1 card shows
+export const PROTO_CARD1_PULSE_FROM = 42800 + CLARIFIER_SHIFT; // pulse #reading-pane (inline round-1 card) …
 export const PROTO_CARD1_PULSE_TO = 44800 + CLARIFIER_SHIFT; //   … ~2s
 export const PROTO_FEEDBACK_MOVE_MS = 44900 + CLARIFIER_SHIFT; // cursor → #prototype-feedback
 export const PROTO_FEEDBACK_TYPE_FROM = 45200 + CLARIFIER_SHIFT; // field_type #prototype-feedback begins …
 export const PROTO_FEEDBACK_TYPE_TO = 47700 + CLARIFIER_SHIFT; //   … typed over ~2.5s (also pulsed across this window)
 export const PROTO_SUBMIT_MOVE_MS = 47900 + CLARIFIER_SHIFT; // cursor → #review-submit
 export const PROTO_SUBMIT_CLICK_MS = 48200 + CLARIFIER_SHIFT; // cosmetic click on #review-submit ("Request changes")
-export const PROTO_ROUND2_MS = 48400 + CLARIFIER_SHIFT; // prototype_gate{on,round:2} → the card MORPHS larger + difficulty badge
-export const PROTO_CARD2_PULSE_FROM = 48600 + CLARIFIER_SHIFT; // pulse #demo-proto-card (round 2) …
+export const PROTO_ROUND2_MS = 48400 + CLARIFIER_SHIFT; // prototype_gate{on,round:2} → the inline card MORPHS with a difficulty badge
+export const PROTO_CARD2_PULSE_FROM = 48600 + CLARIFIER_SHIFT; // pulse #reading-pane (inline round-2 card) …
 export const PROTO_CARD2_PULSE_TO = 50600 + CLARIFIER_SHIFT; //   … ~2s pause
 // (P5 #10) PACING: before approving, make the review-bar buttons read clearly — pulse #review-approve,
 // re-anchor the cursor at the feedback field (a fresh origin — its prior waypoint is #review-submit from
@@ -2183,13 +2183,14 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
   // ---- Chapter "Prototype review" (P4: the scripted prototype ACT) -----------------------------
   //
   // The assistant narrates a visual prototype; the storyboard then PLAYS the act: pulse the narration
-  // bubble (a ~2s read), show the ROUND-1 trail card (an HTML overlay, #demo-proto-card) over the
-  // reading pane + pulse it, TYPE the feedback into #prototype-feedback over ~2.5s, cosmetic-click
-  // #review-submit, MORPH to the ROUND-2 card (larger + difficulty badge, driven by prototype_gate
+  // bubble (a ~2s read), show the ROUND-1 trail card INLINE in #reading-pane (exactly as the real app
+  // does — main.ts's renderPrototypePreview composes the ASCII trail card via composePreviewMarkdown,
+  // NOT a floating overlay) + pulse the pane, TYPE the feedback into #prototype-feedback over ~2.5s,
+  // cosmetic-click #review-submit, MORPH to the ROUND-2 card (difficulty badge, driven by prototype_gate
   // round:2) + pulse it, then cosmetic-click #review-approve. The card round is DERIVED from the
-  // prototype_gate projection (reconcileProtoCard: round 1|2 while on, null while off), so the round-2
-  // gate frame is what re-renders the bigger badged card — no separate card signal. All clicks are
-  // COSMETIC (the named state change is frame-driven); the reconciler owns the card + the gate.
+  // prototype_gate projection (renderPrototypePreview re-fires per round), so the round-2 gate frame is
+  // what re-renders the badged card — no separate card signal. All clicks are COSMETIC (the named state
+  // change is frame-driven); the gate drives the inline preview + the review bar.
   {
     // seq 59 — the assistant narrates the visual prototype (streams via revealMs 700). Conversation tab.
     tMs: PROTO_NARR_MS,
@@ -2208,15 +2209,18 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // SURFACE — open the prototype-preview BACKDROP plan in the reading pane (OPENING edge of the bracket:
-    // a plan being open makes activeTab="plan"). The trail-card overlay floats over this pane. (Ordered
-    // before the narration pulse below so the array stays tMs-monotonic: PROTO_OPEN_MS < PROTO_NARR_PULSE_FROM.)
+    // SURFACE — open the prototype-preview plan in the reading pane (OPENING edge of the bracket: a plan
+    // being open makes activeTab="plan"). This doc IS the inline ASCII trail card (PROTO_PREVIEW_DOC,
+    // byte-identical to composePreviewMarkdown's round-1 output) so the pane is coherent the instant it
+    // opens, regardless of the two-writer race with renderPrototypePreview. (Ordered before the narration
+    // pulse below so the array stays tMs-monotonic: PROTO_OPEN_MS < PROTO_NARR_PULSE_FROM.)
     tMs: PROTO_OPEN_MS,
     frame: { t: "open_plan", path: PROTO_PREVIEW_PATH },
   },
   {
-    // SURFACE — the prototype gate turns ON (round 1): the review bar lights up AND reconcileProtoCard
-    // shows the ROUND-1 trail card (#demo-proto-card, TRAILHEAD_PROTO_CARD_R1_HTML) over the pane.
+    // SURFACE — the prototype gate turns ON (round 1): the review bar lights up AND main.ts's
+    // renderPrototypePreview composes the ROUND-1 trail card INLINE into #reading-pane (the real app's
+    // inline-preview path).
     tMs: PROTO_OPEN_MS,
     frame: { t: "prototype_gate", on: true, round: 1 },
   },
@@ -2233,9 +2237,9 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // OVERLAY — pulse the round-1 card (#demo-proto-card) for ~2s so the viewer takes it in.
+    // OVERLAY — pulse the reading pane (the inline round-1 card) for ~2s so the viewer takes it in.
     tMs: PROTO_CARD1_PULSE_FROM,
-    frame: { t: "pulse", target: "#demo-proto-card", fromMs: PROTO_CARD1_PULSE_FROM, toMs: PROTO_CARD1_PULSE_TO },
+    frame: { t: "pulse", target: "#reading-pane", fromMs: PROTO_CARD1_PULSE_FROM, toMs: PROTO_CARD1_PULSE_TO },
   },
   {
     // OVERLAY — the cursor travels to the inline feedback textarea (visible while the gate is on).
@@ -2271,17 +2275,17 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     frame: { t: "cursor_click", target: "#review-submit" },
   },
   {
-    // SURFACE — the gate ADVANCES to round 2: reconcileGate re-emits at the new round AND reconcileProtoCard
-    // re-renders the card from TRAILHEAD_PROTO_CARD_R2_HTML — VISIBLY LARGER (--tc-scale bump) with a green
-    // "Moderate" difficulty badge. This is the on-screen result of the typed feedback (frame-driven, the
+    // SURFACE — the gate ADVANCES to round 2: reconcileGate re-emits at the new round AND main.ts's
+    // renderPrototypePreview re-composes the inline card with the round-2 ASCII (the green "Moderate"
+    // difficulty badge line). This is the on-screen result of the typed feedback (frame-driven, the
     // #review-submit click above being cosmetic).
     tMs: PROTO_ROUND2_MS,
     frame: { t: "prototype_gate", on: true, round: 2 },
   },
   {
-    // OVERLAY — pulse the morphed round-2 card (#demo-proto-card) for ~2s: a pause to register the change.
+    // OVERLAY — pulse the reading pane (the morphed round-2 inline card) for ~2s: register the change.
     tMs: PROTO_CARD2_PULSE_FROM,
-    frame: { t: "pulse", target: "#demo-proto-card", fromMs: PROTO_CARD2_PULSE_FROM, toMs: PROTO_CARD2_PULSE_TO },
+    frame: { t: "pulse", target: "#reading-pane", fromMs: PROTO_CARD2_PULSE_FROM, toMs: PROTO_CARD2_PULSE_TO },
   },
   {
     // OVERLAY (P5 #10) — pulse the "Approve visual" button (#review-approve) so the review-bar buttons
@@ -2312,7 +2316,8 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     frame: { t: "cursor_click", target: "#review-approve" },
   },
   {
-    // SURFACE — the gate turns OFF (closing edge): reconcileProtoCard hides the card (round → null).
+    // SURFACE — the gate turns OFF (closing edge): the review bar reverts and the inline preview clears
+    // when the pane closes below (open_plan{null}).
     tMs: PROTO_CLOSE_MS,
     frame: { t: "prototype_gate", on: false },
   },

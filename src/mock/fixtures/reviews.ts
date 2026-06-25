@@ -128,10 +128,9 @@ function splitRoot(): TreeNode {
 // a round, surfaced only as audit data).
 // An optional override of the prototype gate's preview FENCE (kind + inlinePreview). The default
 // fixture is kind:"mermaid" (the knob harness demonstrates the detached mermaid-preview path). The
-// mock-ANIMATE Trailhead demo passes a NON-mermaid override here: its prototype is the floating HTML
-// trail-card overlay (#demo-proto-card), and composePreviewMarkdown(mermaid) would otherwise paint a
-// stray flowchart into the reading pane BEHIND the card (review item #6). A non-mermaid kind keeps the
-// detached-preview render coherent with the title-only backdrop the storyboard opens.
+// mock-ANIMATE Trailhead demo passes a NON-mermaid (kind:"ascii") override here so composePreviewMarkdown
+// renders the trail-card ASCII INLINE in the reading pane (the real app's inline-preview path) rather than
+// a stray flowchart (review item #6). There is no floating overlay — the inline preview IS the prototype.
 export interface ProtoPreviewOverride {
   kind: PrototypeGate["kind"];
   inlinePreview: string | null;

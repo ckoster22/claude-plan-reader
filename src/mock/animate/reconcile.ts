@@ -93,8 +93,6 @@ export interface ReconcilerSeams {
   setComposerOpen?: (open: boolean) => void;
   // Drive the selection popover (reconciler owns `#sel-popover`): on + its anchor target selector.
   setSelPopover?: (state: { on: boolean; target: string | null }) => void;
-  // Drive the prototype trail-card overlay: round 1|2 shows the card, null hides it.
-  setProtoCard?: (state: { round: number | null }) => void;
   // Drive the reconciler-owned question-card Other-toggle (`.checked` + dispatched change) + its text
   // input. `null` ⇒ the answer UI is off (toggle unchecked, input empty/hidden).
   setQuestionAnswerUI?: (state: { otherChecked: boolean; otherText: string } | null) => void;
@@ -167,7 +165,6 @@ export function createReconciler(
   // so each drives its seam only on change (mirrors reconcileGate). null ⇒ never applied.
   let lastComposerOpen: boolean | null = null;
   let lastPopoverKey: string | null = null;
-  let lastProtoRound: number | null | undefined = undefined;
   let lastQuestionKey: string | null = null;
   // Cursor: the last-GOOD resolved position. Held when a target is absent OR resolves to a zero-area
   // rect (e.g. a display:none modal), so the cursor never lerps toward (0,0) — it dwells in place.
@@ -312,17 +309,6 @@ export function createReconciler(
     seams.setSelPopover(pop);
   }
 
-  // Drive the prototype trail-card overlay. The round is DERIVED from the existing prototype_gate
-  // projection (projectSurfaceState.prototypeGate): round 1|2 while the gate is ON, null while OFF. This
-  // reuses the gate's pure-in-T projection rather than inventing a second signal. Only on change.
-  function reconcileProtoCard(surface: SurfaceState): void {
-    if (!seams.setProtoCard) return;
-    const round = surface.prototypeGate.on ? surface.prototypeGate.round : null;
-    if (round === lastProtoRound) return;
-    lastProtoRound = round;
-    seams.setProtoCard({ round });
-  }
-
   // Drive the reconciler-owned question-card Other answer UI. DERIVED purely from projectFieldText: an
   // entry for the Other text selector ⇒ the card is being answered via "Other…" (toggle checked + the
   // input carries that prefix); no entry ⇒ the answer UI is off (null). The reconciler RE-ASSERTS this
@@ -428,13 +414,12 @@ export function createReconciler(
     reconcileActiveTab(surface, prev);
 
     // ---- overlays: drive the cosmetic seams. ORDER MATTERS: every pass that may change DOM geometry
-    // (composer/popover/proto-card/question-UI) runs BEFORE the cursor, so reconcileCursor reads
+    // (composer/popover/question-UI) runs BEFORE the cursor, so reconcileCursor reads
     // post-update rects. Pulse + fields are geometry-neutral but kept here for grouping.
     reconcilePulse(T);
     reconcileFields(T);
     reconcileComposer(T);
     reconcilePopover(T);
-    reconcileProtoCard(surface);
     reconcileQuestionUI(T);
     // Cursor LAST (runs every tick, no memo) so it reads geometry after the modal/card passes settle.
     reconcileCursor(T);

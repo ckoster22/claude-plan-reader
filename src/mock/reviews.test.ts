@@ -23,7 +23,11 @@ import {
   acceptanceRefineTargets,
   composePreviewMarkdown,
 } from "../prototype";
-import { TRAILHEAD_PROTO_PREVIEW_OVERRIDE } from "./fixtures/markdown";
+import {
+  trailheadProtoPreviewOverride,
+  MOCK_MARKDOWN,
+  PROTO_PREVIEW_PATH,
+} from "./fixtures/markdown";
 
 import { ConversationModel } from "../conversation/stream";
 import { renderTree } from "../conversation/render";
@@ -115,20 +119,36 @@ describe("review bar — prototype/acceptance gates drive the real gate-active f
     expect(prototypeBarLabel(gate!.round)).toBe("Visual prototype — round 1 of 3");
   });
 
-  // Review item #6: the mock-ANIMATE Trailhead prototype gate must NOT inject a mermaid diagram into
-  // the reading pane (the demo's prototype is the floating HTML trail card; main.ts's real
-  // renderPrototypePreview → composePreviewMarkdown paints the gate's inlinePreview behind it). The
-  // default fixture is kind:"mermaid"; the player passes TRAILHEAD_PROTO_PREVIEW_OVERRIDE (kind:"ascii")
-  // so composePreviewMarkdown emits a PLAIN fence, never a ```mermaid one.
-  it("the Trailhead preview override composes WITHOUT a mermaid fence (#6); the default fixture WITH one", () => {
-    const overridden = gateSnapshot("prototype", 1, TRAILHEAD_PROTO_PREVIEW_OVERRIDE);
-    const overriddenGate = overridden.pendingPrototype!;
-    expect(overriddenGate.kind).toBe("ascii");
-    const overriddenMd = composePreviewMarkdown(overriddenGate);
+  // Review item #6 + review2 c3: the mock-ANIMATE Trailhead prototype gate renders its prototype INLINE
+  // in #reading-pane (no floating overlay — the deleted #demo-proto-card "wouldn't appear in the app").
+  // main.ts's real renderPrototypePreview → composePreviewMarkdown paints the gate's inlinePreview. The
+  // default fixture is kind:"mermaid"; the player passes trailheadProtoPreviewOverride(round) (kind:"ascii")
+  // so composePreviewMarkdown emits a PLAIN fence, never a ```mermaid one, and round 2 adds the badge.
+  it("the Trailhead inline preview composes the trail card WITHOUT mermaid (#6); round 2 adds the badge", () => {
+    const round1Gate = gateSnapshot("prototype", 1, trailheadProtoPreviewOverride(1)).pendingPrototype!;
+    expect(round1Gate.kind).toBe("ascii");
+    const round1Md = composePreviewMarkdown(round1Gate);
     // The fix: NO mermaid fence ⇒ the reading-pane mermaid pipeline renders nothing.
-    expect(overriddenMd).not.toContain("```mermaid");
-    // …but the trail-card text the override carries IS present (the pane shows a coherent note).
-    expect(overriddenMd).toContain("Eagle Peak Loop");
+    expect(round1Md).not.toContain("```mermaid");
+    // The pane shows a COHERENT trail-list card (name + distance/elevation), not a near-empty title.
+    expect(round1Md).toContain("Eagle Peak Loop");
+    expect(round1Md).toContain("6.2 mi");
+    expect(round1Md).toContain("+1,400 ft");
+    // Round 1 has NO difficulty badge.
+    expect(round1Md).not.toContain("Moderate");
+
+    // Round 2 morphs the SAME card to add the difficulty badge (the typed-feedback result).
+    const round2Gate = gateSnapshot("prototype", 2, trailheadProtoPreviewOverride(2)).pendingPrototype!;
+    const round2Md = composePreviewMarkdown(round2Gate);
+    expect(round2Md).not.toContain("```mermaid");
+    expect(round2Md).toContain("Eagle Peak Loop");
+    expect(round2Md).toContain("Moderate");
+
+    // DETERMINISM (two-writer race): the reading-pane backdrop the reconciler opens (PROTO_PREVIEW_PATH →
+    // PROTO_PREVIEW_DOC) is BYTE-IDENTICAL to composePreviewMarkdown's round-1 output, so whichever writer
+    // wins a tick, the pane settles to the same card. This invariant is what makes repeated scrubs to the
+    // same T deterministic.
+    expect(MOCK_MARKDOWN[PROTO_PREVIEW_PATH]).toBe(round1Md);
 
     // FALSIFY: the DEFAULT (un-overridden) fixture is kind:"mermaid" and DOES emit a ```mermaid fence —
     // exactly the stray flowchart this fix removes from the Trailhead demo. If this assertion ever flips

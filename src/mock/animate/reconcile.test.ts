@@ -85,7 +85,6 @@ function makeSeams(over?: Partial<ReconcilerSeams>): {
     setFieldText: vi.fn(),
     setComposerOpen: vi.fn(),
     setSelPopover: vi.fn(),
-    setProtoCard: vi.fn(),
     setQuestionAnswerUI: vi.fn(),
     setScroll: vi.fn(),
     ...over,
@@ -659,32 +658,6 @@ describe("reconcile — popover on/off + backward-scrub revert (P1)", () => {
   });
 });
 
-describe("reconcile — proto-card on/off (derived from gate) + revert (P1)", () => {
-  it("round mirrors the prototype gate; null when gate off; reverts on rewind", () => {
-    const story: StoryFrame[] = [
-      { tMs: 100, frame: { t: "prototype_gate", on: true, round: 1 } },
-      { tMs: 200, frame: { t: "prototype_gate", on: true, round: 2 } },
-      { tMs: 300, frame: { t: "prototype_gate", on: false } },
-    ];
-    const { seams } = makeSeams();
-    const r = createReconciler(seams, story);
-
-    r.reconcile(50); // before the gate → null.
-    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: null });
-    r.reconcile(100); // gate on round 1.
-    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: 1 });
-    r.reconcile(200); // gate on round 2.
-    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: 2 });
-    r.reconcile(300); // gate off → hide.
-    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: null });
-    // BACKWARD scrub into round 1 → card re-shows at round 1.
-    r.reconcile(100);
-    expect(lastCall(seams, "setProtoCard")[0]).toEqual({ round: 1 });
-    // FALSIFIABILITY: deriving round from `surface.prototypeGate.round` unconditionally (ignoring `.on`)
-    // would emit {round:2} at T=300 instead of {round:null} → the gate-off assertion goes RED. Confirmed.
-  });
-});
-
 describe("reconcile — question Other-answer UI (derived from field text) + revert (P1)", () => {
   it("turns on with the typed text, then reverts to null before the field window", () => {
     const sel = QUESTION_OTHER_TEXT_SELECTOR;
@@ -790,7 +763,7 @@ describe("reconcile — (P2) setScroll seam: lerped frac, #reader-scroll target,
 // (P6) WHOLE-TIMELINE SCRUB-REVERT — the reconciler-level companion to the projection-purity property
 // test in storyboard.test.ts. Sweeps a reconciler FORWARD across many T over the real TRAILHEAD_BEAT,
 // then drives it BACK to an early T, and asserts the final OVERLAY seam-driven state (cursor, pulse set,
-// composer, popover, proto-card, question-UI) matches driving DIRECTLY to that early T from a FRESH
+// composer, popover, question-UI) matches driving DIRECTLY to that early T from a FRESH
 // reconciler. Because each overlay seam is a pure projection of T and the reconciler re-derives the full
 // state every tick (un-invertible surfaces rebuilt from scratch), forward-then-back == direct.
 //
@@ -800,10 +773,10 @@ describe("reconcile — (P2) setScroll seam: lerped frac, #reader-scroll target,
 // already correct). jsdom rects are all-zero, so cursor/popover positions are deterministic across both
 // paths — we compare the two drive paths, not absolute pixels.
 //
-// FALSIFIABILITY (verified): temporarily make the proto-card pass LATCH (skip re-driving when the gate
-// goes off after having been on — i.e. never emit {round:null} once shown) and the swept-back early-T
-// last call for setProtoCard becomes {round:2} while the direct path is {round:null} → the deep-equal
-// goes RED. Restoring the re-derive turns it green. Confirmed locally before commit.
+// FALSIFIABILITY (verified): temporarily make the popover pass LATCH (skip re-driving when the popover
+// goes off after having been on — i.e. never emit {on:false} once shown) and the swept-back early-T last
+// call for setSelPopover becomes {on:true,…} while the direct path is {on:false,…} → the deep-equal goes
+// RED. Restoring the re-derive turns it green. Confirmed locally before commit.
 describe("reconcile — (P6) whole-timeline forward-then-back == direct (overlay seams)", () => {
   // The overlay seams whose last call is a pure fn of T (their projected value carries no host-DOM
   // identity that would differ between two reconcilers over the same all-zero-rect jsdom).
@@ -812,7 +785,6 @@ describe("reconcile — (P6) whole-timeline forward-then-back == direct (overlay
     "setPulseTargets",
     "setComposerOpen",
     "setSelPopover",
-    "setProtoCard",
     "setQuestionAnswerUI",
   ] as const;
 

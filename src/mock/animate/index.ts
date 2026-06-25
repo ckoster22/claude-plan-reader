@@ -38,12 +38,7 @@ import { setPlans, setPendingReviews } from "../state";
 import { emitMockEvent } from "../event";
 import { emitGate, clearGate, installMockOrchestrator } from "../orchestrator";
 import { applyComments, renderInto, settle } from "../../render";
-import {
-  TRAILHEAD_PROTO_CARD_R1_HTML,
-  TRAILHEAD_PROTO_CARD_R2_HTML,
-  TRAILHEAD_PROTO_CARD_CSS,
-  TRAILHEAD_PROTO_PREVIEW_OVERRIDE,
-} from "../fixtures/markdown";
+import { trailheadProtoPreviewOverride } from "../fixtures/markdown";
 import {
   applyUpToTime,
   storyDurationMs,
@@ -261,28 +256,6 @@ const ANIM_CSS = `
   outline-offset: 2px;
 }
 
-/* The prototype trail-card overlay CHROME: a fixed, max-z card positioned over #reading-pane each tick.
-   --tc-scale grows round 1 → round 2 (set by the player per round). The card INTERIOR rules
-   (.tc-card/.tc-thumb/.tc-title/.tc-meta/.tc-badge) live in TRAILHEAD_PROTO_CARD_CSS (markdown.ts),
-   injected alongside this sheet — cohesive with the player-authored HTML those exports also own. */
-#demo-proto-card {
-  position: fixed;
-  top: 0;
-  left: 0;
-  z-index: 2147483640;
-  pointer-events: none;
-  --tc-scale: 1;
-  width: calc(260px * var(--tc-scale));
-  padding: calc(14px * var(--tc-scale)) calc(16px * var(--tc-scale));
-  border-radius: 12px;
-  background: #1f2027;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
-  color: #e8e8e8;
-  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  transition: width 200ms ease, padding 200ms ease;
-}
-
 /* ---- annotation overlay (Phase 1: replay/capture; pure projection of (doc, T)) ----------------
    Z-ORDER STACK (load-bearing, pinned with DISTINCT numeric z — no ties — so author chrome stays
    clickable ABOVE the drawing canvas regardless of DOM append order):
@@ -291,12 +264,11 @@ const ANIM_CSS = `
                                                  WIN over the canvas, so these sit strictly above it.)
      #mockanim-cmt panel ......... 2147483643  (passive text panel; pointer-events:none — must NEVER
                                                  intercept clicks, sits just under the chrome.)
-     #demo-annotation-canvas ..... 2147483642  (ABOVE app + #demo-cursor + #demo-proto-card so strokes
+     #demo-annotation-canvas ..... 2147483642  (ABOVE app + #demo-cursor so strokes
                                                  paint over the screen; in author mode pointer-events:auto
                                                  to capture drawing — but strictly BELOW the toolbar/
                                                  transport so it can't eat their clicks.)
      #demo-cursor ................ 2147483641  (cosmetic; strictly below the canvas)
-     #demo-proto-card ............ 2147483640  (cosmetic; strictly below the cursor)
    The canvas + panel are pure projections re-derived every paint (back-scrub clears them like every
    other overlay). They are INERT until a doc is loaded (no doc ⇒ cleared canvas + empty panel). */
 #demo-annotation-canvas {
@@ -376,9 +348,7 @@ function injectStyle(): void {
   if (document.getElementById("mock-anim-style")) return;
   const style = el("style");
   style.id = "mock-anim-style";
-  // The card-interior rules (.tc-card/.tc-thumb/…/.tc-badge) ship with the player-authored card HTML in
-  // markdown.ts; append them so the card markup + its styling stay cohesive in one place.
-  style.textContent = ANIM_CSS + TRAILHEAD_PROTO_CARD_CSS;
+  style.textContent = ANIM_CSS;
   document.head.appendChild(style);
 }
 
@@ -520,13 +490,8 @@ function mountPlayer(): void {
   cursorNode.style.display = "none";
   document.body.appendChild(cursorNode);
 
-  const protoCard = el("div");
-  protoCard.id = "demo-proto-card";
-  protoCard.style.display = "none";
-  document.body.appendChild(protoCard);
-
   // ---- annotation overlay nodes (Phase 1) ----
-  // The canvas sits ABOVE #demo-cursor/#demo-proto-card (it is appended AFTER them, below the transport
+  // The canvas sits ABOVE #demo-cursor (it is appended AFTER it, below the transport
   // root appended later — see the z-order comment in ANIM_CSS). Both nodes are created ONCE; the player
   // is the single writer, mirroring the #demo-cursor pattern. INERT until a doc is loaded.
   const annoCanvas = el("canvas");
@@ -755,28 +720,6 @@ function mountPlayer(): void {
     popover.style.top = `${rect.bottom + 6}px`;
   };
 
-  // Drive the prototype trail-card overlay. null → hide. Otherwise inject the player-authored card HTML
-  // (TRAILHEAD_PROTO_CARD_R1/R2_HTML from markdown.ts — SAFE, not user content) and bump --tc-scale so
-  // round 2 is visibly LARGER; round 2's HTML also carries the difficulty badge (.tc-badge). Position it
-  // over #reading-pane by reading that pane's rect EACH call (the pane scrolls).
-  const setProtoCard = (state: { round: number | null }): void => {
-    if (state.round === null) {
-      protoCard.style.display = "none";
-      return;
-    }
-    const round = state.round;
-    // Round 2+ : larger card + difficulty badge. Round 1: the clean base card.
-    protoCard.style.setProperty("--tc-scale", round >= 2 ? "1.3" : "1");
-    protoCard.innerHTML = round >= 2 ? TRAILHEAD_PROTO_CARD_R2_HTML : TRAILHEAD_PROTO_CARD_R1_HTML;
-    protoCard.style.display = "block";
-    // Reposition over #reading-pane each call (the reconciler calls this every tick; the pane scrolls).
-    const paneRect = readingPane.getBoundingClientRect();
-    if (paneRect.width > 0 || paneRect.height > 0) {
-      protoCard.style.left = `${paneRect.left + 24}px`;
-      protoCard.style.top = `${paneRect.top + 24}px`;
-    }
-  };
-
   // Drive the reconciler-owned question-card Other answer UI. Non-null: check the toggle + dispatch a
   // real `change` (so the card's refresh() un-hides the Other input) and set the text input value (+
   // dispatch input). null: leave as-is (the reconciler only calls on change; backward scrub re-asserts).
@@ -865,11 +808,12 @@ function mountPlayer(): void {
         }),
       emitReviewCancelled: (reviewId: string): void =>
         emitMockEvent("plan-review-cancelled", { review_id: reviewId }),
-      // Prototype gate: the fake orchestrator seam. Pass the Trailhead NON-mermaid preview override so
-      // the detached composePreviewMarkdown render behind the floating trail card is a plain-fence note,
-      // NOT the default fixture's stray `flowchart LR` mermaid (review item #6).
+      // Prototype gate: the fake orchestrator seam. Pass the ROUND-AWARE Trailhead ASCII override so
+      // main.ts's renderPrototypePreview composes the trail-card ASCII INLINE in #reading-pane (the real
+      // app's inline-preview path) — round 1 = the clean card, round 2 = the difficulty-badge variant.
+      // Never mermaid (review item #6 — the default fixture's `flowchart LR` would otherwise paint).
       emitGate: (_which: "prototype", round?: number): void =>
-        emitGate("prototype", round, TRAILHEAD_PROTO_PREVIEW_OVERRIDE),
+        emitGate("prototype", round, trailheadProtoPreviewOverride(round ?? 1)),
       clearGate,
       // Active tab: click the real tab button (never un-hide #conversation-stream).
       setActiveTab: (tab: "plan" | "conversation"): void => {
@@ -885,7 +829,6 @@ function mountPlayer(): void {
       setFieldText,
       setComposerOpen,
       setSelPopover,
-      setProtoCard,
       setQuestionAnswerUI,
       setScroll,
     },

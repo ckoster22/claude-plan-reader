@@ -709,11 +709,17 @@ describe("storyboard — TRAILHEAD_BEAT prototype-review chapter", () => {
     expect((userBubble!.frame as { text: string }).text).toBe(fullAtEnd);
   });
 
-  it("the card overlay is PULSED in both rounds (#demo-proto-card pulse frames)", () => {
-    const cardPulses = TRAILHEAD_BEAT.filter(
-      (sf) => sf.frame.t === "pulse" && sf.frame.target === "#demo-proto-card",
+  it("the INLINE prototype pane is PULSED in both rounds (#reading-pane pulse frames), never a floating card", () => {
+    const panePulses = TRAILHEAD_BEAT.filter(
+      (sf) => sf.frame.t === "pulse" && sf.frame.target === "#reading-pane",
     );
-    expect(cardPulses.length).toBeGreaterThanOrEqual(2);
+    expect(panePulses.length).toBeGreaterThanOrEqual(2);
+    // REGRESSION GUARD (review2 c3): the deleted floating overlay (#demo-proto-card) must NEVER reappear in
+    // ANY frame. Re-adding the card path (a pulse/cursor/anything targeting it) turns this RED.
+    const cardRefs = TRAILHEAD_BEAT.filter(
+      (sf) => "target" in sf.frame && (sf.frame as { target?: string }).target === "#demo-proto-card",
+    );
+    expect(cardRefs).toHaveLength(0);
   });
 
   it("the open_plan bracket opens PROTO_PREVIEW_PATH at gate-open and closes (null) at gate-close", () => {

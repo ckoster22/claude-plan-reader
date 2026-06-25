@@ -174,101 +174,78 @@ The reading pane resolves this relative image through \`read_image_as_data_url\`
 Text after the image, so the pane shows the image is inlined mid-document.
 `;
 
-// ---- ANIMATE prototype-review beat — the visual prototype the gate previews -------------------
+// ---- ANIMATE prototype-review beat — the visual prototype the gate previews INLINE ------------
 //
 // The TRAILHEAD_BEAT (src/mock/animate/storyboard.ts) opens THIS plan in the reading pane during the
-// prototype-gate window (its open_plan…open_plan{null} bracket). It is a TINY title-only doc that acts
-// as the BACKDROP for the player-owned `#demo-proto-card` trail-card overlay (below) — the actual
-// prototype is the HTML card, NOT markdown (the reading pane is MarkdownIt({ html: false }), so card
-// HTML in a doc would be escaped). It is registered in the served markdown map (read_plan_contents
-// serves it) but NOT in the plan LIST / sidebar fixtures.
+// prototype-gate window (its open_plan…open_plan{null} bracket). The prototype is rendered INLINE in
+// `#reading-pane` exactly as the REAL app does it: main.ts's onPrototypeReview → renderPrototypePreview
+// composes `composePreviewMarkdown(gate)` (a plain monospace ASCII fence) into the pane, with the
+// review bar in `.review-bar.proto` mode. There is NO floating overlay card — the previous
+// `#demo-proto-card` chrome (review2 c3: "this wouldn't appear in the app") was deleted.
+//
+// TWO-WRITER DETERMINISM: two writers paint `#reading-pane` during this window —
+//   (a) the reconciler's reading-pane pass, which opens PROTO_PREVIEW_PATH → renders PROTO_PREVIEW_DOC,
+//   (b) renderPrototypePreview, which renders composePreviewMarkdown(gate) (round-aware).
+// To make the visible result deterministic regardless of which writer wins a given tick, PROTO_PREVIEW_DOC
+// is byte-identical to composePreviewMarkdown's output for the ROUND-1 override (same plain ``` fence
+// around the same ASCII card). So round-1 ticks settle to the same card no matter the race; round-2 ticks
+// (only renderPrototypePreview re-fires — the open-plan key is unchanged, so the reconciler memoizes)
+// morph the card to the difficulty-badge variant. Mermaid-free throughout (review item #6).
 export const PROTO_PREVIEW_PATH = `${PLANS}/trailhead-prototype-preview.md`;
 
-// A deliberately TINY title-only reading-pane doc. The prototype is shown as a PLAYER OVERLAY (the
-// `#demo-proto-card` trail card, below), NOT through this markdown — the reading pane uses
-// MarkdownIt({ html: false }) so raw card HTML in a doc would be escaped. This doc is just the backdrop
-// the open_plan bracket opens while the trail-card overlay floats over it. (The old trivial mermaid was
-// removed; the card replaces it as the prototype's visual.)
-const PROTO_PREVIEW_DOC = `# Trailhead prototype — trail card
+// The monospace trail-card ASCII the inline prototype shows. Round 1 = the clean card (name, photo
+// placeholder, distance/elevation). Round 2 = the SAME card plus a difficulty badge line — the exact
+// prototype feedback the storyboard types. Kept ASCII (no triple-backticks) so it nests cleanly inside a
+// plain ``` fence in both writers below.
+const TRAIL_CARD_R1_ASCII = [
+  "┌─ Eagle Peak Loop ───────────────┐",
+  "│                                 │",
+  "│   [ ▟▙ trail photo ▟▙ ]         │",
+  "│                                 │",
+  "│   6.2 mi  ·  +1,400 ft          │",
+  "│                                 │",
+  "└─────────────────────────────────┘",
+].join("\n");
 
-A quick visual prototype of the trail-list card.
-`;
+const TRAIL_CARD_R2_ASCII = [
+  "┌─ Eagle Peak Loop ───────────────┐",
+  "│                                 │",
+  "│   [ ▟▙ trail photo ▟▙ ]         │",
+  "│                                 │",
+  "│   6.2 mi  ·  +1,400 ft          │",
+  "│   « Moderate »                  │",
+  "│                                 │",
+  "└─────────────────────────────────┘",
+].join("\n");
 
-// ---- ANIMATE prototype trail-card — the player-owned `#demo-proto-card` overlay -----------------
-//
-// PLAYER-AUTHORED, SAFE HTML (NOT user content): the reconciler injects these strings into the
-// `#demo-proto-card` overlay node (src/mock/animate/index.ts setProtoCard). They are NOT rendered
-// through a markdown doc — the reading pane is MarkdownIt({ html: false }), so card HTML in a doc
-// would be escaped; the card is an overlay only.
-//
-// Round 1 = a clean trail card: a photo-placeholder block, a trail name, and distance/elevation stats.
-// Round 2 = the SAME card but visibly LARGER (the player bumps `--tc-scale`) AND with a difficulty
-// badge (`.tc-badge`, a green "Moderate" pill) — the exact prototype feedback the storyboard types.
-//
-// Markup is namespaced (`.tc-card`, `.tc-thumb`, `.tc-title`, `.tc-meta`, `.tc-badge`) so it cannot
-// collide with app styles. `--tc-scale` is owned by the player (set on `#demo-proto-card`), so the same
-// HTML scales by round; round 2 adds the badge node the player would otherwise omit.
-export const TRAILHEAD_PROTO_CARD_R1_HTML =
-  `<div class="tc-card">` +
-  `<div class="tc-thumb" aria-hidden="true"></div>` +
-  `<div class="tc-title">Eagle Peak Loop</div>` +
-  `<div class="tc-meta">6.2 mi · +1,400 ft</div>` +
-  `</div>`;
+// PURE: the mock-ANIMATE prototype gate's detached-preview override for a given 1-based round
+// (kind:"ascii", non-mermaid). The Trailhead player passes the result to emitGate so main.ts's
+// renderPrototypePreview composes the SAME ASCII trail card the open-plan backdrop shows. Round >= 2
+// swaps in the difficulty-badge variant. The default MOCK_PROTOTYPE_GATE is kind:"mermaid" (a stray
+// `flowchart LR`), so this override is what keeps the prototype chapter mermaid-free (review item #6).
+export function trailheadProtoPreviewOverride(round: number): {
+  kind: "ascii";
+  inlinePreview: string;
+} {
+  return {
+    kind: "ascii",
+    inlinePreview: round >= 2 ? TRAIL_CARD_R2_ASCII : TRAIL_CARD_R1_ASCII,
+  };
+}
 
-export const TRAILHEAD_PROTO_CARD_R2_HTML =
-  `<div class="tc-card">` +
-  `<div class="tc-thumb" aria-hidden="true"></div>` +
-  `<div class="tc-title">Eagle Peak Loop</div>` +
-  `<div class="tc-badge">Moderate</div>` +
-  `<div class="tc-meta">6.2 mi · +1,400 ft</div>` +
-  `</div>`;
+// Wrap a body in a plain ``` fence — byte-identical to prototype.ts's composePreviewMarkdown output for
+// a no-variant kind:"ascii" gate (whose `fence("", body)` is exactly this when `body` has no ``` run, plus
+// composePreviewMarkdown's single trailing newline). The ASCII bodies above contain no triple-backticks,
+// so a fixed 3-backtick fence matches. This keeps PROTO_PREVIEW_DOC and the round-1 override in lockstep
+// so the two writers settle to the same pane content (see the TWO-WRITER DETERMINISM note above).
+function asciiFenceDoc(body: string): string {
+  return "```\n" + body + "\n```\n";
+}
 
-// The mock-ANIMATE prototype gate's detached-preview override (kind:"ascii", non-mermaid). When the
-// prototype gate fires, main.ts's real onPrototypeReview → renderPrototypePreview composes
-// composePreviewMarkdown(gate) into #reading-pane. The default MOCK_PROTOTYPE_GATE is kind:"mermaid",
-// which would paint a stray `flowchart LR` diagram BEHIND the floating trail card (review item #6 — the
-// demo's prototype is the HTML card, NOT a mermaid). The Trailhead player passes THIS override so the
-// detached preview renders as a short plain-fence note that COMPLEMENTS the card + title-only backdrop —
-// no mermaid anywhere in the prototype-review chapter. (Mermaid lives only in TRAILHEAD_MASTER_DOC.)
-export const TRAILHEAD_PROTO_PREVIEW_OVERRIDE = {
-  kind: "ascii" as const,
-  inlinePreview:
-    "Trail card — Eagle Peak Loop\n6.2 mi · +1,400 ft\n(interactive preview floats over this pane →)",
-};
-
-// The trail-card CSS (namespaced to `#demo-proto-card` descendants). Injected by the player alongside
-// ANIM_CSS. `--tc-scale` (set by the player per round) drives every size so round 2 is uniformly larger;
-// `.tc-badge` is hidden by round 1's HTML omitting it (round 2's HTML adds it). The card chrome itself
-// (`#demo-proto-card` position/background/shadow) lives in ANIM_CSS — this is the card INTERIOR only.
-export const TRAILHEAD_PROTO_CARD_CSS = `
-#demo-proto-card .tc-card {
-  display: flex;
-  flex-direction: column;
-  gap: calc(8px * var(--tc-scale, 1));
-}
-#demo-proto-card .tc-thumb {
-  height: calc(74px * var(--tc-scale, 1));
-  border-radius: 8px;
-  background: linear-gradient(135deg, #3a5f3a, #6aa3ff);
-}
-#demo-proto-card .tc-title {
-  font-size: calc(15px * var(--tc-scale, 1));
-  font-weight: 600;
-}
-#demo-proto-card .tc-meta {
-  font-size: calc(12px * var(--tc-scale, 1));
-  opacity: 0.75;
-}
-#demo-proto-card .tc-badge {
-  align-self: flex-start;
-  padding: 3px 9px;
-  border-radius: 999px;
-  font-size: calc(11px * var(--tc-scale, 1));
-  font-weight: 600;
-  color: #10210f;
-  background: #7ed47e;
-}
-`;
+// The reading-pane backdrop the open_plan bracket opens. Byte-identical to
+// composePreviewMarkdown(trailheadProtoPreviewOverride(1)) so the reconciler's reading-pane writer and
+// renderPrototypePreview never disagree on round 1.
+const PROTO_PREVIEW_DOC = asciiFenceDoc(TRAIL_CARD_R1_ASCII);
 
 // The path -> document map consumed by state.ts / the mock read_plan_contents.
 export const MOCK_MARKDOWN: Record<string, string> = {
@@ -285,8 +262,9 @@ export const MOCK_MARKDOWN: Record<string, string> = {
   // The reviewed plan's file (its row is opened by the external-review flow).
   [`${PLANS}/review-pending.md`]: "# Plan under review\n\n- Step one\n- Step two\n\nReview this in the bar above.\n",
   // The ANIMATE prototype-review backdrop (opened by TRAILHEAD_BEAT's open_plan bracket). NOT a
-  // sidebar/list plan — markdown map only, so read_plan_contents serves it. The trail-card overlay
-  // (#demo-proto-card) floats over it; the doc is just a title.
+  // sidebar/list plan — markdown map only, so read_plan_contents serves it. The doc IS the inline
+  // trail-card prototype (an ASCII ``` fence), byte-identical to composePreviewMarkdown's round-1
+  // output so it never disagrees with renderPrototypePreview.
   [PROTO_PREVIEW_PATH]: PROTO_PREVIEW_DOC,
   // The REAL "Chompy Asteroids" nested tree — nine VERBATIM plan files (frontmatter intact; the
   // mock read_plan_contents strips it on read, mirroring the real backend). Keys match NESTED_PLANS.
