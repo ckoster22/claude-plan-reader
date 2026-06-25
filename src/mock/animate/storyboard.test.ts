@@ -55,6 +55,7 @@ import {
   EXEC_SHIFT,
   PROTO_ACT_SHIFT,
   CLARIFIER_SHIFT,
+  SIZER_SHIFT,
   PROTO_NARR_MS,
   PROTO_OPEN_MS,
   PROTO_CARD1_PULSE_FROM,
@@ -100,6 +101,8 @@ import {
   B2_ANSWER_MS,
   B3_LEAF_START_MS,
   B4_SIZER_MS,
+  B4_SIZER_LEAF_START_MS,
+  B4_SIZER_RESULT_MS,
   B4_OUTCOME_MS,
   EXEC_BASE_MS,
   // (c5) in-process "Request changes" review-bar constants.
@@ -453,56 +456,150 @@ describe("storyboard — P3 front (opening / clarify / scope×20 / plan-sizer)",
     for (const t of leafTools) expect(t.status).not.toBe("running");
   });
 
-  it("BEAT 4 — a plan-sizer Task is present, atomic, returning the master+3-subplans / 04→4-leaves split", () => {
-    const sizerUse = TRAILHEAD_BEAT.find((sf) => {
-      const f = sf.frame;
-      return (
-        f.t === "conv" &&
-        (f as { ev: { kind: string; id?: string } }).ev.kind === "tool_use" &&
-        (f as { ev: { id?: string } }).ev.id === "toolu_trailhead_plan_sizer"
-      );
+  // (c2 — review2) the plan-sizer is now a RUNNING SUBAGENT group (Task tool_use + subagent_started label
+  // + atomic leaf pairs + an in-group summary + a DEFERRED top-level Task tool_result carrying the SPLIT
+  // decision), mirroring the scope-recon / intent-clarifier groups — NOT a bare atomic pair. Every leaf is
+  // parented to PLAN_SIZER_ID and is ATOMIC (use+result share a tMs). The group's seqs are FRACTIONAL
+  // (56.x), strictly between the seq-56 Task tool_use and the seq-57 deferred result.
+  const PLAN_SIZER_ID = "toolu_trailhead_plan_sizer";
+
+  // Every leaf tool_use whose parent is the plan-sizer Task (excluding the Task itself).
+  function sizerLeafUses(): StoryFrame[] {
+    return TRAILHEAD_BEAT.filter((sf) => {
+      if (sf.frame.t !== "conv") return false;
+      const ev = (sf.frame as { ev: { kind: string; parent_tool_use_id: string | null; tool?: string } }).ev;
+      return ev.kind === "tool_use" && ev.parent_tool_use_id === PLAN_SIZER_ID && ev.tool !== "Task";
     });
-    const sizerResult = TRAILHEAD_BEAT.find((sf) => {
-      const f = sf.frame;
-      return (
-        f.t === "conv" &&
-        (f as { ev: { kind: string; tool_use_id?: string } }).ev.kind === "tool_result" &&
-        (f as { ev: { tool_use_id?: string } }).ev.tool_use_id === "toolu_trailhead_plan_sizer"
-      );
-    });
-    // FALSIFIABILITY: remove the plan-sizer pair and both finds go undefined → RED.
-    expect(sizerUse).toBeDefined();
-    expect(sizerResult).toBeDefined();
-    // Atomic: the use + result share a tMs (no lingering running leaf).
-    expect(sizerResult!.tMs).toBe(sizerUse!.tMs);
-    expect(sizerUse!.tMs).toBe(B4_SIZER_MS);
-    // It is a Task labeled plan-sizer; the result carries the SPLIT decision verbatim.
-    expect((sizerUse!.frame as { ev: { tool: string } }).ev.tool).toBe("Task");
-    expect((sizerUse!.frame as { ev: { input: { subagent_type: string } } }).ev.input.subagent_type).toBe(
-      "plan-sizer",
+  }
+
+  it("BEAT 4 — a labeled plan-sizer Task + subagent_started group with >=2 ATOMIC leaves runs the right-sizing gate", () => {
+    // (1) The top-level Task tool_use launching the plan-sizer subagent.
+    const sizerUse = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; id?: string } }).ev.kind === "tool_use" &&
+        (sf.frame as { ev: { id?: string } }).ev.id === PLAN_SIZER_ID &&
+        (sf.frame as { ev: { tool?: string } }).ev.tool === "Task",
     );
-    const resultText = (sizerResult!.frame as { ev: { content: string } }).ev.content;
-    expect(resultText).toMatch(/master \+ 3 subplans/i);
-    expect(resultText).toMatch(/04.*decomposed into 4 leaves/i);
+    // FALSIFIABILITY: remove the plan-sizer Task tool_use → undefined → RED.
+    expect(sizerUse, "plan-sizer Task tool_use").toBeDefined();
+    expect(sizerUse!.tMs).toBe(B4_SIZER_MS);
+    expect((sizerUse!.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id).toBeNull();
+    expect((sizerUse!.frame as { ev: { input: { subagent_type: string } } }).ev.input.subagent_type).toBe("plan-sizer");
+
+    // (2) The `subagent_started` LABEL frame keyed to the Task id (names the group → "plan-sizer").
+    // FALSIFIABILITY: drop the subagent_started frame → undefined → RED (and the group loses its label).
+    const started = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; tool_use_id?: string } }).ev.kind === "subagent_started" &&
+        (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === PLAN_SIZER_ID,
+    );
+    expect(started, "plan-sizer subagent_started label").toBeDefined();
+
+    // (3) >=2 leaf tool pairs, ALL parented to the Task, EACH atomic (use+result share a tMs). The leaves
+    // land AT/after the sizer leaf-start and BEFORE the deferred result.
+    // FALSIFIABILITY: move a leaf's result to a later tMs → the shared-tMs assert goes RED.
+    const leafUses = sizerLeafUses();
+    expect(leafUses.length, "plan-sizer leaf count").toBeGreaterThanOrEqual(2);
+    for (const useSf of leafUses) {
+      const useEv = (useSf.frame as { ev: { id: string } }).ev;
+      expect(useSf.tMs, "leaf at/after sizer leaf-start").toBeGreaterThanOrEqual(B4_SIZER_LEAF_START_MS);
+      expect(useSf.tMs, "leaf before the deferred result").toBeLessThan(B4_SIZER_RESULT_MS);
+      const resultSf = TRAILHEAD_BEAT.find(
+        (sf) =>
+          sf.frame.t === "conv" &&
+          (sf.frame as { ev: { kind: string; tool_use_id?: string } }).ev.kind === "tool_result" &&
+          (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === useEv.id,
+      );
+      expect(resultSf, `tool_result for sizer leaf ${useEv.id}`).toBeDefined();
+      expect(resultSf!.tMs, `atomic tMs for sizer leaf ${useEv.id}`).toBe(useSf.tMs);
+      expect(
+        (resultSf!.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id,
+        "leaf result parented to plan-sizer Task",
+      ).toBe(PLAN_SIZER_ID);
+    }
+    // The leaf MIX is realistic (Read the plan template + Glob/Grep to gauge the surface).
+    const tools = new Set(leafUses.map((sf) => (sf.frame as { ev: { tool: string } }).ev.tool));
+    expect(tools.has("Read"), "sizer reads the plan template").toBe(true);
+    expect(tools.has("Glob") || tools.has("Grep"), "sizer gauges surface via Glob/Grep").toBe(true);
+
     // A 'Plan sizer' chapter label opens the beat.
     const labels = TRAILHEAD_BEAT.map((sf) => sf.chapterLabel).filter(Boolean);
     expect(labels).toContain("Plan sizer");
-    // The plan-sizer Task node is NOT left running at duration (atomic pair flips it done).
+  });
+
+  it("BEAT 4 — the plan-sizer Task RESOLVES via a DEFERRED top-level result carrying the SPLIT decision (no stuck tool)", () => {
+    // The DEFERRED result: a top-level tool_result (parent null) whose tool_use_id = the sizer Task id.
+    const deferred = TRAILHEAD_BEAT.find(
+      (sf) =>
+        sf.frame.t === "conv" &&
+        (sf.frame as { ev: { kind: string; tool_use_id?: string; parent_tool_use_id: string | null } }).ev.kind === "tool_result" &&
+        (sf.frame as { ev: { tool_use_id?: string } }).ev.tool_use_id === PLAN_SIZER_ID &&
+        (sf.frame as { ev: { parent_tool_use_id: string | null } }).ev.parent_tool_use_id === null,
+    );
+    // FALSIFIABILITY: delete the deferred sizer Task tool_result → undefined here, AND the derived sizer
+    // Task node is left 'running' at duration (the assertion below + no-stuck invariant go RED).
+    expect(deferred, "deferred plan-sizer Task tool_result").toBeDefined();
+    expect(deferred!.tMs).toBe(B4_SIZER_RESULT_MS);
+    // It carries the SPLIT decision VERBATIM.
+    const resultText = (deferred!.frame as { ev: { content: string } }).ev.content;
+    expect(resultText).toMatch(/SPLIT/);
+    expect(resultText).toMatch(/master \+ 3 subplans/i);
+    expect(resultText).toMatch(/04.*decomposed into 4 leaves/i);
+
+    // The deferred result lands BEFORE the seq-58 outcome narration begins (no-stuck-tool: the Task never
+    // lingers "running" into the next beat). FALSIFIABILITY: push the deferred result to/after the outcome
+    // and this ordering goes RED (and a mid-T sample would show the Task stuck running).
+    expect(B4_SIZER_RESULT_MS).toBeLessThan(B4_OUTCOME_MS);
+
+    // Derived: at duration the sizer group exists, is LABELED, has >=2 child tools, NONE running, and the
+    // spanning Task itself is not running (the deferred result flipped it).
     const model = new ConversationModel();
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
+    const group = model.derive().nodes.find(
+      (n) => n.type === "subagent" && (n as { agentId: string }).agentId === PLAN_SIZER_ID,
+    ) as { children: Array<{ type: string; status?: string }>; subagentType: string | null } | undefined;
+    expect(group, "derived plan-sizer subagent group").toBeDefined();
+    expect(group!.subagentType).toBe("plan-sizer");
+    const childTools = group!.children.filter((c) => c.type === "tool");
+    expect(childTools.length, "plan-sizer child tools").toBeGreaterThanOrEqual(2);
+    for (const c of childTools) expect(c.status).not.toBe("running");
     const sizerNode = model
       .derive()
       .nodes.find((n) => n.type === "tool" && (n as { input?: { subagent_type?: string } }).input?.subagent_type === "plan-sizer") as
       | { status: string }
       | undefined;
-    expect(sizerNode).toBeDefined();
+    expect(sizerNode, "plan-sizer Task node").toBeDefined();
     expect(sizerNode!.status).not.toBe("running");
   });
 
-  it("BEAT 4 — the plan-sizer narration outcome lands AFTER scope-recon completes and BEFORE the prototype review", () => {
+  it("BEAT 4 — the sizer group's fractional leaf seqs are strictly ABOVE the clarifier seqs and strictly BELOW the terminal seq", () => {
+    // The new sizer leaves use fractional 56.x seqs — strictly between the clarifier group's 2.x seqs and
+    // the terminal seq. FALSIFIABILITY: renumber a sizer leaf to <=2.9 (a clarifier seq) or >=TERMINAL_SEQ
+    // and a bound below goes RED.
+    const sizerSeqs = TRAILHEAD_BEAT.filter((sf) => {
+      if (sf.frame.t !== "conv") return false;
+      const ev = (sf.frame as { ev: { parent_tool_use_id: string | null } }).ev;
+      return ev.parent_tool_use_id === PLAN_SIZER_ID;
+    }).map((sf) => (sf.frame as { ev: { seq: number } }).ev.seq);
+    expect(sizerSeqs.length).toBeGreaterThanOrEqual(5); // subagent_started + first-words + >=2 leaf pairs + summary
+
+    // The clarifier group's highest seq is its deferred result, 2.9. The sizer leaves must all exceed it.
+    const CLARIFIER_MAX_SEQ = 2.9;
+    for (const s of sizerSeqs) {
+      expect(s, "sizer seq strictly above clarifier seqs").toBeGreaterThan(CLARIFIER_MAX_SEQ);
+      expect(s, "sizer seq strictly below terminal seq").toBeLessThan(TERMINAL_SEQ);
+      // And strictly between the seq-56 Task tool_use and the seq-57 deferred result (fractional 56.x).
+      expect(s).toBeGreaterThan(56);
+      expect(s).toBeLessThan(57);
+    }
+  });
+
+  it("BEAT 4 — the plan-sizer group lands AFTER scope-recon completes and BEFORE the prototype review", () => {
     // The plan-sizer outcome (B4_OUTCOME_MS) is the last front beat before the (shifted) prototype review.
-    expect(B4_OUTCOME_MS).toBeLessThan(13000 + EXEC_SHIFT + CLARIFIER_SHIFT); // the prototype-review chapter's shifted open.
-    // And it follows the scope-recon Task's deferred result.
+    expect(B4_OUTCOME_MS).toBeLessThan(13000 + EXEC_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT); // the prototype-review chapter's shifted open.
+    // And the sizer launches after the scope-recon Task's deferred result.
     const taskResult = TRAILHEAD_BEAT.find(
       (sf) =>
         sf.frame.t === "conv" &&
@@ -821,7 +918,7 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
   // Nested-plan + comment chapters shift by + PROTO_ACT_SHIFT (the P4 prototype act lengthened the
   // upstream chapter) + CLARIFIER_SHIFT (the P4#2 intent-clarifier beat slid the whole back half later);
   // the literals are unchanged, the shift is added.
-  const NESTED_SHIFT = EXEC_SHIFT + PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+  const NESTED_SHIFT = EXEC_SHIFT + PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT;
   const PLAN_CHANGED_MS = 19800 + NESTED_SHIFT;
 
   it("(P1) sidebar is EMPTY ([]) before the reveal, then ONLY the master appears (NOT the whole tree); the full tree lands only at duration", () => {
@@ -874,7 +971,7 @@ describe("storyboard — TRAILHEAD_BEAT nested-plan reveal chapter", () => {
   it("FINISHED THOUGHT — working is non-null in the nested-plan gap but null at duration", () => {
     // Inside the "Nested plan" gap (after the plan_changed reveal, before the terminal result) — still
     // generating, so working is live.
-    applyUpToTime(model, TRAILHEAD_BEAT, 20000 + EXEC_SHIFT + PROTO_ACT_SHIFT + CLARIFIER_SHIFT);
+    applyUpToTime(model, TRAILHEAD_BEAT, 20000 + EXEC_SHIFT + PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT);
     expect(model.derive().working).not.toBeNull();
     // At duration the terminal result has landed → the turn is complete, working is null.
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
@@ -1101,7 +1198,7 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
   // (c4) + C4_SHIFT: the c4 ToC-navigation beat (which now plays BEFORE the comments) is longer than the
   // old generic slow-scroll beat it replaced, so the comment chapter slid later by C4_SHIFT (applied in
   // the DOWNSTREAM splice loop to every comment-chapter frame).
-  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT;
+  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT + C4_SHIFT;
   const C1_PAINT_MS = 59800 + CMT_SHIFT;
   const C2_PAINT_MS = 63800 + CMT_SHIFT;
   const C3_PAINT_MS = 67800 + CMT_SHIFT;
@@ -1222,7 +1319,7 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
 // below). Live tMs = the COMMENT_AND_V2 literal + CMT_SHIFT (= PROTO_ACT_SHIFT + CLARIFIER_SHIFT +
 // C4_SHIFT), exactly like the comment-chapter tests above.
 describe("storyboard — (c5) in-process Request-changes review bar", () => {
-  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT;
+  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT + C4_SHIFT;
   const GATE_ON_MS = REVIEW_GATE_ON_MS + CMT_SHIFT;
   const GATE_OFF_MS = REVIEW_GATE_OFF_MS + CMT_SHIFT;
   const SUBMIT_MOVE_MS = REVIEW_SUBMIT_MOVE_MS + CMT_SHIFT;
@@ -1417,9 +1514,10 @@ describe("storyboard — (P2) projectScroll purity + scrub-revert", () => {
 
 describe("storyboard — (c4) Contents-tab ToC navigation beat", () => {
   // The c4 frames live in DOWNSTREAM_HEAD (literal < the comment-chapter boundary), so the splice .map
-  // shifts them by + PROTO_ACT_SHIFT + CLARIFIER_SHIFT (NOT + C4_SHIFT — that extra is comment-chapter
-  // only). The switch constants are authored in that literal space, so the LIVE time adds the head shift.
-  const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+  // shifts them by + PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT (NOT + C4_SHIFT — that extra is
+  // comment-chapter only). The switch constants are authored in that literal space, so the LIVE time adds
+  // the head shift.
+  const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT;
   const CONTENTS_SWITCH_LIVE = C4_CONTENTS_TAB_SWITCH_MS + HEAD_SHIFT;
   const PLANS_SWITCH_LIVE = C4_PLANS_TAB_SWITCH_MS + HEAD_SHIFT;
 

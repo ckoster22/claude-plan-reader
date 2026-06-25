@@ -31,6 +31,7 @@ import {
   C4_SCROLL_UP_TO,
   PROTO_ACT_SHIFT,
   CLARIFIER_SHIFT,
+  SIZER_SHIFT,
 } from "./storyboard";
 import { extractToc } from "../../render/toc";
 import { buildToc } from "../../main";
@@ -906,7 +907,7 @@ describe("reconcile — (P6) whole-timeline forward-then-back == direct (overlay
 // ToC-entry beat and back to ~0 after the Context beat, with NO two scroll windows overlapping.
 describe("reconcile — (c4) Contents-tab ToC navigation", () => {
   // The c4 sidebar_tab/scroll frames live in DOWNSTREAM_HEAD (shifted by the head shift only).
-  const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+  const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT;
   const CONTENTS_SWITCH_LIVE = C4_CONTENTS_TAB_SWITCH_MS + HEAD_SHIFT;
   const PLANS_SWITCH_LIVE = C4_PLANS_TAB_SWITCH_MS + HEAD_SHIFT;
   const SCROLL_DOWN_TO_LIVE = C4_SCROLL_DOWN_TO + HEAD_SHIFT;

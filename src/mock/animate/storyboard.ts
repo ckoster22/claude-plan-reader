@@ -776,12 +776,31 @@ export const B3_SUMMARY_MS = 31000 + CLARIFIER_SHIFT; // the subagent's closing 
 export const B3_TASK_RESULT_MS = 31900 + CLARIFIER_SHIFT; // the Task's OWN deferred tool_result (flips it done)
 export const B3_WRAPUP_MS = 32800 + CLARIFIER_SHIFT; // the top-level wrap-up
 
-// Beat 4 — Plan-sizer (NEW): the right-sizing gate between scope-recon and the drafted plan:
+// Beat 4 — Plan-sizer (c2 — review2): the right-sizing gate between scope-recon and the drafted plan,
+// now shown as a RUNNING SUBAGENT (a small mirror of the scope-recon / intent-clarifier groups) instead
+// of a bare atomic tool_use/tool_result pair. The assistant launches a top-level `plan-sizer` Task,
+// streams a `subagent_started` label, runs a few atomic leaf tool pairs (Read the plan template,
+// Glob/Grep to gauge the surface size), notes a brief in-group summary, then its OWN DEFERRED Task
+// tool_result returns the SPLIT decision and flips the spanning Task done. The group's seqs are
+// FRACTIONAL (56.x — strictly between the seq-56 Task tool_use and the seq-57 deferred result) so NOTHING
+// downstream renumbers: the outcome narration stays seq 58 and EXEC_SEQ_BASE is untouched.
 export const B4_NARRATION_MS = 34200 + CLARIFIER_SHIFT; // short narration announcing the right-sizing gate
-export const B4_SIZER_MS = 35400 + CLARIFIER_SHIFT; // the plan-sizer Task tool_use + its atomic tool_result
-export const B4_SIZER_PULSE_FROM = 35600 + CLARIFIER_SHIFT; // brief pulse on the plan-sizer row …
+export const B4_SIZER_MS = 35400 + CLARIFIER_SHIFT; // seq 56 plan-sizer Task tool_use + seq 56.05 subagent_started
+export const B4_SIZER_FIRSTWORDS_MS = 35700 + CLARIFIER_SHIFT; // seq 56.1 the sizer's first words (inside the group)
+export const B4_SIZER_LEAF_START_MS = 36200 + CLARIFIER_SHIFT; // first sizer leaf pair tMs; each steps by B4_SIZER_LEAF_STEP_MS
+export const B4_SIZER_LEAF_STEP_MS = 450; // the inter-leaf gap (atomic pair shares one tMs)
+export const B4_SIZER_PULSE_FROM = 35600 + CLARIFIER_SHIFT; // brief pulse on the plan-sizer Task row (while it runs) …
 export const B4_SIZER_PULSE_TO = 37200 + CLARIFIER_SHIFT; //   … ~1.6s
-export const B4_OUTCOME_MS = 37600 + CLARIFIER_SHIFT; // narration of the split decision
+export const B4_SIZER_SUMMARY_MS = 37800 + CLARIFIER_SHIFT; // the sizer's closing in-group summary
+export const B4_SIZER_RESULT_MS = 38300 + CLARIFIER_SHIFT; // seq 57 the sizer Task's OWN DEFERRED tool_result (carries the SPLIT decision, flips it done)
+// SIZER_SHIFT (load-bearing, c2): widening the plan-sizer beat into a running subagent group (the leaf
+// pairs + summary + deferred result above) pushes its TAIL — the split-outcome narration (B4_OUTCOME_MS)
+// — later by this much. Everything downstream of the outcome (the prototype-review chapter PROTO_*, the
+// HEAD_SHIFT-spliced nested-plan/comment chapters, and the programmatic Execution chapter EXEC_BASE_MS)
+// slides later by exactly this much too. Like CLARIFIER_SHIFT it adds TIME only (the new group frames
+// carry FRACTIONAL 56.x seqs, so no seq renumbering). The pre-shift literal stays visible as docs.
+export const SIZER_SHIFT = 1100; // B4_OUTCOME_MS moves 37600 → 38700, after the deferred sizer result (38300).
+export const B4_OUTCOME_MS = 37600 + CLARIFIER_SHIFT + SIZER_SHIFT; // seq 58 narration of the split decision
 
 // EXEC_SHIFT / SEQ_SHIFT (load-bearing): the rewritten front (beats 1-4) is LONGER and uses MORE seqs
 // than the original. The downstream beats (prototype review … execution … terminal) are kept VERBATIM
@@ -824,7 +843,7 @@ export const COMMENT_ACT_SHIFT = 5000;
 // slow-scroll beat it replaced). The comment act's last model frame (the seq-64 system echo, literal
 // 69400) therefore lands at final 69400 + PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT = 85400.
 // EXEC_BASE_MS must stay strictly greater than that.
-export const EXEC_BASE_MS = 82000 + CLARIFIER_SHIFT; // Execution open_plan{null}; > the comment act's last frame (85400).
+export const EXEC_BASE_MS = 82000 + CLARIFIER_SHIFT + SIZER_SHIFT; // Execution open_plan{null}; > the comment act's last frame (shifted by SIZER_SHIFT too).
 export const EXEC_SEQ_BASE = 65; // first Execution model seq (= old 64 + 1, contiguous after the comment chapter).
 
 // ---- (c4) Contents-tab ToC navigation beat constants (tests pin to THESE) -----------------------
@@ -909,36 +928,38 @@ export const REVIEW_GATE_OFF_MS = 69300; // review_gate{off} — the gate resolv
 // ---- Named tMs constants for the P4 prototype ACT (tests pin to THESE, not magic numbers) -------
 // The prototype chapter narration (seq 59) lands at PROTO_NARR_MS; the act then plays out as a sequence
 // of dwells (pulses spanning tMs gaps) the player's hold-state covers. All overlay frames; no seqs.
-// (All PROTO_* add + CLARIFIER_SHIFT — the intent-clarifier beat slid the whole back half later; the
-// pre-clarifier literal stays visible as documentation, tests pin to the constants.)
-export const PROTO_NARR_MS = 39800 + CLARIFIER_SHIFT; // seq 59 "I put together a quick visual prototype…"
-export const PROTO_NARR_PULSE_FROM = 40700 + CLARIFIER_SHIFT; // pulse the narration bubble (by data-seq) …
-export const PROTO_NARR_PULSE_TO = 42700 + CLARIFIER_SHIFT; //   … ~2s pause (the viewer reads it)
-export const PROTO_OPEN_MS = 40600 + CLARIFIER_SHIFT; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → inline round-1 card shows
-export const PROTO_CARD1_PULSE_FROM = 42800 + CLARIFIER_SHIFT; // pulse #reading-pane (inline round-1 card) …
-export const PROTO_CARD1_PULSE_TO = 44800 + CLARIFIER_SHIFT; //   … ~2s
-export const PROTO_FEEDBACK_MOVE_MS = 44900 + CLARIFIER_SHIFT; // cursor → #prototype-feedback
-export const PROTO_FEEDBACK_TYPE_FROM = 45200 + CLARIFIER_SHIFT; // field_type #prototype-feedback begins …
-export const PROTO_FEEDBACK_TYPE_TO = 47700 + CLARIFIER_SHIFT; //   … typed over ~2.5s (also pulsed across this window)
-export const PROTO_SUBMIT_MOVE_MS = 47900 + CLARIFIER_SHIFT; // cursor → #review-submit
-export const PROTO_SUBMIT_CLICK_MS = 48200 + CLARIFIER_SHIFT; // cosmetic click on #review-submit ("Request changes")
-export const PROTO_ROUND2_MS = 48400 + CLARIFIER_SHIFT; // prototype_gate{on,round:2} → the inline card MORPHS with a difficulty badge
-export const PROTO_CARD2_PULSE_FROM = 48600 + CLARIFIER_SHIFT; // pulse #reading-pane (inline round-2 card) …
-export const PROTO_CARD2_PULSE_TO = 50600 + CLARIFIER_SHIFT; //   … ~2s pause
+// (All PROTO_* add + PROTO_BASE_SHIFT = CLARIFIER_SHIFT + SIZER_SHIFT — the intent-clarifier beat AND the
+// c2 plan-sizer running-group widening each slid the whole back half later; the pre-shift literal stays
+// visible as documentation, tests pin to the constants.)
+export const PROTO_BASE_SHIFT = CLARIFIER_SHIFT + SIZER_SHIFT; // the cumulative front-block widening above the prototype chapter
+export const PROTO_NARR_MS = 39800 + PROTO_BASE_SHIFT; // seq 59 "I put together a quick visual prototype…"
+export const PROTO_NARR_PULSE_FROM = 40700 + PROTO_BASE_SHIFT; // pulse the narration bubble (by data-seq) …
+export const PROTO_NARR_PULSE_TO = 42700 + PROTO_BASE_SHIFT; //   … ~2s pause (the viewer reads it)
+export const PROTO_OPEN_MS = 40600 + PROTO_BASE_SHIFT; // open_plan(PROTO_PREVIEW_PATH) + prototype_gate{on,round:1} → inline round-1 card shows
+export const PROTO_CARD1_PULSE_FROM = 42800 + PROTO_BASE_SHIFT; // pulse #reading-pane (inline round-1 card) …
+export const PROTO_CARD1_PULSE_TO = 44800 + PROTO_BASE_SHIFT; //   … ~2s
+export const PROTO_FEEDBACK_MOVE_MS = 44900 + PROTO_BASE_SHIFT; // cursor → #prototype-feedback
+export const PROTO_FEEDBACK_TYPE_FROM = 45200 + PROTO_BASE_SHIFT; // field_type #prototype-feedback begins …
+export const PROTO_FEEDBACK_TYPE_TO = 47700 + PROTO_BASE_SHIFT; //   … typed over ~2.5s (also pulsed across this window)
+export const PROTO_SUBMIT_MOVE_MS = 47900 + PROTO_BASE_SHIFT; // cursor → #review-submit
+export const PROTO_SUBMIT_CLICK_MS = 48200 + PROTO_BASE_SHIFT; // cosmetic click on #review-submit ("Request changes")
+export const PROTO_ROUND2_MS = 48400 + PROTO_BASE_SHIFT; // prototype_gate{on,round:2} → the inline card MORPHS with a difficulty badge
+export const PROTO_CARD2_PULSE_FROM = 48600 + PROTO_BASE_SHIFT; // pulse #reading-pane (inline round-2 card) …
+export const PROTO_CARD2_PULSE_TO = 50600 + PROTO_BASE_SHIFT; //   … ~2s pause
 // (P5 #10) PACING: before approving, make the review-bar buttons read clearly — pulse #review-approve,
 // re-anchor the cursor at the feedback field (a fresh origin — its prior waypoint is #review-submit from
 // the round-1 cosmetic click), then travel SLOWLY across the review bar to Approve so the move is
 // legible. The whole approve sequence still completes by the ORIGINAL PROTO_ACK_MS (52400 + SHIFT), so
 // PROTO_ACT_SHIFT is UNCHANGED and NO downstream chapter shifts (it fits the pre-existing slack).
-export const PROTO_APPROVE_PULSE_FROM = 50650 + CLARIFIER_SHIFT; // pulse #review-approve so the button reads clearly …
-export const PROTO_APPROVE_PULSE_TO = 51900 + CLARIFIER_SHIFT; //   … through the slow move, up to the click
-export const PROTO_APPROVE_ORIGIN_MS = 50650 + CLARIFIER_SHIFT; // cursor re-anchors at #prototype-feedback (fresh origin)
-export const PROTO_APPROVE_MOVE_MS = 50900 + CLARIFIER_SHIFT; // cursor travels SLOWLY to #review-approve …
+export const PROTO_APPROVE_PULSE_FROM = 50650 + PROTO_BASE_SHIFT; // pulse #review-approve so the button reads clearly …
+export const PROTO_APPROVE_PULSE_TO = 51900 + PROTO_BASE_SHIFT; //   … through the slow move, up to the click
+export const PROTO_APPROVE_ORIGIN_MS = 50650 + PROTO_BASE_SHIFT; // cursor re-anchors at #prototype-feedback (fresh origin)
+export const PROTO_APPROVE_MOVE_MS = 50900 + PROTO_BASE_SHIFT; // cursor travels SLOWLY to #review-approve …
 export const PROTO_APPROVE_MOVE_DUR = 750; //   … over ~0.75s (legible travel across the review bar). Arrives 51650 + SHIFT.
-export const PROTO_APPROVE_CLICK_MS = 51900 + CLARIFIER_SHIFT; // cosmetic click on #review-approve ("Approve visual") after the dwell
-export const PROTO_CLOSE_MS = 52050 + CLARIFIER_SHIFT; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
-export const PROTO_FEEDBACK_MS = 52200 + CLARIFIER_SHIFT; // seq 60 user feedback bubble + seq 61 approval echo (land together)
-export const PROTO_ACK_MS = 52400 + CLARIFIER_SHIFT; // seq 62 assistant ack (UNCHANGED — the approve act fits before it)
+export const PROTO_APPROVE_CLICK_MS = 51900 + PROTO_BASE_SHIFT; // cosmetic click on #review-approve ("Approve visual") after the dwell
+export const PROTO_CLOSE_MS = 52050 + PROTO_BASE_SHIFT; // prototype_gate{off} + open_plan{null} → card hides, tab flips back
+export const PROTO_FEEDBACK_MS = 52200 + PROTO_BASE_SHIFT; // seq 60 user feedback bubble + seq 61 approval echo (land together)
+export const PROTO_ACK_MS = 52400 + PROTO_BASE_SHIFT; // seq 62 assistant ack (UNCHANGED — the approve act fits before it)
 // (P5) The Execution chapter is now a SEQUENCE OF SUBAGENTS — one Task subagent per subplan, each with
 // 4–6 atomic leaf tool calls + a deferred top-level Task tool_result. The per-subplan Task ids and the
 // leaf-tool ids are generated by the EXEC_SUBPLANS builder below (no hand-authored WRITE_* ids).
@@ -2206,13 +2227,19 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
   },
 
   // ================================================================================================
-  // Chapter "Plan sizer" — Beat 4 (NEW): the right-sizing gate before the plan is drafted
+  // Chapter "Plan sizer" — Beat 4 (c2 — review2): the right-sizing gate, shown as a RUNNING SUBAGENT
   // ================================================================================================
   //
-  // Between scope-recon and the drafted plan the assistant runs a `plan-sizer` Task whose result returns
-  // the split decision ("master + 3 subplans; subplan 04 decomposed into 4 leaves"). The Task's tool_use
-  // and tool_result share a tMs (ATOMIC — no lingering running leaf, so the no-stuck-tool invariant
-  // holds). A brief pulse draws the eye to the plan-sizer row.
+  // Between scope-recon and the drafted plan the assistant launches a `plan-sizer` Task and the viewer
+  // sees it WORK — a `subagent_started` label, a first-words line, a few ATOMIC leaf tool pairs (Read the
+  // plan template, Glob/Grep to gauge the surface size), a brief in-group summary — then the Task's OWN
+  // DEFERRED top-level tool_result returns the SPLIT decision ("master + 3 subplans; subplan 04 decomposed
+  // into 4 leaves") and flips the spanning Task done. This MIRRORS the scope-recon / intent-clarifier
+  // groups (atomic leaf pairs sharing one tMs; a DEFERRED parent result; a subagent_started label) instead
+  // of the old bare atomic tool_use/tool_result pair. The group's seqs are FRACTIONAL (56.x — strictly
+  // between the seq-56 Task tool_use and the seq-57 deferred result), so NOTHING downstream renumbers (the
+  // outcome stays seq 58, EXEC_SEQ_BASE is untouched). The deferred result lands BEFORE the seq-58 outcome
+  // narration (no-stuck-tool: the Task never lingers "running" into the next beat).
   {
     // seq 55 — short narration announcing the right-sizing gate (streams via revealMs 900).
     tMs: B4_NARRATION_MS,
@@ -2229,8 +2256,8 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 56 — the plan-sizer Task tool_use (top-level). Its `input` describes the right-sizing decision.
-    // ATOMIC with its result (seq 57, SAME tMs) — the plan-sizer is a quick gate, not a spanning group.
+    // seq 56 — the plan-sizer Task tool_use (top-level). Its OWN result is DEFERRED to the group's end
+    // (seq 57), so the Task SPANS the whole sizer group (a spanning Task, not a bare atomic pair).
     tMs: B4_SIZER_MS,
     frame: {
       t: "conv",
@@ -2250,8 +2277,150 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // seq 57 — the plan-sizer's tool_result (ATOMIC with seq 56). Returns the SPLIT DECISION verbatim.
+    // seq 56.05 — a `subagent_started` frame LABELS the group (header → "plan-sizer"). Keyed by
+    // tool_use_id = PLAN_SIZER_ID. Produces NO timeline node; it seeds the group metadata.
     tMs: B4_SIZER_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.05,
+        kind: "subagent_started",
+        tool_use_id: PLAN_SIZER_ID,
+        subagent_type: "plan-sizer",
+        description: "Right-size the Trailhead plan",
+        prompt:
+          "Given the scope-recon report (navigation, eight screens, shared components, trail data), decide whether to draft a single plan or split into a master + subplans. Decompose any screen that is itself multi-part.",
+      },
+    },
+  },
+  {
+    // seq 56.1 — the sizer's first words (INSIDE the group, parent = PLAN_SIZER_ID).
+    tMs: B4_SIZER_FIRSTWORDS_MS,
+    frame: {
+      t: "conv",
+      revealMs: 700,
+      ev: {
+        seq: 56.1,
+        kind: "assistant_text",
+        text: "Measuring the surface against the plan template to decide split vs. single…",
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.2 — LEAF Read of the plan template (parent = PLAN_SIZER_ID). Atomic with its result (56.3).
+    tMs: B4_SIZER_LEAF_START_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.2,
+        kind: "tool_use",
+        id: "toolu_th_ps_1",
+        tool: "Read",
+        input: { file_path: "~/.claude/docs/PLAN_TEMPLATE.md" },
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.3 — Read result (SAME tMs = atomic; the leaf never lingers "running").
+    tMs: B4_SIZER_LEAF_START_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.3,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ps_1",
+        content:
+          "Plan template: one plan should fit ~5-7 phases. Beyond that, split into a master + interface-bounded subplans. Decompose any single phase that is itself multi-part.",
+        is_error: false,
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.4 — LEAF Glob to count the screens (parent = PLAN_SIZER_ID). Atomic with its result (56.5).
+    tMs: B4_SIZER_LEAF_START_MS + 1 * B4_SIZER_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.4,
+        kind: "tool_use",
+        id: "toolu_th_ps_2",
+        tool: "Glob",
+        input: { pattern: "src/screens/*.tsx" },
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.5 — Glob result (SAME tMs = atomic). Eight screens → the surface is too wide for one plan.
+    tMs: B4_SIZER_LEAF_START_MS + 1 * B4_SIZER_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.5,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ps_2",
+        content:
+          "src/screens/MapScreen.tsx\nsrc/screens/TrailListScreen.tsx\nsrc/screens/TrailDetailScreen.tsx\nsrc/screens/LogScreen.tsx\n…8 screens — wider than a single 5-7 phase plan.",
+        is_error: false,
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.6 — LEAF Grep gauging the trail-detail screen's internal parts (parent = PLAN_SIZER_ID).
+    // Atomic with its result (56.7). Confirms the detail screen is itself multi-part → decompose it.
+    tMs: B4_SIZER_LEAF_START_MS + 2 * B4_SIZER_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.6,
+        kind: "tool_use",
+        id: "toolu_th_ps_3",
+        tool: "Grep",
+        input: { pattern: "DifficultyBadge|ElevationSparkline|Reviews|Save", glob: "src/screens/TrailDetailScreen.tsx" },
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.7 — Grep result (SAME tMs = atomic). Four distinct parts → subplan 04 decomposes into 4 leaves.
+    tMs: B4_SIZER_LEAF_START_MS + 2 * B4_SIZER_LEAF_STEP_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.7,
+        kind: "tool_result",
+        tool_use_id: "toolu_th_ps_3",
+        content:
+          "TrailDetailScreen.tsx: DifficultyBadge, ElevationSparkline, Reviews, Save/Share — four distinct parts in one screen.",
+        is_error: false,
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 56.8 — the sizer's closing in-group summary (parent = PLAN_SIZER_ID).
+    tMs: B4_SIZER_SUMMARY_MS,
+    frame: {
+      t: "conv",
+      ev: {
+        seq: 56.8,
+        kind: "assistant_text",
+        text:
+          "Eight screens exceed one plan's budget, and the trail-detail screen is itself four parts. Recommending a master + 3 subplans, with subplan 04 decomposed into 4 leaves.",
+        parent_tool_use_id: PLAN_SIZER_ID,
+      },
+    },
+  },
+  {
+    // seq 57 — the plan-sizer Task's OWN DEFERRED tool_result. Top-level (parent null), tool_use_id =
+    // PLAN_SIZER_ID → flips the spanning Task running→done (without it the Task row stays "running"
+    // forever — the recursive no-stuck-tool invariant fails). Carries the SPLIT decision VERBATIM and
+    // lands BEFORE the seq-58 outcome narration (tMs + seq), so it never lingers into the next beat.
+    tMs: B4_SIZER_RESULT_MS,
     frame: {
       t: "conv",
       ev: {
@@ -2266,7 +2435,8 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     },
   },
   {
-    // OVERLAY — a brief pulse on the plan-sizer Task row (by its data-seq) so the gate reads as deliberate.
+    // OVERLAY — a brief pulse on the plan-sizer Task row (by its data-seq) so the running gate reads as
+    // deliberate. The pulse window sits WHILE the sizer runs (between its launch and its summary).
     tMs: B4_SIZER_PULSE_FROM,
     frame: {
       t: "pulse",
@@ -3402,12 +3572,13 @@ function shiftStoryFrame(sf: StoryFrame, delta: number): StoryFrame {
 // FINAL tMs/seq — pushed verbatim, no shift). chapterLabels preserved; monotonic tMs preserved (the
 // comment chapter's last frame stays strictly below EXEC_BASE_MS).
 // The nested-plan + master-open + c4 ToC-navigation beat: shifted by the BASE head shift only
-// (PROTO_ACT_SHIFT + CLARIFIER_SHIFT). The c4 scroll/pulse inner windows pick up this base shift here
-// (their CONSTANTS are deliberately NOT bumped, to avoid double-shifting).
-const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+// (PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT). The c4 scroll/pulse inner windows pick up this base
+// shift here (their CONSTANTS are deliberately NOT bumped, to avoid double-shifting).
+const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT;
 for (const sf of DOWNSTREAM_AFTER_PROTOTYPE) {
-  // + CLARIFIER_SHIFT on top of PROTO_ACT_SHIFT: the intent-clarifier running beat (B1B_*) inserted in
-  // the front slides this whole block (nested-plan … c4 nav) later by CLARIFIER_SHIFT too.
+  // + CLARIFIER_SHIFT + SIZER_SHIFT on top of PROTO_ACT_SHIFT: the intent-clarifier running beat (B1B_*)
+  // AND the c2 plan-sizer running-group widening inserted in the front slide this whole block (nested-plan
+  // … c4 nav) later by CLARIFIER_SHIFT + SIZER_SHIFT too.
   TRAILHEAD_BEAT.push(shiftStoryFrame(sf, HEAD_SHIFT));
 }
 // (c4) The comment-and-iterate chapter: shifted by the head shift PLUS an extra + C4_SHIFT (the c4
