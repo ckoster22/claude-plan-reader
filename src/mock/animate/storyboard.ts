@@ -3376,13 +3376,19 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
 // wrap-up + the terminal `result` (strictly highest seq AND tMs).
 const EXEC_STEP_MS = 600; // inter-frame tMs step within the Execution chapter (atomic pairs share one tMs).
 
-function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminalMs: number } {
+function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminalMs: number; warpPointMs: number } {
   const frames: StoryFrame[] = [];
   let seq = EXEC_SEQ_BASE;
   let tMs = EXEC_BASE_MS;
   const step = () => {
     tMs += EXEC_STEP_MS;
   };
+
+  // (c6 — review2) The autoplay 4× WARP begins HERE: the tMs at which subplan 01 has FULLY played in
+  // detail — i.e. the boundary frame where the SECOND subplan's row appears. Captured from the builder's
+  // own output (NOT a literal) so any Execution re-time/re-count keeps the warp anchored to "just after
+  // subplan 01". The autoplay loop in index.ts speeds the advance 4× from here to TERMINAL_LAND_MS.
+  let warpPointMs = 0;
 
   // The cumulative set of revealed subplan nn_paths — GROWS one subplan at a time. Each subplan's
   // `reveals` are unioned in just before that subplan's row snapshot, so the snapshot is the tree-so-far.
@@ -3502,6 +3508,9 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
     // each subplan's turn (the progressive chapter is long; one "Execution" marker would be too sparse).
     for (const path of sp.reveals) revealed.add(path);
     step();
+    // The first subplan AFTER 01 — its row appearing marks the moment subplan 01 has fully played in
+    // detail. Anchor the autoplay warp here (see warpPointMs above). Captured once (first match).
+    if (warpPointMs === 0 && sp.id !== "01") warpPointMs = tMs;
     frames.push({ tMs, chapterLabel: `Subplan ${sp.id}`, frame: { t: "plan_changed", plans: treeThrough(revealed) } });
 
     // (b) The just-in-time PLANNING beat — narration + a spanning planning Task whose deferred result IS
@@ -3565,7 +3574,7 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
     },
   });
 
-  return { frames, terminalSeq, terminalMs };
+  return { frames, terminalSeq, terminalMs, warpPointMs };
 }
 
 const EXEC_BUILT = buildExecution();
@@ -3574,6 +3583,24 @@ const EXEC_BUILT = buildExecution();
 // Re-timing/re-counting the Execution chapter updates these automatically (one-line base change above).
 export const TERMINAL_SEQ = EXEC_BUILT.terminalSeq;
 export const TERMINAL_MS = EXEC_BUILT.terminalMs;
+
+// ---- (c6 — review2) Autoplay 4× time-warp window over the dragging Execution tail ----------------
+// review2 c6 (user comment at tMs≈93167, deep in EXECUTION): "at this point, animate at 4× speed." The
+// execution tail is ~half the demo and drags. We speed the AUTOPLAY ADVANCE 4× across [WARP_POINT_MS,
+// TERMINAL_LAND_MS) — an autoplay RATE change ONLY. Scrub/seek (tFromPointer), the progress fraction,
+// getDuration(), and every pure f(T) projection stay LINEAR in T (the review2 annotation timestamps are
+// T values; they must still resolve to the same frames). seekTo(T) sets T directly and is unaffected.
+//
+// BOTH bounds are DERIVED, never absolute literals, so a tMs re-time can't desync them:
+//   • WARP_POINT_MS = the builder-captured tMs where subplan 01 has fully played in detail (the second
+//     subplan's row appears). Begins the 4× tail right after the first fully-detailed subplan.
+//   • TERMINAL_LAND_MS = a fixed lead-in before the terminal "done"/result beat, so that beat plays back
+//     at 1× and LANDS. Derived from TERMINAL_MS minus a one-beat lead.
+export const WARP_POINT_MS = EXEC_BUILT.warpPointMs;
+// The terminal-landing lead: long enough that the final integration wrap-up + the "done" result beat play
+// at 1×. The wrap-up narration and the terminal result are the last two emitted frames (each +EXEC_STEP_MS
+// apart); land a couple of beats before TERMINAL_MS so the close reads at normal speed.
+export const TERMINAL_LAND_MS = TERMINAL_MS - 4 * EXEC_STEP_MS;
 
 // Shift a StoryFrame by `delta` ms. The outer `tMs` ALWAYS shifts; for OVERLAY frames carrying their
 // OWN time windows (pulse / field_type / scroll have fromMs+toMs) the INNER window shifts in lockstep

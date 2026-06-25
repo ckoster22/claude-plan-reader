@@ -51,6 +51,8 @@ import {
   applyUpToTime,
   storyDurationMs,
   TRAILHEAD_BEAT,
+  WARP_POINT_MS,
+  TERMINAL_LAND_MS,
   type StoryFrame,
 } from "./storyboard";
 import { createReconciler } from "./reconcile";
@@ -405,10 +407,19 @@ function planDirOf(path: string): string {
 
 // ---- playback timing -------------------------------------------------------------------------
 
-// The wall-clock tick interval; T advances by `TICK_MS × SPEED` each tick.
+// The wall-clock tick interval; T advances by `TICK_MS × tickRate(T, speed)` each tick.
 const TICK_MS = 50;
 // The cycle of playback speeds the speed control rotates through.
 const SPEEDS = [0.5, 1, 2, 4, 8] as const;
+
+// (c6 — review2) The AUTOPLAY advance rate at a given T. PIECEWISE: inside the Execution warp window
+// [WARP_POINT_MS, TERMINAL_LAND_MS) the demo plays the dragging subplan tail at 4× the UI speed; outside
+// it (the detailed front half AND the terminal "done" beat) it plays at 1× the UI speed so those land.
+// This affects the AUTOPLAY ADVANCE ONLY — it composes with (multiplies) the UI `speed()` selector and
+// touches NOTHING about the T→frame mapping. tFromPointer (scrub/seek), the progress fraction, getDuration,
+// and every pure f(T) projection stay LINEAR in T. Pure + exported so it is unit-testable without a RAF loop.
+export const tickRate = (t: number, speed: number): number =>
+  (t >= WARP_POINT_MS && t < TERMINAL_LAND_MS ? 4 * speed : speed);
 
 // ---- player ----------------------------------------------------------------------------------
 
@@ -964,7 +975,9 @@ function mountPlayer(): void {
   };
 
   const tick = (): void => {
-    T += TICK_MS * speed();
+    // (c6) Piecewise autoplay rate: 4× through the Execution tail, 1× elsewhere (incl. the terminal beat),
+    // composed with the UI speed control. AUTOPLAY ADVANCE ONLY — seek/scrub/progress/f(T) stay linear in T.
+    T += TICK_MS * tickRate(T, speed());
     if (T >= duration) {
       T = duration;
       paint();
