@@ -68,6 +68,8 @@ import {
   PROTO_ACK_MS,
   // (P5 #1/#3/#10) pacing/cursor-travel constants — the field→button moves + dwell pulses.
   B1_REQUEST_DWELL_MS,
+  B1_REQUEST_DWELL_PULSE_FROM,
+  B1_REQUEST_DWELL_PULSE_TO,
   B1_START_MOVE_MS,
   B1_START_MOVE_DUR,
   B1_START_PULSE_FROM,
@@ -2347,16 +2349,44 @@ describe("storyboard — (P5) pacing & cursor TRAVEL at the three submit moments
     expect(reAnchor, "fresh #composer-request origin waypoint at B1_REQUEST_DWELL_MS").toBeDefined();
   });
 
+  it("#1 New-Plan submit (review2 c1): a TEXTBOX dwell pulse marks #composer-request as the travel origin", () => {
+    // The reviewer could not tell the move started in the textbox. A pulse on #composer-request during the
+    // dwell establishes the origin BEFORE the cursor departs. FALSIFIABILITY: drop this frame or retarget
+    // it off #composer-request → this assertion goes RED.
+    expectDwellPulse("#composer-request", B1_REQUEST_DWELL_PULSE_FROM, B1_REQUEST_DWELL_PULSE_TO);
+    // The textbox pulse precedes the start move (origin established, THEN travel).
+    expect(B1_REQUEST_DWELL_PULSE_FROM).toBeLessThan(B1_START_MOVE_MS);
+  });
+
   it("#1 New-Plan submit: the cursor TRAVELS #composer-request → #composer-start (slow, legible)", () => {
-    // The slow move is deliberately legible: not a near-instant jump.
+    // The slow move is deliberately legible: not a near-instant jump. FALSIFIABILITY: set B1_START_MOVE_DUR
+    // to 0 (instant jump) → projectCursorState short-circuits t01 to 1 → expectMidTravel's
+    // toBeLessThan(1) / toBeGreaterThan(0) goes RED.
     expect(B1_START_MOVE_DUR).toBeGreaterThanOrEqual(700);
     expectMidTravel(B1_START_MOVE_MS, B1_START_MOVE_DUR, "#composer-request", "#composer-start");
   });
 
-  it("#1 New-Plan submit: a dwell pulse marks #composer-start before the cosmetic click", () => {
+  it("#1 New-Plan submit (review2 c1): the commented frame 8508 falls DURING the travel (cursor mid-flight)", () => {
+    // The whole point of the re-time: at the reviewer's tMs≈8508 the cursor must be MID-TRAVEL from the
+    // textbox to the Start button — NOT rested. FALSIFIABILITY: if the move window no longer straddles 8508
+    // (e.g. it ends before, as it did originally), t01 leaves (0,1) and/or the segment rests → RED.
+    const COMMENT_T = 8508;
+    expect(B1_START_MOVE_MS).toBeLessThan(COMMENT_T); // travel has begun by 8508
+    expect(B1_START_MOVE_MS + B1_START_MOVE_DUR).toBeGreaterThan(COMMENT_T); // …and not yet finished
+    const c = projectCursorState(TRAILHEAD_BEAT, COMMENT_T);
+    expect(c, "cursor state at the commented frame 8508").not.toBeNull();
+    expect(c!.fromTarget, "fromTarget at 8508").toBe("#composer-request");
+    expect(c!.toTarget, "toTarget at 8508").toBe("#composer-start");
+    expect(c!.t01, "t01 at 8508 (strictly in-flight)").toBeGreaterThan(0);
+    expect(c!.t01, "t01 at 8508 (strictly in-flight)").toBeLessThan(1);
+  });
+
+  it("#1 New-Plan submit: a dwell pulse marks #composer-start across the arrival + cosmetic click", () => {
     expectDwellPulse("#composer-start", B1_START_PULSE_FROM, B1_START_PULSE_TO);
-    // The click lands AT/after the dwell ends (the viewer reads the button first).
-    expect(B1_START_CLICK_MS).toBeGreaterThanOrEqual(B1_START_PULSE_TO - 1);
+    // The pulse opens WHILE the cursor is still approaching (so the button is lit as it lands) and stays
+    // active THROUGH the cosmetic click — the click lands inside the pulse window, not after it.
+    expect(B1_START_PULSE_FROM).toBeLessThan(B1_START_MOVE_MS + B1_START_MOVE_DUR); // opens mid-travel
+    expect(projectPulseSet(TRAILHEAD_BEAT, B1_START_CLICK_MS).has("#composer-start"), "pulse lit at the click").toBe(true);
   });
 
   it("#3 Clarify submit: a fresh [data-other=text] origin waypoint precedes the submit move", () => {

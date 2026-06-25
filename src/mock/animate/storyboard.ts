@@ -705,21 +705,29 @@ export const B1_COMPOSER_PULSE_TO = 3700; //   … for ~2s (a real dwell: the vi
 export const B1_REQUEST_MOVE_MS = 3700; // cursor travels to #composer-request
 export const B1_REQUEST_TYPE_FROM = 4300; // field_type #composer-request begins …
 export const B1_REQUEST_TYPE_TO = 6800; //   … typed over ~2.5s
-// (P5 #1) PACING: right after typing ends the cursor re-anchors AT the request field (a fresh origin
-// waypoint), THEN travels SLOWLY to #composer-start so the viewer can follow the field→button move (no
-// jump). A dwell + pulse on Start lets the moment read before the cosmetic click. The whole tail still
-// completes before B1B_LEAD_MS (11000), so NO downstream shift is needed (it fits the pre-existing slack).
+// (P5 #1 / review2 c1) PACING: the reviewer at tMs≈8508 could not SEE the textbox→Start move — it
+// completed ~600ms earlier and there was no textbox dwell to establish the origin, so the cursor read as
+// "already rested on the button". The beat is now re-centered ON the commented frame:
+//   1. right after typing ends the cursor RE-ANCHORS at the request field (fresh origin waypoint) and a
+//      pulse on #composer-request marks "the cursor is IN the textbox" during a real dwell;
+//   2. it then travels SLOWLY to #composer-start over ~1.1s, and the travel WINDOW STRADDLES 8508 so a
+//      viewer scrubbing there sees the cursor mid-flight (t01 ≈ 0.55), not a rested cursor;
+//   3. an arrival pulse + cosmetic click land just after, before the close.
+// The whole tail still completes before B1B_LEAD_MS (11000), so NO downstream beat shift is needed (it
+// fits the pre-existing slack — the reply at B1_REPLY_MS + 900 reveal ends at 10900 < 11000).
 export const B1_REQUEST_DWELL_MS = 6850; // cursor re-anchors at #composer-request (fresh origin for the slow travel)
-export const B1_START_MOVE_MS = 7150; // cursor travels SLOWLY to #composer-start …
-export const B1_START_MOVE_DUR = 750; //   … over ~0.75s (legible travel, not a jump). Arrives 7900.
-export const B1_START_PULSE_FROM = 7900; // pulse #composer-start once the cursor arrives …
-export const B1_START_PULSE_TO = 8450; //   … ~0.55s dwell so the viewer reads the moment before the click
-export const B1_START_CLICK_MS = 8450; // cosmetic click on #composer-start (after the dwell)
-export const B1_COMPOSER_CLOSE_MS = 8650; // overlay_modal{composer,off} — modal closes (NOT via real start())
-export const B1_USER_MSG_MS = 8850; // seq 1 user_message (the request) appears as a chat bubble
-export const B1_USER_PULSE_FROM = 8950; // pulse the user bubble …
-export const B1_USER_PULSE_TO = 9700; //   … for ~0.75s
-export const B1_REPLY_MS = 9800; // seq 2 assistant reply begins streaming (reveal 900 → ends 10700 < B1B_LEAD_MS)
+export const B1_REQUEST_DWELL_PULSE_FROM = 6900; // pulse #composer-request during the dwell …
+export const B1_REQUEST_DWELL_PULSE_TO = 7900; //   … ~1s so the viewer registers "the cursor is in the textbox"
+export const B1_START_MOVE_MS = 7900; // cursor begins the SLOW travel to #composer-start …
+export const B1_START_MOVE_DUR = 1100; //   … over ~1.1s (legible travel). Travels 7900→9000, STRADDLING 8508.
+export const B1_START_PULSE_FROM = 8500; // pulse #composer-start while the cursor is still approaching …
+export const B1_START_PULSE_TO = 9200; //   … so the button reads clearly as the travel finishes + click
+export const B1_START_CLICK_MS = 9000; // cosmetic click on #composer-start (on arrival, ~end of the travel)
+export const B1_COMPOSER_CLOSE_MS = 9150; // overlay_modal{composer,off} — modal closes (NOT via real start())
+export const B1_USER_MSG_MS = 9300; // seq 1 user_message (the request) appears as a chat bubble
+export const B1_USER_PULSE_FROM = 9350; // pulse the user bubble …
+export const B1_USER_PULSE_TO = 9900; //   … for ~0.55s
+export const B1_REPLY_MS = 10000; // seq 2 assistant reply begins streaming (reveal 900 → ends 10900 < B1B_LEAD_MS)
 
 // Beat 1.5 — Intent-clarifier running beat (P4, #2): BEFORE the clarify question card appears, the
 // intent-clarifier agent is shown RUNNING with realistic streaming tool calls (a small mirror of the
@@ -1094,14 +1102,27 @@ export const TRAILHEAD_BEAT: StoryFrame[] = [
     frame: { t: "cursor_move", target: "#composer-request", moveMs: 200 },
   },
   {
-    // OVERLAY (P5 #1) — the cursor travels SLOWLY (B1_START_MOVE_DUR ~0.75s) from #composer-request to the
-    // Start button, so the viewer can FOLLOW the move instead of seeing it jump.
+    // OVERLAY (review2 c1) — pulse #composer-request DURING the dwell so the viewer registers the cursor is
+    // IN THE TEXTBOX (the origin of the travel below). This is what was missing: the field→button move now
+    // departs from a clearly-established origin instead of reading as "already on the button".
+    tMs: B1_REQUEST_DWELL_PULSE_FROM,
+    frame: {
+      t: "pulse",
+      target: "#composer-request",
+      fromMs: B1_REQUEST_DWELL_PULSE_FROM,
+      toMs: B1_REQUEST_DWELL_PULSE_TO,
+    },
+  },
+  {
+    // OVERLAY (P5 #1 / review2 c1) — the cursor travels SLOWLY (B1_START_MOVE_DUR ~1.1s) from
+    // #composer-request to the Start button. The move WINDOW (7900→9000) STRADDLES the commented frame
+    // 8508, so a viewer scrubbing there sees the cursor mid-flight (t01 ≈ 0.55), not a rested cursor.
     tMs: B1_START_MOVE_MS,
     frame: { t: "cursor_move", target: "#composer-start", moveMs: B1_START_MOVE_DUR },
   },
   {
-    // OVERLAY (P5 #1) — pulse #composer-start once the cursor arrives: a DWELL (the tMs gap to the click)
-    // so the viewer reads the button before the cosmetic press.
+    // OVERLAY (P5 #1) — pulse #composer-start while the cursor is still APPROACHING (from 8500, mid-travel)
+    // so the button reads clearly the moment the cursor lands and through the cosmetic press.
     tMs: B1_START_PULSE_FROM,
     frame: { t: "pulse", target: "#composer-start", fromMs: B1_START_PULSE_FROM, toMs: B1_START_PULSE_TO },
   },
