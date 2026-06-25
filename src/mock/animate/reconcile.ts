@@ -199,7 +199,13 @@ export function createReconciler(
   // tracks the growing comment set). null ⇒ never applied.
   let lastReviewGateKey: string | null = null;
 
-  function reconcileReadingPane(surface: SurfaceState): void {
+  // (c4/scroll determinism) `T` is threaded in so the async reading-pane chain can RE-ASSERT the
+  // projected scroll AFTER its render+applyComments+settle+rebuildToc complete (each of which resets the
+  // container's scrollTop to 0). On a FRESH seekSettled(T) there is no subsequent tick to self-heal the
+  // synchronous reconcileScroll(T) that ran BEFORE the async chain finished, so a scrolled beat would
+  // otherwise land at scrollTop 0. Re-asserting in the chain tail makes the scroll a pure fn of T even on
+  // a single settled seek (the sync pass still covers the unchanged-key / no-render path).
+  function reconcileReadingPane(surface: SurfaceState, T: number): void {
     const key = `${surface.openPlanPath ?? " null"}|${commentsKey(surface.comments)}`;
     if (key === lastReadingKey) return;
     lastReadingKey = key;
@@ -240,6 +246,12 @@ export function createReconciler(
       // extractToc→buildToc is the SAME data flow production uses (the sidebar never queries #reading-pane
       // itself). A backward scrub re-renders the projected markdown, so the ToC re-derives from scratch.
       if (gen === openEpoch) seams.rebuildToc?.(seams.readingPane);
+      // (c4/scroll determinism) RE-ASSERT the projected scroll for THIS scrub T, now that the pane is
+      // fully rendered+settled+ToC-built+highlighted (all of which reset scrollTop to 0). This is what
+      // makes a FRESH seekSettled(T) to a scrolled beat land at the scrolled position (the synchronous
+      // reconcileScroll(T) in the main pass ran BEFORE this async chain finished, so its write was wiped).
+      // Guarded on the epoch so a superseded render's late scroll can't clobber the newest pane.
+      if (gen === openEpoch) applyScroll(T);
       // Only the LATEST chain clears the barrier (a stale chain returned above without touching it).
       if (gen === openEpoch) inFlightSettle = null;
     })();
@@ -457,10 +469,18 @@ export function createReconciler(
   // projectScroll returns null (no active scroll window at T) we do NOT touch scrollTop — the pane is
   // left wherever it is (so a non-scroll chapter is unaffected). Resolving fraction→pixels (against the
   // live scrollHeight/clientHeight) is the player's job; the reconciler passes the pure {target, frac}.
-  function reconcileScroll(T: number): void {
+  // Shared scroll application: project the scroll at T and drive the seam. Called BOTH from the
+  // synchronous reconcile pass (reconcileScroll, every tick, no memo) AND from the async reading-pane
+  // chain tail (so a fresh settled seek re-asserts the position after the render+settle+ToC+highlights
+  // reset scrollTop). Identical logic in both paths so the deterministic-scroll contract holds regardless
+  // of whether a render ran this seek. null (no active window) ⇒ the player leaves scrollTop untouched.
+  function applyScroll(T: number): void {
     if (!seams.setScroll) return;
-    const scroll = projectScroll(story, T);
-    seams.setScroll(scroll);
+    seams.setScroll(projectScroll(story, T));
+  }
+
+  function reconcileScroll(T: number): void {
+    applyScroll(T);
   }
 
   function reconcile(T: number): void {
@@ -474,7 +494,7 @@ export function createReconciler(
     // ---- surfaces: project the FULL state at T, drive only the changed seams ----
     const surface = projectSurfaceState(story, T);
     const prev = lastSurface;
-    reconcileReadingPane(surface);
+    reconcileReadingPane(surface, T);
     // Scroll runs EVERY tick immediately AFTER the reading-pane rebuild (no memo) so a set_comments
     // rebuild's scrollTop reset self-heals within one tick (see reconcileScroll).
     reconcileScroll(T);

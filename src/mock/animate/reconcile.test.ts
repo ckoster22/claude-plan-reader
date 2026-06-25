@@ -773,8 +773,9 @@ describe("reconcile — (P2) setScroll seam: lerped frac, #reader-scroll target,
   it("runs EVERY tick (no memo) so a set_comments reading-pane rebuild's scroll reset self-heals", async () => {
     // A scroll window that stays active ACROSS a set_comments frame (which triggers a reading-pane rebuild
     // — renderInto resets the container scrollTop to 0). setScroll must fire on EVERY tick (not memoized)
-    // so the projected frac is re-asserted after the rebuild within the same/next tick. We assert setScroll
-    // is called on each tick with the (changing) projected frac — including the tick carrying the rebuild.
+    // so the projected frac is re-asserted after the rebuild. With the determinism fix, a tick that runs a
+    // render ALSO re-asserts the scroll in the ASYNC chain tail (after render+settle), so the LAST call
+    // after each settled tick carries the projected frac.
     const story: StoryFrame[] = [
       { tMs: 0, frame: { t: "open_plan", path: PLAN_A } },
       { tMs: 0, frame: { t: "scroll", target: "#reader-scroll", fromFrac: 0, toFrac: 1, fromMs: 0, toMs: 1000 } },
@@ -784,24 +785,37 @@ describe("reconcile — (P2) setScroll seam: lerped frac, #reader-scroll target,
     const { seams } = makeSeams();
     const r = createReconciler(seams, story);
 
+    const scrollFn = seams.setScroll as ReturnType<typeof vi.fn>;
+    const last = (): unknown => scrollFn.mock.calls[scrollFn.mock.calls.length - 1]?.[0];
+
     r.reconcile(0); // open + scroll frac 0
     await flush();
-    r.reconcile(500); // the set_comments rebuild tick — scroll frac 0.5 re-asserted
-    await flush();
-    r.reconcile(600); // next tick — scroll frac 0.6 re-asserted (proves no memo: a changed AND unchanged
-    r.reconcile(600); //   re-tick at the SAME T still re-drives every tick (no change-memo skip).
-    await flush();
+    // After the settled open at T=0 the LAST setScroll re-asserts frac 0 (the async tail re-asserts).
+    expect(last()).toEqual({ target: "#reader-scroll", frac: 0 });
+    const afterOpen = scrollFn.mock.calls.length;
 
-    const calls = (seams.setScroll as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
-    // One setScroll call PER reconcile tick (4 ticks above) — proves it is NOT memoized (a memoized pass
-    // would skip the duplicate T=600 tick). FALSIFIABILITY: add a changed-value memo to reconcileScroll
-    // and the duplicate-T tick would be skipped → this length check goes RED.
-    expect(calls.length).toBe(4);
-    // The tick carrying the set_comments rebuild (T=500) re-asserted the projected frac (0.5) — the
-    // self-heal. FALSIFIABILITY: move reconcileScroll BEFORE reconcileReadingPane (or memoize it) and the
-    // post-rebuild frac would not be re-driven on that tick.
-    expect(calls[1]).toEqual({ target: "#reader-scroll", frac: 0.5 });
-    expect(calls[3]).toEqual({ target: "#reader-scroll", frac: 0.6 });
+    r.reconcile(500); // the set_comments rebuild tick — scroll frac 0.5 re-asserted after the rebuild
+    await flush();
+    // The LAST call after the settled rebuild tick carries the projected frac 0.5 — the self-heal: the
+    // render reset scrollTop, then the async tail re-asserted. FALSIFIABILITY: drop the async-tail
+    // applyScroll re-assert and the rebuild leaves the LAST call as the PRE-render sync 0.5 only IF the
+    // render didn't run — but the render DID run, so without the re-assert the deterministic landing is
+    // lost (the live CDP gap). The sync-pass 0.5 still records, but the async self-heal is what the live
+    // layer needs; here we pin that the LAST call is the projected frac.
+    expect(last()).toEqual({ target: "#reader-scroll", frac: 0.5 });
+
+    const beforeT600 = scrollFn.mock.calls.length;
+    r.reconcile(600); // next tick — no render (unchanged key) → only the SYNC pass fires; frac 0.6.
+    r.reconcile(600); //   re-tick at the SAME T still re-drives (no change-memo skip).
+    await flush();
+    // The duplicate T=600 ticks (no render) each fire the SYNC reconcileScroll → proves no memo (a memoized
+    // pass would skip the second). Both land frac 0.6.
+    expect(last()).toEqual({ target: "#reader-scroll", frac: 0.6 });
+    // No-memo proof: the two no-render T=600 ticks added EXACTLY 2 sync setScroll calls (no async tail ran,
+    // since the reading key was unchanged). A changed-value memo would add ≤1. FALSIFIABILITY: add a memo
+    // to reconcileScroll and this delta drops to 1 → RED.
+    expect(scrollFn.mock.calls.length - beforeT600).toBe(2);
+    void afterOpen;
   });
 
   it("setScroll runs AFTER reconcileReadingPane in the pass order (synchronous empty-pane rebuild)", () => {
@@ -1018,5 +1032,94 @@ describe("reconcile — (c4) Contents-tab ToC navigation", () => {
     // The default "plans" is re-asserted (projectSidebarTab is a pure last-≤-T re-derivation).
     expect(projectSidebarTab(TRAILHEAD_BEAT, 0)).toBe("plans");
     expect(lastCall(seams, "setSidebarTab")![0]).toBe("plans");
+  });
+
+  // ---- LIVE-PATH determinism: reconcileScroll applied to a REAL #reader-scroll after a settled render ----
+  //
+  // The unit tests above pin projectScroll in ISOLATION. The LIVE bug (found via CDP) was that on a FRESH
+  // seekSettled(T), the reading-pane render (read→renderInto→applyComments→settle→rebuildToc) resets
+  // scrollTop to 0 AFTER the synchronous reconcileScroll(T) ran — and with no subsequent tick to self-heal,
+  // a scrolled beat landed at 0. This test exercises the FULL reconcile path with a REAL #reader-scroll +
+  // the player's actual frac→pixels setScroll, asserting that AFTER a settled seek (await settleBarrier)
+  // scrollTop > 0 at the down beat and ~0 at the Context beat.
+  //
+  // jsdom computes no layout, so we stub a scroll RANGE on #reader-scroll (scrollHeight/clientHeight) and a
+  // real scrollTop accessor. The render seam resets scrollTop to 0 (mirroring the real renderInto wiping +
+  // re-laying-out the pane). FALSIFIABILITY (verified): remove the async-tail applyScroll re-assert and the
+  // down-beat assertion goes RED (scrollTop stays 0 — the render reset it after the sync setScroll ran).
+  it("LIVE PATH: a fresh settled seek lands #reader-scroll.scrollTop > 0 at the down beat, ~0 at the Context beat", async () => {
+    // The c4 scroll frames live in DOWNSTREAM_HEAD → shifted by the full head shift (incl. SIZER_SHIFT).
+    const HEAD_SHIFT2 = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + SIZER_SHIFT;
+    const DOWN_BEAT_T = C4_SCROLL_DOWN_TO + HEAD_SHIFT2 - 1; // frac ~1 (scrolled all the way down)
+    const CONTEXT_BEAT_T = C4_SCROLL_UP_TO + HEAD_SHIFT2 - 1; // frac ~0 (back at the top)
+    const PRE_SCROLL_T = 0; // before any scroll window → scrollTop untouched (starts 0)
+
+    // A real #reader-scroll with a stubbed 500px scroll range (scrollHeight 800, clientHeight 300).
+    const reader = document.createElement("div");
+    reader.id = "reader-scroll";
+    document.body.appendChild(reader);
+    let scrollTop = 0;
+    Object.defineProperty(reader, "scrollHeight", { configurable: true, get: () => 800 });
+    Object.defineProperty(reader, "clientHeight", { configurable: true, get: () => 300 });
+    Object.defineProperty(reader, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+
+    // The player's ACTUAL setScroll logic (frac→pixels against the live range); null ⇒ untouched.
+    const realSetScroll = (state: { target: string; frac: number } | null): void => {
+      if (state === null) return;
+      const container = document.querySelector(state.target) as HTMLElement | null;
+      if (!container) return;
+      const range = container.scrollHeight - container.clientHeight;
+      if (range <= 0) return;
+      const next = Math.round(state.frac * range);
+      if (Math.abs(container.scrollTop - next) > 0.5) container.scrollTop = next;
+    };
+
+    const { seams } = makeSeams({
+      readPlan: vi.fn(async () => TRAILHEAD_MASTER_DOC),
+      // The render RESETS scrollTop to 0 (mirroring the real renderInto wiping + re-laying-out the pane).
+      renderInto: vi.fn((p: HTMLElement) => {
+        p.innerHTML = '<h1 data-source-line="0">Master</h1>';
+        scrollTop = 0;
+      }),
+      // settle + rebuildToc also touch the pane; keep them resetting scrollTop to harden the test.
+      settle: vi.fn(async () => {
+        scrollTop = 0;
+      }),
+      rebuildToc: vi.fn(() => {
+        scrollTop = 0;
+      }),
+      setScroll: realSetScroll,
+    });
+    const r = createReconciler(seams, TRAILHEAD_BEAT);
+
+    // Fresh settled seek to the DOWN beat: scrollTop must end > 0 (scrolled down) AFTER the render+settle.
+    r.reconcile(DOWN_BEAT_T);
+    await r.settleBarrier();
+    await flush();
+    expect(scrollTop, "down beat scrollTop > 0 (scrolled down)").toBeGreaterThan(0);
+
+    // Fresh settled seek to the CONTEXT beat: scrollTop must end ~0 (back at the top).
+    r.reconcile(CONTEXT_BEAT_T);
+    await r.settleBarrier();
+    await flush();
+    expect(scrollTop, "Context beat scrollTop ~0 (back at top)").toBeLessThanOrEqual(2);
+
+    // Backward scrub to a pre-scroll T: no scroll window → scrollTop untouched (stays at the Context ~0).
+    r.reconcile(PRE_SCROLL_T);
+    await r.settleBarrier();
+    await flush();
+    expect(scrollTop, "pre-scroll T leaves scrollTop ~0").toBeLessThanOrEqual(2);
+
+    // And a backward scrub from the Context beat back to the DOWN beat re-lands scrollTop > 0 (revert both ways).
+    r.reconcile(DOWN_BEAT_T);
+    await r.settleBarrier();
+    await flush();
+    expect(scrollTop, "backward scrub to the down beat re-scrolls down").toBeGreaterThan(0);
   });
 });
