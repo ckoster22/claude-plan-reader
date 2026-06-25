@@ -590,7 +590,12 @@ function renderQuotaBanner(node: QuotaBannerNode, handlers?: RenderHandlers): HT
     // (armed below) keeps it current. NO Resume button — resuming before refresh is impossible.
     const countdown = document.createElement("div");
     countdown.className = "conv-qb-countdown";
-    countdown.textContent = formatCountdown(node.resetAt - Date.now());
+    // DEMO-ONLY seam (mock-animate scrubbable countdown): when a frozen remaining-ms is supplied the
+    // countdown is a pure function of demo scrub-time T — render it STATIC and arm NO live interval /
+    // visibilitychange handler. Production never sets frozenRemainingMs, so the wall-clock path below
+    // is provably unchanged.
+    const frozen = node.frozenRemainingMs;
+    countdown.textContent = formatCountdown(frozen !== undefined ? frozen : node.resetAt - Date.now());
     banner.appendChild(countdown);
 
     const refreshAt = document.createElement("div");
@@ -620,18 +625,22 @@ function renderQuotaBanner(node: QuotaBannerNode, handlers?: RenderHandlers): HT
 
     // ---- Arm the SINGLE wall-clock countdown interval + visibilitychange recompute. ----
     // (renderTree already cleared any prior interval before calling us, so this is the only live one.)
-    const tick = (): void => {
-      // Recompute TRUE remaining each tick from wall-clock — never decrement a stored counter (so an
-      // occluded/suspended WebView shows the correct value the instant it wakes).
-      countdown.textContent = formatCountdown(node.resetAt - Date.now());
-    };
-    countdownTimer = setInterval(tick, 1000);
-    countdownVisHandler = () => {
-      // On un-occlusion the displayed value may be stale (the interval was throttled/suspended) —
-      // recompute immediately so it corrects without waiting for the next tick.
-      if (!document.hidden) tick();
-    };
-    document.addEventListener("visibilitychange", countdownVisHandler);
+    // DEMO-ONLY seam: a frozen countdown is static (a pure f(T)) — arm NOTHING. Production omits
+    // frozenRemainingMs, so this guard is a no-op there and the live wall-clock behavior is unchanged.
+    if (frozen === undefined) {
+      const tick = (): void => {
+        // Recompute TRUE remaining each tick from wall-clock — never decrement a stored counter (so an
+        // occluded/suspended WebView shows the correct value the instant it wakes).
+        countdown.textContent = formatCountdown(node.resetAt - Date.now());
+      };
+      countdownTimer = setInterval(tick, 1000);
+      countdownVisHandler = () => {
+        // On un-occlusion the displayed value may be stale (the interval was throttled/suspended) —
+        // recompute immediately so it corrects without waiting for the next tick.
+        if (!document.hidden) tick();
+      };
+      document.addEventListener("visibilitychange", countdownVisHandler);
+    }
   } else {
     // EXHAUSTED: the once-per-session auto-resume budget is spent — no countdown, no auto-resume.
     banner.classList.add("conv-quota-banner-exhausted");

@@ -4377,3 +4377,96 @@ pane BEHIND the floating trail-card overlay (`#demo-proto-card`). The mock-anima
 stays coherent with the title-only backdrop the storyboard opens. The override is applied by spreading a
 fresh gate object; the default round-1/no-override path preserves the `MOCK_PROTOTYPE_GATE` REFERENCE
 identity so existing `toBe(MOCK_PROTOTYPE_GATE)` tests stay green.
+
+## Mock-animate review2 fidelity pass (dev-only — additive to the two sections above)
+
+A second fidelity pass over the same scrubbable `mock-animate` Trailhead beat made the demo more
+app-faithful (inline prototype, real ToC, in-process review bar) and better paced. Everything below is
+still dev-only (`MOCK_ANIMATE=1`), a pure function of the scrub time `T` (autoplay rate excepted — see
+the time-warp note), and ships in no distributable. This is a **sibling** of the two sections above —
+none of the three edits the others. The total beat duration grew to ~161 s (`TERMINAL_MS`, the terminal
+`result` frame's `tMs`, is still **computed** from `buildExecution()`, not a literal).
+
+### `sidebar_tab` OverlayFrame + the real ToC in the demo (`storyboard.ts`, `index.ts`)
+
+A new `OverlayFrame` variant alongside `cursor_move` / `pulse` / `field_type` / `overlay_modal` / `scroll`:
+
+```ts
+{ t: "sidebar_tab"; tab: "plans" | "contents" }
+```
+
+It drives the SIDEBAR Plans/Contents tab (distinct from the structural READER Plan/Conversation
+`activeTab`). `projectSidebarTab(story, T)` is last-≤-T with a default of `"plans"`; the `setSidebarTab`
+reconciler seam clicks the real `.tab-row:not(.reader-tab-row) .tab[data-tab=…]` so main.ts's `initTabs`
+switching logic runs (toggles `.active` on `#tab-plans` / `#tab-contents`), with a direct-class-toggle
+fallback for a boot-order race. The c4 navigation choreography is: Contents-tab click → a low ToC entry
+(scroll down) → the "Context" entry (scroll to top) → Plans tab → comment.
+
+`#toc-list` is now POPULATED in the demo (previously empty) via the `rebuildToc` reconciler seam
+(`index.ts`), which reuses the REAL production data flow `extractToc(#reading-pane)` → `buildToc(#toc-list, …)`
+— the one sanctioned render→sidebar path (the sidebar never queries `#reading-pane` itself). `rebuildToc`
+is also a typed optional seam on the reconciler (`reconcile.ts`); it is re-driven by the async
+reading-pane chain under the same `openEpoch` guard so a superseded render never clobbers a newer pane's
+ToC.
+
+### `review_gate` SurfaceFrame — the in-process `#review-bar` (`storyboard.ts`, `orchestrator.ts`, `main.ts`)
+
+A new `SurfaceFrame` variant (applied to the host seams, never to the conversation model):
+
+```ts
+{ t: "review_gate"; on: boolean; planPath: string | null }
+```
+
+When ON with a `planPath`, main.ts's `#review-bar` shows in VIEWING / IN-PROCESS mode (Submit relabeled
+"Request changes") for that plan; Submit is DISABLED at 0 comments and ENABLED once the open plan's
+projected comment count is ≥1 (the bar derives this from the same `set_comments` projection). `off` ⇒ the
+gate clears and the bar reverts. `projectSurfaceState` projects it last-≤-T; the reconciler's
+`emitReviewGate(planPath, count)` seam (1) calls the mock-only `__setOpenPathForMock(planPath)`, (2) sets
+the mock comment count, (3) fans `emitApprovalGate(planPath)` (mock orchestrator, **onSnapshot only** — NOT
+onAwaitingApproval, whose production hook re-opens the plan and would wipe the freshly-applied comment
+highlights), then (4) re-reads the count through the REAL `refreshCommentCount`. `clearReviewGate` calls
+`clearApprovalGate`. Faithful ordering: comments land first → bar appears (Submit disabled at 0) → enabled
+as comments grow → cursor → click `#review-submit`.
+
+**`__setOpenPathForMock(path)` (mock-only hook in `main.ts`).** The player renders the reading pane
+DIRECTLY (`readPlan → renderInto → applyComments`) and NEVER calls `openPlan`, so main.ts's `openPath`
+stays null/stale. `viewingGate()` compares `gate.planPath === openPath`, so without alignment the held gate
+reads as a review of a DIFFERENT plan → SUMMARY mode ("N plans awaiting review" + external "Submit
+feedback"), not the in-process "Request changes" VIEWING bar. `__setOpenPathForMock` sets `openPath`
+WITHOUT re-rendering, so `viewingGate()` matches and the comment highlights survive. Production never calls
+it (production sets `openPath` through `openPlan`); `path: null` clears it.
+
+### Inline prototype rendering replaces the floating card (`fixtures/markdown.ts`, `main.ts`)
+
+The mock-only floating `#demo-proto-card` overlay is DELETED ("this wouldn't appear in the app"). The
+prototype now renders INLINE in `#reading-pane` via the REAL `renderPrototypePreview` /
+`composePreviewMarkdown` path with the `.review-bar.proto` bar mode — the same inline-preview flow the
+production app uses. Determinism: two writers can touch `#reading-pane` on a given tick — (a) the
+reconciler's reading-pane pass (opens `PROTO_PREVIEW_PATH` → renders `PROTO_PREVIEW_DOC`) and (b)
+`renderPrototypePreview` (renders `composePreviewMarkdown(gate)`). To make the visible result independent
+of which writer wins, `PROTO_PREVIEW_DOC` is **byte-identical** to `composePreviewMarkdown` of the round-1
+override (an ASCII trail-card fence), so the two-writer race settles to the same content. No mermaid in the
+proto chapter.
+
+### `tickRate` autoplay time-warp (`index.ts`, `storyboard.ts`)
+
+A pure `tickRate(T, speed)` helper in the player: autoplay advances at 4× within
+`[WARP_POINT_MS, TERMINAL_LAND_MS)` (the dragging-subplan execution tail) and 1× outside, composed with the
+UI speed control. Both bounds are DERIVED from the execution constants (`WARP_POINT_MS = EXEC_BUILT.warpPointMs`;
+`TERMINAL_LAND_MS = TERMINAL_MS - 4 × EXEC_STEP_MS`), not literals. The warp is **autoplay-advance ONLY**:
+`tick()` advances `T += TICK_MS × tickRate(T, speed())`, while `seekTo` / `tFromPointer` (scrub/seek), the
+`T/duration` transport fill, `getDuration`, and every `f(T)` projection stay LINEAR in T — a scrub to any
+beat lands identically regardless of how autoplay paced its way there.
+
+### Shared `applyScroll(T)` determinism — sync pass + async render-chain tail (`reconcile.ts`)
+
+The projected scroll (`projectScroll(story, T)` → the `setScroll` seam) is now driven through a single
+shared `applyScroll(T)` helper called from BOTH paths: the synchronous `reconcileScroll(T)` (every tick,
+no change-memo, immediately after the reading-pane rebuild — so a `set_comments`-triggered rebuild's
+`scrollTop`-reset self-heals within one tick) AND the async reading-pane chain tail
+(`renderInto → applyComments → settle → rebuildToc`, each of which resets `scrollTop` to 0), the latter
+guarded on `openEpoch` so a superseded render's late scroll can't clobber the newest pane. On a FRESH
+`seekSettled(T)` to a scrolled beat there is no subsequent tick to self-heal the synchronous write that ran
+BEFORE the async chain finished, so re-asserting in the chain tail makes the scroll a pure f(T) even on a
+fresh settled seek. Identical logic in both paths — `null` (no active scroll window at T) ⇒ the player
+leaves `scrollTop` untouched.

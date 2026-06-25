@@ -170,6 +170,10 @@ export interface QuotaBannerNode {
   resetAt: number;
   remaining: number;
   source: string;
+  // DEMO-ONLY override (mock-animate scrubbable countdown): when present the WAITING banner renders
+  // this static remaining-ms instead of arming a live wall-clock countdown, so the value is a pure
+  // function of scrub-time T. Production NEVER sets it — the live wall-clock path is unchanged.
+  frozenRemainingMs?: number;
 }
 
 // A subagent group: an accent-bordered container keyed by agent_id, holding nested nodes.
@@ -304,6 +308,9 @@ export type ModelEvent =
       resetAt: number;
       remaining: number;
       source: string;
+      // DEMO-ONLY (mock-animate): a static remaining-ms override carried onto the derived node. See
+      // QuotaBannerNode.frozenRemainingMs. Production never sets it.
+      frozenRemainingMs?: number;
     };
 
 // The pure model. Accumulates raw events; derives the tree on demand.
@@ -413,6 +420,9 @@ export class ConversationModel {
     resetAt: number;
     remaining: number;
     source: string;
+    // DEMO-ONLY (mock-animate): static remaining-ms override; production omits it. See
+    // QuotaBannerNode.frozenRemainingMs.
+    frozenRemainingMs?: number;
   }): void {
     if (this.quotaBanner) {
       // Update the existing singleton in place — no new event, no duplicate node.
@@ -420,6 +430,7 @@ export class ConversationModel {
       this.quotaBanner.resetAt = info.resetAt;
       this.quotaBanner.remaining = info.remaining;
       this.quotaBanner.source = info.source;
+      this.quotaBanner.frozenRemainingMs = info.frozenRemainingMs;
       return;
     }
     const ev: Extract<ModelEvent, { __event: "quota_banner" }> = {
@@ -429,6 +440,9 @@ export class ConversationModel {
       resetAt: info.resetAt,
       remaining: info.remaining,
       source: info.source,
+      ...(info.frozenRemainingMs !== undefined
+        ? { frozenRemainingMs: info.frozenRemainingMs }
+        : {}),
     };
     this.quotaBanner = ev;
     this.events.push(ev);
@@ -442,6 +456,8 @@ export class ConversationModel {
     resetAt: number;
     remaining: number;
     source: string;
+    // DEMO-ONLY (mock-animate): static remaining-ms override; production omits it. Forwarded as-is.
+    frozenRemainingMs?: number;
   }): void {
     this.appendQuotaBanner(info);
   }
@@ -725,6 +741,8 @@ export class ConversationModel {
               resetAt: ev.resetAt,
               remaining: ev.remaining,
               source: ev.source,
+              // DEMO-ONLY (mock-animate) static-countdown override; undefined in production.
+              frozenRemainingMs: ev.frozenRemainingMs,
             },
             parent: null,
           });

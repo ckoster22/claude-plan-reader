@@ -175,6 +175,76 @@ describe("quota banner — wall-clock countdown", () => {
   });
 });
 
+describe("quota banner — frozen countdown (DEMO-ONLY mock-animate seam)", () => {
+  it("renders the STATIC frozenRemainingMs (== formatCountdown), independent of Date.now()", () => {
+    vi.useFakeTimers();
+    // Set wall-clock to an arbitrary time whose resetAt - now would yield a DIFFERENT value, to prove
+    // the frozen value (not the wall clock) drives the display.
+    const start = 1_700_000_000_000;
+    vi.setSystemTime(start);
+
+    const m = new ConversationModel();
+    m.appendQuotaBanner({
+      state: "waiting",
+      resetAt: start + 99_000, // wall-clock path would show 00:01:39 — must NOT appear
+      remaining: 1,
+      source: "retry-after",
+      frozenRemainingMs: 11_040_000, // 3h 04m 00s
+    });
+    render(m);
+
+    const countdown = host.querySelector(".conv-qb-countdown")!;
+    expect(countdown.textContent).toBe(formatCountdown(11_040_000));
+    expect(countdown.textContent).toBe("03:04:00");
+  });
+
+  it("arms NO live interval — advancing fake timers does NOT change the displayed text", () => {
+    vi.useFakeTimers();
+    const setSpy = vi.spyOn(globalThis, "setInterval");
+    const start = 1_700_000_000_000;
+    vi.setSystemTime(start);
+
+    const m = new ConversationModel();
+    m.appendQuotaBanner({
+      state: "waiting",
+      resetAt: start + 3_600_000,
+      remaining: 1,
+      source: "retry-after",
+      frozenRemainingMs: 11_040_000,
+    });
+    render(m);
+
+    const countdown = host.querySelector(".conv-qb-countdown")!;
+    const before = countdown.textContent;
+    // No countdown interval was armed (the seam skips it entirely).
+    expect(setSpy).not.toHaveBeenCalled();
+    // Advance both the timers AND the wall clock — a frozen banner must be inert to both.
+    vi.setSystemTime(start + 5000);
+    vi.advanceTimersByTime(5000);
+    expect(countdown.textContent).toBe(before);
+    expect(countdown.textContent).toBe("03:04:00");
+  });
+
+  it("CONTROL: a waiting banner WITHOUT frozenRemainingMs still ticks over wall-clock time", () => {
+    vi.useFakeTimers();
+    const start = 1_700_000_000_000;
+    vi.setSystemTime(start);
+    const resetAt = start + 3_600_000;
+
+    const m = new ConversationModel();
+    m.appendQuotaBanner({ state: "waiting", resetAt, remaining: 1, source: "retry-after" });
+    render(m);
+
+    const countdown = host.querySelector(".conv-qb-countdown")!;
+    expect(countdown.textContent).toBe("01:00:00");
+
+    // Advance the wall clock and fire one tick → the live path updates the display.
+    vi.setSystemTime(start + 30 * 60_000 - 1000);
+    vi.advanceTimersByTime(1000);
+    expect(countdown.textContent).toBe("00:30:00");
+  });
+});
+
 describe("quota banner — single interval, no leak", () => {
   it("re-rendering does not accumulate intervals (one created per rebuild, prior cleared)", () => {
     vi.useFakeTimers();
