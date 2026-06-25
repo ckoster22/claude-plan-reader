@@ -38,6 +38,8 @@ import { setPlans, setPendingReviews } from "../state";
 import { emitMockEvent } from "../event";
 import { emitGate, clearGate, installMockOrchestrator } from "../orchestrator";
 import { applyComments, renderInto, settle } from "../../render";
+import { extractToc } from "../../render/toc";
+import { buildToc } from "../../main";
 import { trailheadProtoPreviewOverride } from "../fixtures/markdown";
 import {
   applyUpToTime,
@@ -762,6 +764,37 @@ function mountPlayer(): void {
     if (Math.abs(container.scrollTop - next) > 0.5) container.scrollTop = next;
   };
 
+  // (c4) Rebuild the sidebar Contents ToC from the CURRENTLY-rendered reading pane, reusing the REAL
+  // production data flow: extractToc (read-only over #reading-pane) → buildToc (writes #toc-list, wiring
+  // each row's click to scrollToHeading). This is the ONE sanctioned render→sidebar flow (the sidebar
+  // never queries #reading-pane itself). Resolves #toc-list against the LIVE DOM each call; no-op if the
+  // ToC list is absent (a stripped DOM). buildToc clears + repopulates, so an empty pane ⇒ an empty ToC.
+  const rebuildToc = (pane: HTMLElement): void => {
+    const tocList = document.getElementById("toc-list");
+    if (!tocList) return;
+    buildToc(tocList, extractToc(pane));
+  };
+
+  // (c4) Switch the SIDEBAR Plans/Contents tab by clicking the real `.tab-row .tab[data-tab=…]` so
+  // main.ts's initTabs switching logic runs (toggles `.active` on `#tab-plans` / `#tab-contents`). Falls
+  // back to toggling the `.active` classes directly the way initTabs does — robust to a boot-order race
+  // where the click listener isn't wired yet (mirrors clickTab's fallback for the reader tab). Scopes to
+  // the SIDEBAR `.tab-row` (the FIRST one — NOT `.reader-tab-row`) so it never grabs the reader tabs.
+  const setSidebarTab = (tab: "plans" | "contents"): void => {
+    const row = document.querySelector<HTMLElement>(".tab-row:not(.reader-tab-row)");
+    const tabBtn = row?.querySelector<HTMLElement>(`.tab[data-tab="${tab}"]`) ?? null;
+    if (tabBtn) tabBtn.click();
+    if (!tabBtn || !tabBtn.classList.contains("active")) {
+      if (row) {
+        for (const t of Array.from(row.querySelectorAll<HTMLElement>(".tab"))) {
+          t.classList.toggle("active", t.dataset.tab === tab);
+        }
+      }
+      document.getElementById("tab-plans")?.classList.toggle("active", tab === "plans");
+      document.getElementById("tab-contents")?.classList.toggle("active", tab === "contents");
+    }
+  };
+
   // ---- the reconciler: wired to the REAL host seams ----
   const reconciler = createReconciler(
     {
@@ -794,6 +827,8 @@ function mountPlayer(): void {
       applyComments,
       readingPane,
       planDirOf,
+      // (c4) Rebuild the Contents ToC from the rendered pane via the REAL extractToc→buildToc.
+      rebuildToc,
       // Sidebar: stash the full plan set + emit plan-changed so main.ts re-lists through its real handler.
       setPlans: (plans: PlanRecord[]): void => setPlans(plans),
       emitPlanChanged: (): void => emitMockEvent("plan-changed", { path: "/Users/mock/.claude/plans/unread-standalone.md" }),
@@ -819,6 +854,8 @@ function mountPlayer(): void {
       setActiveTab: (tab: "plan" | "conversation"): void => {
         clickTab(tab);
       },
+      // (c4) Sidebar tab: click the real sidebar Plans/Contents tab so initTabs switching runs.
+      setSidebarTab,
       // ---- overlay seams (cosmetic; reconciler-owned DOM) ----
       // Author mode routes through the suppression wrapper (cursor hard-hidden); default/replay uses
       // the raw seam.

@@ -117,7 +117,14 @@ export type OverlayFrame =
   // content div (`#reading-pane`/`.md` has no overflow — setting its scrollTop is a silent no-op).
   // Projected by projectScroll (last-active window, lerped) and reconciled by the setScroll seam,
   // which resolves the fraction to pixels (frac * (scrollHeight - clientHeight)) against the live DOM.
-  | { t: "scroll"; target: string; fromFrac: number; toFrac: number; fromMs: number; toMs: number };
+  | { t: "scroll"; target: string; fromFrac: number; toFrac: number; fromMs: number; toMs: number }
+  // (c4) The SIDEBAR tab (Plans / Contents) shown at this point. A real, deterministic surface (the
+  // c4 navigation choreography clicks the Contents tab to reveal the plan's ToC, then restores Plans
+  // before commenting). Projected by projectSidebarTab (last-≤-T, default "plans") and reconciled by
+  // the setSidebarTab seam, which clicks the real `.tab-row .tab[data-tab=…]` so main.ts's initTabs
+  // switching logic runs (toggles `.active` on `#tab-plans` / `#tab-contents`). Distinct from the
+  // READER tab (Plan / Conversation) `activeTab`, which is structural (open-plan ⇒ Plan).
+  | { t: "sidebar_tab"; tab: "plans" | "contents" };
 
 // The unified storyboard frame envelope.
 export type Frame = ModelFrame | SurfaceFrame | OverlayFrame;
@@ -140,6 +147,7 @@ const OVERLAY_KINDS = new Set<Frame["t"]>([
   "field_type",
   "overlay_modal",
   "scroll",
+  "sidebar_tab",
 ]);
 
 // Is this a SurfaceFrame (vs a ModelFrame)?
@@ -221,6 +229,7 @@ export function applyModelFrame(
     case "field_type":
     case "overlay_modal":
     case "scroll":
+    case "sidebar_tab":
       break;
     default: {
       // Exhaustiveness guard — a new Frame variant must add a case above.
@@ -500,6 +509,19 @@ export function projectScroll(story: ReadonlyArray<StoryFrame>, T: number): Scro
   return { target: active.target, frac };
 }
 
+// PURE: the SIDEBAR tab ("plans" | "contents") shown at T — the LAST `sidebar_tab` OverlayFrame whose
+// tMs <= T, defaulting to "plans" before any such frame (the app's default-active sidebar tab). Mirrors
+// the open_plan last-≤-T pattern, so a backward scrub reverts cleanly (a tab switched later is back on
+// the default at an earlier T). The reconciler drives setSidebarTab only on change.
+export function projectSidebarTab(story: ReadonlyArray<StoryFrame>, T: number): "plans" | "contents" {
+  let tab: "plans" | "contents" = "plans";
+  for (const sf of story) {
+    if (sf.tMs > T) continue;
+    if (sf.frame.t === "sidebar_tab") tab = sf.frame.tab;
+  }
+  return tab;
+}
+
 // ---- Model signature (memo key) ----------------------------------------------------------------
 
 // An INJECTIVE string over the applied MODEL-frame SET at T plus the in-progress reveal prefix. The
@@ -774,30 +796,70 @@ export const COMMENT_ACT_SHIFT = 5000;
 // is the Execution open_plan{null} tMs; EXEC_SEQ_BASE is the first Execution model seq (the exec-open
 // narration). The builder steps from there; TERMINAL_MS / TERMINAL_SEQ are COMPUTED from its output
 // (see after EXEC_FRAMES) so a re-time/re-count is a one-line base change, never a literal edit.
-// EXEC_BASE_MS bumped (P2): the comment chapter LENGTHENED — a slow-scroll beat (down then up, ~4s) now
-// plays before the comments AND comment c2 got its own full popover act. The DOWNSTREAM_AFTER_PROTOTYPE
-// literals from the scroll beat onward shifted by + SCROLL_BEAT_SHIFT, so the comment chapter's last
-// model frame (the seq-64 system echo, literal 58400 + SCROLL_BEAT_SHIFT) lands at final
-// 58400 + SCROLL_BEAT_SHIFT + PROTO_ACT_SHIFT. EXEC_BASE_MS must stay strictly greater than that.
-export const EXEC_BASE_MS = 80000 + CLARIFIER_SHIFT; // Execution open_plan{null}; > the comment act's last frame (79000 + CLARIFIER_SHIFT).
+// (c4) The comment-and-iterate chapter (COMMENT_AND_V2) is pushed by PROTO_ACT_SHIFT + CLARIFIER_SHIFT +
+// C4_SHIFT (the c4 ToC-navigation beat now plays BEFORE the comments and is longer than the old generic
+// slow-scroll beat it replaced). The comment act's last model frame (the seq-64 system echo, literal
+// 69400) therefore lands at final 69400 + PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT = 85400.
+// EXEC_BASE_MS must stay strictly greater than that.
+export const EXEC_BASE_MS = 82000 + CLARIFIER_SHIFT; // Execution open_plan{null}; > the comment act's last frame (85400).
 export const EXEC_SEQ_BASE = 65; // first Execution model seq (= old 64 + 1, contiguous after the comment chapter).
 
-// ---- (P2) Scroll beat + c2-act constants (tests pin to THESE) -----------------------------------
+// ---- (c4) Contents-tab ToC navigation beat constants (tests pin to THESE) -----------------------
 //
-// SCROLL_BEAT_SHIFT (load-bearing, P2): a slow-scroll-down-then-up beat over the master-plan pane was
-// inserted AFTER the master opens (DOWNSTREAM literal 47000) and BEFORE the first comment act, and c2
-// gained a full popover act. Both add TIME (overlay frames carry no seq). Every DOWNSTREAM literal from
-// the scroll beat onward (the whole comment chapter + V2 open + the seq-64 echo) is written at its
-// post-shift value DIRECTLY in the array below; SCROLL_BEAT_SHIFT names the amount the comment chapter
-// moved later (vs the pre-P2 literals) so the tMs-pinned tests express the relationship.
-export const SCROLL_BEAT_SHIFT = 7600; // comment chapter slid later by this much (vs pre-P2 literals).
-// The slow-scroll window over #reader-scroll (the .reader scroll container). Two scroll frames:
-// down (0→1) over [SCROLL_DOWN_FROM, SCROLL_DOWN_TO), then up (1→0) over [SCROLL_UP_FROM, SCROLL_UP_TO).
+// (c4 — review2) BEFORE the user comments, the demo NAVIGATES the plan's table of contents: it clicks
+// the SIDEBAR "Contents" tab (revealing the ToC built from the open master), clicks a LOW ToC entry so
+// the reading pane scrolls way down, then clicks the "Context" ToC entry so it scrolls back to the top
+// — only THEN does the commenting begin. This REPLACES the old generic slow-scroll beat (the demo now
+// scrolls by DRIVING the real ToC entries the cursor visibly clicks, not an anonymous scroll sweep).
+//
+// The scroll itself is still the PURE `scroll` primitive (projectScroll, lerped, scrub-revertable) over
+// #reader-scroll, so it is deterministic and reverts on a back-scrub; the cursor merely TARGETS the
+// real `.toc-item` elements for legibility. Two scroll windows (down 0→1 then up 1→0) drive the pane;
+// they MUST NOT overlap (projectScroll is last-window-wins — an overlap would silently mask the earlier
+// window). All literals below are in DOWNSTREAM_HEAD space (the master opens at literal 47000); the
+// .map splice adds + PROTO_ACT_SHIFT + CLARIFIER_SHIFT, exactly like the rest of the head.
+//
+// C4_SHIFT (load-bearing): the c4 navigation beat is LONGER than the old slow-scroll beat it replaces,
+// so the whole comment-and-iterate chapter (COMMENT_AND_V2, authored at its original literals) is pushed
+// later by + C4_SHIFT (applied programmatically in the splice loop, NOT hand-edited literals). The
+// tMs-pinned comment tests add C4_SHIFT to their expected paint times.
 export const SCROLL_TARGET = "#reader-scroll";
-export const SCROLL_DOWN_FROM = 50800; // begin scrolling the master pane DOWN …
-export const SCROLL_DOWN_TO = 53000; //   … reaching the bottom over ~2.2s
-export const SCROLL_UP_FROM = 53400; // dwell ~0.4s at the bottom, then scroll back UP …
-export const SCROLL_UP_TO = 55600; //   … reaching the top over ~2.2s
+export const C4_SHIFT = 2000; // the comment chapter slid later by this much (the c4 beat is longer than the old scroll beat).
+
+// The cursor travels to the Contents tab, a cosmetic click lands, and the sidebar switches to Contents
+// (the real initTabs switch, via the setSidebarTab seam) so the ToC — built from the open master — shows.
+export const C4_CONTENTS_TAB_MOVE_MS = 48000; // cursor → the sidebar "Contents" tab
+export const C4_CONTENTS_TAB_CLICK_MS = 48700; // cosmetic click on the Contents tab
+export const C4_CONTENTS_TAB_SWITCH_MS = 48700; // sidebar_tab → "contents" (lands WITH the click so the ToC reveals)
+export const C4_CONTENTS_TAB_PULSE_FROM = 48200; // pulse the Contents tab as the cursor arrives …
+export const C4_CONTENTS_TAB_PULSE_TO = 49400; //   … through the click
+// The cursor travels to a LOW ToC entry (the master's last heading, "Decomposition" = data-line 6) and
+// clicks it; the reading pane SCROLLS DOWN (0→1) so the viewer sees the bottom of the plan.
+export const C4_TOC_DOWN_MOVE_MS = 49800; // cursor → the low ToC entry (.toc-item[data-line="6"])
+export const C4_TOC_DOWN_CLICK_MS = 50500; // cosmetic click on the low ToC entry
+export const C4_SCROLL_DOWN_FROM = 50500; // begin scrolling the master pane DOWN (paired with the click) …
+export const C4_SCROLL_DOWN_TO = 52900; //   … reaching the bottom over ~2.4s
+export const C4_TOC_DOWN_PULSE_FROM = 50000; // pulse the low ToC entry as the cursor arrives …
+export const C4_TOC_DOWN_PULSE_TO = 51200; //   … through the click
+// After a brief dwell at the bottom, the cursor travels to the "Context" ToC entry (data-line 2) and
+// clicks it; the reading pane SCROLLS BACK UP (1→0) to the top — only THEN does commenting begin.
+export const C4_TOC_CONTEXT_MOVE_MS = 53300; // cursor → the "Context" ToC entry (.toc-item[data-line="2"])
+export const C4_TOC_CONTEXT_CLICK_MS = 54000; // cosmetic click on the "Context" ToC entry
+export const C4_SCROLL_UP_FROM = 54000; // begin scrolling the master pane back UP (paired with the click) …
+export const C4_SCROLL_UP_TO = 56400; //   … reaching the top over ~2.4s
+export const C4_TOC_CONTEXT_PULSE_FROM = 53500; // pulse the "Context" ToC entry as the cursor arrives …
+export const C4_TOC_CONTEXT_PULSE_TO = 54700; //   … through the click
+// Restore the Plans tab before the user starts commenting (the comments anchor reading-pane blocks; the
+// sidebar shows the plan list again). The cursor travels to the Plans tab and clicks it.
+export const C4_PLANS_TAB_MOVE_MS = 56600; // cursor → the sidebar "Plans" tab
+export const C4_PLANS_TAB_CLICK_MS = 57300; // cosmetic click on the Plans tab
+export const C4_PLANS_TAB_SWITCH_MS = 57300; // sidebar_tab → "plans" (restores the plan list for commenting)
+// The two ToC entry selectors the cursor targets (built by buildToc from extractToc on the open master:
+// the h1 "Master Plan…" = data-line 0, the h2 "Context" = data-line 2, the h2 "Decomposition" = data-line 6).
+export const C4_TOC_LOW_SELECTOR = '#toc-list .toc-item[data-line="6"]';
+export const C4_TOC_CONTEXT_SELECTOR = '#toc-list .toc-item[data-line="2"]';
+export const C4_CONTENTS_TAB_SELECTOR = '.tab-row .tab[data-tab="contents"]';
+export const C4_PLANS_TAB_SELECTOR = '.tab-row .tab[data-tab="plans"]';
 
 // ---- Named tMs constants for the P4 prototype ACT (tests pin to THESE, not magic numbers) -------
 // The prototype chapter narration (seq 59) lands at PROTO_NARR_MS; the act then plays out as a sequence
@@ -2435,47 +2497,118 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
     frame: { t: "open_plan", path: TRAILHEAD_MASTER_PATH },
   },
 
-  // ---- (P2) Slow-scroll beat over the master pane ----------------------------------------------
+  // ---- (c4) Contents-tab ToC navigation beat ---------------------------------------------------
   //
-  // Before the user comments, the master plan pane SLOW-SCROLLS down to the bottom then back up to the
-  // top so the viewer reads the whole drafted plan (its mermaid decomposition is below the fold). Two
-  // `scroll` OverlayFrames over #reader-scroll (the .reader scroll container — NOT #reading-pane, which
-  // has no overflow): down 0→1, then up 1→0. A pulse on the pane spans the beat as a "watch here" cue.
-  // The scroll is a PURE fn of T (projectScroll, lerped, scrub-revertable) driven by the setScroll seam
-  // EVERY tick AFTER the reading-pane rebuild — so the c1 set_comments rebuild (which resets scrollTop)
-  // self-heals within one tick. The cursor anchor blocks ([data-source-line=…]) are viewport-resolved
-  // each tick, so they still resolve after the scroll returns the pane to the top.
+  // Before the user comments, the demo NAVIGATES the plan's table of contents (review2 c4): click the
+  // SIDEBAR "Contents" tab → the ToC (built from the open master by the real extractToc→buildToc, via
+  // the player's TOC-populate seam) shows; click a LOW ToC entry → the reading pane scrolls way down;
+  // click the "Context" ToC entry → it scrolls back to the top. The cursor visibly TARGETS the real
+  // `.toc-item` / tab elements; the scroll itself is the PURE `scroll` primitive (projectScroll, lerped,
+  // scrub-revertable) over #reader-scroll. The two scroll windows DO NOT overlap (last-window-wins), so
+  // down then up read as distinct beats. Finally the Plans tab is restored before commenting begins.
   {
-    // OVERLAY — scroll the master pane DOWN to the bottom over ~2.2s.
-    tMs: SCROLL_DOWN_FROM,
-    chapterLabel: "Comment & iterate",
+    // OVERLAY — the cursor travels to the sidebar "Contents" tab.
+    tMs: C4_CONTENTS_TAB_MOVE_MS,
+    chapterLabel: "Review the plan",
+    frame: { t: "cursor_move", target: C4_CONTENTS_TAB_SELECTOR, moveMs: 600 },
+  },
+  {
+    // OVERLAY — pulse the Contents tab as the cursor arrives, through the click.
+    tMs: C4_CONTENTS_TAB_PULSE_FROM,
+    frame: { t: "pulse", target: C4_CONTENTS_TAB_SELECTOR, fromMs: C4_CONTENTS_TAB_PULSE_FROM, toMs: C4_CONTENTS_TAB_PULSE_TO },
+  },
+  {
+    // OVERLAY — a cosmetic press on the Contents tab.
+    tMs: C4_CONTENTS_TAB_CLICK_MS,
+    frame: { t: "cursor_click", target: C4_CONTENTS_TAB_SELECTOR },
+  },
+  {
+    // OVERLAY — switch the SIDEBAR to the Contents tab (the real initTabs switch, via setSidebarTab) so
+    // the ToC built from the open master shows. Lands WITH the click so the reveal reads as its result.
+    tMs: C4_CONTENTS_TAB_SWITCH_MS,
+    frame: { t: "sidebar_tab", tab: "contents" },
+  },
+  {
+    // OVERLAY — the cursor travels to a LOW ToC entry (the master's last heading, "Decomposition").
+    tMs: C4_TOC_DOWN_MOVE_MS,
+    frame: { t: "cursor_move", target: C4_TOC_LOW_SELECTOR, moveMs: 600 },
+  },
+  {
+    // OVERLAY — pulse the low ToC entry as the cursor arrives, through the click.
+    tMs: C4_TOC_DOWN_PULSE_FROM,
+    frame: { t: "pulse", target: C4_TOC_LOW_SELECTOR, fromMs: C4_TOC_DOWN_PULSE_FROM, toMs: C4_TOC_DOWN_PULSE_TO },
+  },
+  {
+    // OVERLAY — a cosmetic press on the low ToC entry.
+    tMs: C4_TOC_DOWN_CLICK_MS,
+    frame: { t: "cursor_click", target: C4_TOC_LOW_SELECTOR },
+  },
+  {
+    // OVERLAY — the reading pane SCROLLS DOWN to the bottom over ~2.4s (paired with the low-entry click).
+    tMs: C4_SCROLL_DOWN_FROM,
     frame: {
       t: "scroll",
       target: SCROLL_TARGET,
       fromFrac: 0,
       toFrac: 1,
-      fromMs: SCROLL_DOWN_FROM,
-      toMs: SCROLL_DOWN_TO,
+      fromMs: C4_SCROLL_DOWN_FROM,
+      toMs: C4_SCROLL_DOWN_TO,
     },
   },
   {
-    // OVERLAY — then scroll back UP to the top over ~2.2s (after a brief ~0.4s dwell at the bottom).
-    tMs: SCROLL_UP_FROM,
+    // OVERLAY — the cursor travels to the "Context" ToC entry (after a brief dwell at the bottom).
+    tMs: C4_TOC_CONTEXT_MOVE_MS,
+    frame: { t: "cursor_move", target: C4_TOC_CONTEXT_SELECTOR, moveMs: 600 },
+  },
+  {
+    // OVERLAY — pulse the "Context" ToC entry as the cursor arrives, through the click.
+    tMs: C4_TOC_CONTEXT_PULSE_FROM,
+    frame: { t: "pulse", target: C4_TOC_CONTEXT_SELECTOR, fromMs: C4_TOC_CONTEXT_PULSE_FROM, toMs: C4_TOC_CONTEXT_PULSE_TO },
+  },
+  {
+    // OVERLAY — a cosmetic press on the "Context" ToC entry.
+    tMs: C4_TOC_CONTEXT_CLICK_MS,
+    frame: { t: "cursor_click", target: C4_TOC_CONTEXT_SELECTOR },
+  },
+  {
+    // OVERLAY — the reading pane SCROLLS BACK UP to the top over ~2.4s (paired with the Context click).
+    // This window starts AT C4_SCROLL_DOWN_TO + dwell — strictly AFTER the down window ends (no overlap).
+    tMs: C4_SCROLL_UP_FROM,
     frame: {
       t: "scroll",
       target: SCROLL_TARGET,
       fromFrac: 1,
       toFrac: 0,
-      fromMs: SCROLL_UP_FROM,
-      toMs: SCROLL_UP_TO,
+      fromMs: C4_SCROLL_UP_FROM,
+      toMs: C4_SCROLL_UP_TO,
     },
   },
   {
-    // OVERLAY — pulse the reading pane across the whole scroll beat (a "read the plan" attention cue).
-    tMs: SCROLL_DOWN_FROM,
-    frame: { t: "pulse", target: "#reading-pane", fromMs: SCROLL_DOWN_FROM, toMs: SCROLL_UP_TO },
+    // OVERLAY — the cursor travels to the sidebar "Plans" tab to restore the plan list before commenting.
+    tMs: C4_PLANS_TAB_MOVE_MS,
+    frame: { t: "cursor_move", target: C4_PLANS_TAB_SELECTOR, moveMs: 600 },
   },
+  {
+    // OVERLAY — a cosmetic press on the Plans tab.
+    tMs: C4_PLANS_TAB_CLICK_MS,
+    frame: { t: "cursor_click", target: C4_PLANS_TAB_SELECTOR },
+  },
+  {
+    // OVERLAY — restore the SIDEBAR Plans tab (the comments anchor reading-pane blocks; the sidebar
+    // shows the plan list again). The reader Plan tab is unchanged (the master stays open).
+    tMs: C4_PLANS_TAB_SWITCH_MS,
+    frame: { t: "sidebar_tab", tab: "plans" },
+  },
+];
 
+// ---- (c4) The comment-and-iterate chapter — pushed an EXTRA + C4_SHIFT later ---------------------
+//
+// Authored at its ORIGINAL literals (continuing the EXEC_SHIFT scheme); the splice loop adds
+// PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT to every frame here. Split OUT of DOWNSTREAM_AFTER_PROTOTYPE
+// (which now ends at the c4 Plans-restore) so the c4 beat and the comment chapter get DIFFERENT shifts
+// cleanly — a per-array push, not a literal-tMs boundary (the c4 beat's tail literal exceeds the first
+// comment's literal, so a single tMs threshold could not separate them).
+const COMMENT_AND_V2: StoryFrame[] = [
   // ---- Chapter "Comment & iterate" (P2: every comment gets a full popover ACT) ------------------
   //
   // The master (TRAILHEAD_MASTER_PATH) is still open on the Plan tab. The user now leaves THREE comments
@@ -2494,8 +2627,10 @@ const DOWNSTREAM_AFTER_PROTOTYPE: StoryFrame[] = [
 
   // ---- Comment 1 act (anchors to the Context paragraph, data-source-line="4") ----
   {
-    // OVERLAY — EMPHASIZE the target block before typing (pulse the Context block ~1s).
+    // OVERLAY — EMPHASIZE the target block before typing (pulse the Context block ~1s). The chapter
+    // label moves here (the c4 navigation beat above carries the "Review the plan" label).
     tMs: 56200,
+    chapterLabel: "Comment & iterate",
     frame: { t: "pulse", target: '#reading-pane [data-source-line="4"]', fromMs: 56200, toMs: 57200 },
   },
   {
@@ -3178,7 +3313,7 @@ export const TERMINAL_MS = EXEC_BUILT.terminalMs;
 // OWN time windows (pulse / field_type / scroll have fromMs+toMs) the INNER window shifts in lockstep
 // too — otherwise the shifted frame's projection window (projectPulseSet/projectFieldText/projectScroll
 // read the INNER fromMs/toMs) would fire at the UNSHIFTED time, decoupled from the shifted outer tMs.
-// cursor_move/cursor_click/overlay_modal carry no fromMs/toMs and need only the outer-tMs shift.
+// cursor_move/cursor_click/overlay_modal/sidebar_tab carry no fromMs/toMs and need only the outer-tMs shift.
 function shiftStoryFrame(sf: StoryFrame, delta: number): StoryFrame {
   const f = sf.frame;
   if (f.t === "pulse" || f.t === "field_type" || f.t === "scroll") {
@@ -3191,12 +3326,22 @@ function shiftStoryFrame(sf: StoryFrame, delta: number): StoryFrame {
 // overlay windows included — see shiftStoryFrame), then the P5 Execution chapter (already authored at
 // FINAL tMs/seq — pushed verbatim, no shift). chapterLabels preserved; monotonic tMs preserved (the
 // comment chapter's last frame stays strictly below EXEC_BASE_MS).
+// The nested-plan + master-open + c4 ToC-navigation beat: shifted by the BASE head shift only
+// (PROTO_ACT_SHIFT + CLARIFIER_SHIFT). The c4 scroll/pulse inner windows pick up this base shift here
+// (their CONSTANTS are deliberately NOT bumped, to avoid double-shifting).
+const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
 for (const sf of DOWNSTREAM_AFTER_PROTOTYPE) {
   // + CLARIFIER_SHIFT on top of PROTO_ACT_SHIFT: the intent-clarifier running beat (B1B_*) inserted in
-  // the front slides this whole block (nested-plan … comment & iterate) later by CLARIFIER_SHIFT too.
-  // (The SCROLL_* frames live only here, so this single .map is the one place their inner windows pick up
-  // CLARIFIER_SHIFT — the SCROLL_* CONSTANTS are deliberately NOT bumped, to avoid double-shifting.)
-  TRAILHEAD_BEAT.push(shiftStoryFrame(sf, PROTO_ACT_SHIFT + CLARIFIER_SHIFT));
+  // the front slides this whole block (nested-plan … c4 nav) later by CLARIFIER_SHIFT too.
+  TRAILHEAD_BEAT.push(shiftStoryFrame(sf, HEAD_SHIFT));
+}
+// (c4) The comment-and-iterate chapter: shifted by the head shift PLUS an extra + C4_SHIFT (the c4
+// ToC-navigation beat is longer than the old generic slow-scroll beat it replaced, so the comment chapter
+// — authored at its original literals — slides later by C4_SHIFT). A per-array push (NOT a literal-tMs
+// boundary): the c4 beat's tail literal exceeds the first comment's literal, so a single threshold could
+// not separate them. The tMs-pinned comment tests add C4_SHIFT to their expected paint times.
+for (const sf of COMMENT_AND_V2) {
+  TRAILHEAD_BEAT.push(shiftStoryFrame(sf, HEAD_SHIFT + C4_SHIFT));
 }
 for (const sf of EXEC_BUILT.frames) {
   TRAILHEAD_BEAT.push(sf);

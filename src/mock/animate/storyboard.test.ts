@@ -33,11 +33,19 @@ import {
   projectFieldText,
   projectModalState,
   projectScroll,
+  projectSidebarTab,
   SCROLL_TARGET,
-  SCROLL_DOWN_FROM,
-  SCROLL_DOWN_TO,
-  SCROLL_UP_FROM,
-  SCROLL_UP_TO,
+  C4_SHIFT,
+  C4_SCROLL_DOWN_FROM,
+  C4_SCROLL_DOWN_TO,
+  C4_SCROLL_UP_FROM,
+  C4_SCROLL_UP_TO,
+  C4_CONTENTS_TAB_SWITCH_MS,
+  C4_PLANS_TAB_SWITCH_MS,
+  C4_TOC_LOW_SELECTOR,
+  C4_TOC_CONTEXT_SELECTOR,
+  C4_CONTENTS_TAB_SELECTOR,
+  C4_PLANS_TAB_SELECTOR,
   TRAILHEAD_BEAT,
   TRAILHEAD_COMMENT_1,
   TRAILHEAD_COMMENT_2,
@@ -1084,7 +1092,10 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
   // PROTO_ACT_SHIFT).
   // + CLARIFIER_SHIFT: the intent-clarifier beat slid the whole back half (incl. this comment chapter)
   // later by CLARIFIER_SHIFT, applied via the DOWNSTREAM_AFTER_PROTOTYPE splice .map.
-  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+  // (c4) + C4_SHIFT: the c4 ToC-navigation beat (which now plays BEFORE the comments) is longer than the
+  // old generic slow-scroll beat it replaced, so the comment chapter slid later by C4_SHIFT (applied in
+  // the DOWNSTREAM splice loop to every comment-chapter frame).
+  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT;
   const C1_PAINT_MS = 59800 + CMT_SHIFT;
   const C2_PAINT_MS = 63800 + CMT_SHIFT;
   const C3_PAINT_MS = 67800 + CMT_SHIFT;
@@ -1205,28 +1216,28 @@ describe("storyboard — (P2) projectScroll purity + scrub-revert", () => {
   // A self-contained two-window scroll story (down 0→1 then up 1→0) at the named constants, mirroring
   // the comment chapter's beat shape but isolated so the assertions don't depend on the full-beat tMs.
   const scrollStory: StoryFrame[] = [
-    { tMs: SCROLL_DOWN_FROM, frame: { t: "scroll", target: SCROLL_TARGET, fromFrac: 0, toFrac: 1, fromMs: SCROLL_DOWN_FROM, toMs: SCROLL_DOWN_TO } },
-    { tMs: SCROLL_UP_FROM, frame: { t: "scroll", target: SCROLL_TARGET, fromFrac: 1, toFrac: 0, fromMs: SCROLL_UP_FROM, toMs: SCROLL_UP_TO } },
+    { tMs: C4_SCROLL_DOWN_FROM, frame: { t: "scroll", target: SCROLL_TARGET, fromFrac: 0, toFrac: 1, fromMs: C4_SCROLL_DOWN_FROM, toMs: C4_SCROLL_DOWN_TO } },
+    { tMs: C4_SCROLL_UP_FROM, frame: { t: "scroll", target: SCROLL_TARGET, fromFrac: 1, toFrac: 0, fromMs: C4_SCROLL_UP_FROM, toMs: C4_SCROLL_UP_TO } },
   ];
 
   it("null OUTSIDE any window; exact frac at the window EDGES; lerped MID-window", () => {
     // Before the first window → null (no override).
-    expect(projectScroll(scrollStory, SCROLL_DOWN_FROM - 1)).toBeNull();
+    expect(projectScroll(scrollStory, C4_SCROLL_DOWN_FROM - 1)).toBeNull();
     // Down window: frac 0 at the start edge, 0.5 at the midpoint, near-1 just before the end edge.
-    expect(projectScroll(scrollStory, SCROLL_DOWN_FROM)).toEqual({ target: SCROLL_TARGET, frac: 0 });
-    const downMid = (SCROLL_DOWN_FROM + SCROLL_DOWN_TO) / 2;
+    expect(projectScroll(scrollStory, C4_SCROLL_DOWN_FROM)).toEqual({ target: SCROLL_TARGET, frac: 0 });
+    const downMid = (C4_SCROLL_DOWN_FROM + C4_SCROLL_DOWN_TO) / 2;
     expect(projectScroll(scrollStory, downMid)!.frac).toBeCloseTo(0.5, 5);
     // The end edge toMs is HALF-OPEN [fromMs, toMs): at toMs the down window no longer contains T. The
     // GAP between the down and up windows → null (no active window in the dwell).
-    expect(projectScroll(scrollStory, SCROLL_DOWN_TO)).toBeNull();
-    expect(projectScroll(scrollStory, (SCROLL_DOWN_TO + SCROLL_UP_FROM) / 2)).toBeNull();
+    expect(projectScroll(scrollStory, C4_SCROLL_DOWN_TO)).toBeNull();
+    expect(projectScroll(scrollStory, (C4_SCROLL_DOWN_TO + C4_SCROLL_UP_FROM) / 2)).toBeNull();
     // Up window: frac 1 at the start edge, 0.5 at the midpoint.
-    expect(projectScroll(scrollStory, SCROLL_UP_FROM)).toEqual({ target: SCROLL_TARGET, frac: 1 });
-    const upMid = (SCROLL_UP_FROM + SCROLL_UP_TO) / 2;
+    expect(projectScroll(scrollStory, C4_SCROLL_UP_FROM)).toEqual({ target: SCROLL_TARGET, frac: 1 });
+    const upMid = (C4_SCROLL_UP_FROM + C4_SCROLL_UP_TO) / 2;
     expect(projectScroll(scrollStory, upMid)!.frac).toBeCloseTo(0.5, 5);
     // After the last window → null again.
-    expect(projectScroll(scrollStory, SCROLL_UP_TO)).toBeNull();
-    expect(projectScroll(scrollStory, SCROLL_UP_TO + 1000)).toBeNull();
+    expect(projectScroll(scrollStory, C4_SCROLL_UP_TO)).toBeNull();
+    expect(projectScroll(scrollStory, C4_SCROLL_UP_TO + 1000)).toBeNull();
   });
 
   it("SCRUB-REVERT (property): evaluating at T after sweeping forward equals evaluating at T directly", () => {
@@ -1234,11 +1245,11 @@ describe("storyboard — (P2) projectScroll purity + scrub-revert", () => {
     // target assert projectScroll(early) is IDENTICAL whether reached directly or after the sweep. Because
     // projectScroll is a pure re-derivation from the frame set (NOT an incremental accumulator), the two
     // are byte-identical. FALSIFIABILITY: a stateful/incremental implementation drifts here → RED.
-    const lo = SCROLL_DOWN_FROM - 500;
-    const hi = SCROLL_UP_TO + 500;
+    const lo = C4_SCROLL_DOWN_FROM - 500;
+    const hi = C4_SCROLL_UP_TO + 500;
     const grid = Array.from({ length: 61 }, (_, i) => Math.round(lo + (i / 60) * (hi - lo)));
     const ser = (s: ReturnType<typeof projectScroll>): string => JSON.stringify(s ?? null);
-    for (const earlyT of [lo, SCROLL_DOWN_FROM, downMidOf(), SCROLL_UP_FROM, hi]) {
+    for (const earlyT of [lo, C4_SCROLL_DOWN_FROM, downMidOf(), C4_SCROLL_UP_FROM, hi]) {
       const direct = ser(projectScroll(scrollStory, earlyT));
       // "Sweep forward" is just evaluating across the grid (the fn is stateless), then evaluate at earlyT.
       for (const T of grid) projectScroll(scrollStory, T);
@@ -1246,11 +1257,11 @@ describe("storyboard — (P2) projectScroll purity + scrub-revert", () => {
       expect(afterSweep, `projectScroll(${earlyT}) forward-then-back == direct`).toBe(direct);
     }
     function downMidOf(): number {
-      return (SCROLL_DOWN_FROM + SCROLL_DOWN_TO) / 2;
+      return (C4_SCROLL_DOWN_FROM + C4_SCROLL_DOWN_TO) / 2;
     }
   });
 
-  it("the REAL TRAILHEAD_BEAT carries the slow-scroll beat over #reader-scroll (down 0→1 then up 1→0)", () => {
+  it("the REAL TRAILHEAD_BEAT carries the c4 scroll beat over #reader-scroll (down 0→1 then up 1→0)", () => {
     const scrolls = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "scroll");
     expect(scrolls.length).toBe(2);
     for (const sf of scrolls) {
@@ -1263,6 +1274,102 @@ describe("storyboard — (P2) projectScroll purity + scrub-revert", () => {
     // The down beat precedes the up beat (down then back up), and BOTH precede the first comment paint.
     expect(down!.tMs).toBeLessThan(up!.tMs);
     // FALSIFIABILITY: drop the up-scroll frame and the `up` find goes undefined → RED.
+  });
+
+  it("(c4) the two scroll windows DO NOT overlap (projectScroll is last-window-wins)", () => {
+    // The c4 beat replaced the generic slow-scroll with a down→up pair paired to the ToC-entry clicks.
+    // If the two scroll windows overlapped, the later (up) window would silently mask the (down) one for
+    // any T inside the overlap — projectScroll is last-active-window-wins. Assert the down window CLOSES
+    // (toMs) at or before the up window OPENS (fromMs), in the LIVE shifted beat. FALSIFIABILITY: widen
+    // C4_SCROLL_DOWN_TO past C4_SCROLL_UP_FROM and this goes RED.
+    const scrolls = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "scroll");
+    const down = scrolls.find((sf) => (sf.frame as { toFrac: number }).toFrac === 1)!.frame as { fromMs: number; toMs: number };
+    const up = scrolls.find((sf) => (sf.frame as { toFrac: number }).toFrac === 0)!.frame as { fromMs: number; toMs: number };
+    expect(down.toMs).toBeLessThanOrEqual(up.fromMs);
+    // And there is NO T at which both windows are active (a direct overlap check across the union span).
+    for (let T = down.fromMs; T < up.toMs; T += 50) {
+      const inDown = down.fromMs <= T && T < down.toMs;
+      const inUp = up.fromMs <= T && T < up.toMs;
+      expect(inDown && inUp, `no overlap at T=${T}`).toBe(false);
+    }
+  });
+});
+
+// ---- (c4) Contents-tab ToC navigation beat — sidebar-tab projection + sequence ordering ---------
+//
+// (c4 — review2) BEFORE commenting, the demo clicks the SIDEBAR "Contents" tab (revealing the ToC),
+// clicks a LOW ToC entry (pane scrolls down), clicks the "Context" ToC entry (pane scrolls back up),
+// then restores the Plans tab. projectSidebarTab is a PURE last-≤-T fn (default "plans"); the cursor
+// visibly targets the real `.toc-item` / tab elements. These tests pin the live (shifted) frame times.
+
+describe("storyboard — (c4) Contents-tab ToC navigation beat", () => {
+  // The c4 frames live in DOWNSTREAM_HEAD (literal < the comment-chapter boundary), so the splice .map
+  // shifts them by + PROTO_ACT_SHIFT + CLARIFIER_SHIFT (NOT + C4_SHIFT — that extra is comment-chapter
+  // only). The switch constants are authored in that literal space, so the LIVE time adds the head shift.
+  const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+  const CONTENTS_SWITCH_LIVE = C4_CONTENTS_TAB_SWITCH_MS + HEAD_SHIFT;
+  const PLANS_SWITCH_LIVE = C4_PLANS_TAB_SWITCH_MS + HEAD_SHIFT;
+
+  it("projectSidebarTab defaults to 'plans', flips to 'contents' at the Contents switch, restores 'plans'", () => {
+    // Default before any sidebar_tab frame.
+    expect(projectSidebarTab(TRAILHEAD_BEAT, 0)).toBe("plans");
+    // Just BEFORE the Contents switch → still Plans.
+    expect(projectSidebarTab(TRAILHEAD_BEAT, CONTENTS_SWITCH_LIVE - 1)).toBe("plans");
+    // AT the Contents switch (and through the navigation) → Contents.
+    expect(projectSidebarTab(TRAILHEAD_BEAT, CONTENTS_SWITCH_LIVE)).toBe("contents");
+    expect(projectSidebarTab(TRAILHEAD_BEAT, PLANS_SWITCH_LIVE - 1)).toBe("contents");
+    // AT the Plans restore (and through commenting) → Plans again.
+    expect(projectSidebarTab(TRAILHEAD_BEAT, PLANS_SWITCH_LIVE)).toBe("plans");
+    expect(projectSidebarTab(TRAILHEAD_BEAT, PLANS_SWITCH_LIVE + 5000)).toBe("plans");
+    // FALSIFIABILITY: drop the "contents" sidebar_tab frame and the mid-window assertion goes RED (stays "plans").
+  });
+
+  it("SCRUB-REVERT (property): projectSidebarTab forward-then-back equals direct (pure last-≤-T)", () => {
+    const grid = Array.from({ length: 41 }, (_, i) => Math.round((i / 40) * storyDurationMs(TRAILHEAD_BEAT)));
+    for (const earlyT of [0, CONTENTS_SWITCH_LIVE, PLANS_SWITCH_LIVE, PLANS_SWITCH_LIVE + 1000]) {
+      const direct = projectSidebarTab(TRAILHEAD_BEAT, earlyT);
+      for (const T of grid) projectSidebarTab(TRAILHEAD_BEAT, T);
+      expect(projectSidebarTab(TRAILHEAD_BEAT, earlyT)).toBe(direct);
+    }
+  });
+
+  it("the c4 beat plays in order: Contents tab → low ToC entry (scroll down) → Context entry (scroll up) → Plans, all BEFORE the first comment", () => {
+    // The cursor targets the REAL tab + .toc-item selectors, in order. Assert the move-to-Contents-tab
+    // precedes the move-to-low-entry precedes the move-to-Context-entry precedes the move-to-Plans-tab,
+    // and that the LAST of those precedes the first comment's #sp-text typing. FALSIFIABILITY: reorder the
+    // Context-entry move after the Plans-tab move and the ordering chain goes RED.
+    const moveTo = (sel: string): number | undefined =>
+      TRAILHEAD_BEAT.find((sf) => sf.frame.t === "cursor_move" && sf.frame.target === sel)?.tMs;
+    const contentsTab = moveTo(C4_CONTENTS_TAB_SELECTOR);
+    const lowEntry = moveTo(C4_TOC_LOW_SELECTOR);
+    const contextEntry = moveTo(C4_TOC_CONTEXT_SELECTOR);
+    const plansTab = moveTo(C4_PLANS_TAB_SELECTOR);
+    expect(contentsTab).toBeDefined();
+    expect(lowEntry).toBeDefined();
+    expect(contextEntry).toBeDefined();
+    expect(plansTab).toBeDefined();
+    expect(contentsTab!).toBeLessThan(lowEntry!);
+    expect(lowEntry!).toBeLessThan(contextEntry!);
+    expect(contextEntry!).toBeLessThan(plansTab!);
+    // The whole c4 beat precedes the first comment's #sp-text typing.
+    const firstCommentType = TRAILHEAD_BEAT.find(
+      (sf) => sf.frame.t === "field_type" && sf.frame.target === "#sp-text",
+    )!.tMs;
+    expect(plansTab!).toBeLessThan(firstCommentType);
+  });
+
+  it("the LOW ToC entry's scroll is DOWN (0→1) and the Context entry's scroll is UP (1→0)", () => {
+    // The down-scroll window is paired with (starts at/after) the low-entry click; the up-scroll window is
+    // paired with the Context-entry click. Assert the down window opens AFTER the low-entry move and the up
+    // window opens AFTER the Context-entry move. FALSIFIABILITY: swap the two scroll directions and this fails.
+    const moveTo = (sel: string): number =>
+      TRAILHEAD_BEAT.find((sf) => sf.frame.t === "cursor_move" && sf.frame.target === sel)!.tMs;
+    const scrolls = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "scroll");
+    const down = scrolls.find((sf) => (sf.frame as { toFrac: number }).toFrac === 1)!;
+    const up = scrolls.find((sf) => (sf.frame as { toFrac: number }).toFrac === 0)!;
+    expect(down.tMs).toBeGreaterThanOrEqual(moveTo(C4_TOC_LOW_SELECTOR));
+    expect(up.tMs).toBeGreaterThanOrEqual(moveTo(C4_TOC_CONTEXT_SELECTOR));
+    expect(down.tMs).toBeLessThan(up.tMs);
   });
 });
 

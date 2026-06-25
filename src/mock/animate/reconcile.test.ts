@@ -19,7 +19,21 @@ import {
   type ReconcilerSeams,
   QUESTION_OTHER_TEXT_SELECTOR,
 } from "./reconcile";
-import { type StoryFrame, TRAILHEAD_BEAT, TERMINAL_MS } from "./storyboard";
+import {
+  type StoryFrame,
+  TRAILHEAD_BEAT,
+  TERMINAL_MS,
+  projectScroll,
+  projectSidebarTab,
+  C4_CONTENTS_TAB_SWITCH_MS,
+  C4_PLANS_TAB_SWITCH_MS,
+  C4_SCROLL_DOWN_TO,
+  C4_SCROLL_UP_TO,
+  PROTO_ACT_SHIFT,
+  CLARIFIER_SHIFT,
+} from "./storyboard";
+import { extractToc } from "../../render/toc";
+import { buildToc } from "../../main";
 import { clonePlans } from "../fixtures/plans";
 import {
   TRAILHEAD_PLANS,
@@ -71,6 +85,7 @@ function makeSeams(over?: Partial<ReconcilerSeams>): {
     }),
     readingPane: pane,
     planDirOf: (path: string) => path.slice(0, path.lastIndexOf("/")),
+    rebuildToc: vi.fn(),
     setPlans: vi.fn(),
     emitPlanChanged: vi.fn(),
     setPendingReviews: vi.fn(),
@@ -79,6 +94,7 @@ function makeSeams(over?: Partial<ReconcilerSeams>): {
     emitGate: vi.fn(),
     clearGate: vi.fn(),
     setActiveTab: vi.fn(),
+    setSidebarTab: vi.fn(),
     // ---- overlay seams (P1) ----
     setCursor: vi.fn(),
     setPulseTargets: vi.fn(),
@@ -825,5 +841,128 @@ describe("reconcile — (P6) whole-timeline forward-then-back == direct (overlay
         ).toBe(ser(directLast?.[0]));
       }
     }
+  });
+});
+
+// ====================================================================================================
+// (c4) Contents-tab ToC navigation — the rebuildToc + setSidebarTab seams + scroll direction.
+//
+// The reconciler must (1) rebuild the Contents ToC from the rendered master pane (the REAL extractToc→
+// buildToc), so #toc-list is populated (with a "Context" entry) during the c4 window; (2) drive the
+// sidebar tab to "contents" then back to "plans"; and (3) drive the pane scroll HIGH (~1) after the low
+// ToC-entry beat and back to ~0 after the Context beat, with NO two scroll windows overlapping.
+describe("reconcile — (c4) Contents-tab ToC navigation", () => {
+  // The c4 sidebar_tab/scroll frames live in DOWNSTREAM_HEAD (shifted by the head shift only).
+  const HEAD_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT;
+  const CONTENTS_SWITCH_LIVE = C4_CONTENTS_TAB_SWITCH_MS + HEAD_SHIFT;
+  const PLANS_SWITCH_LIVE = C4_PLANS_TAB_SWITCH_MS + HEAD_SHIFT;
+  const SCROLL_DOWN_TO_LIVE = C4_SCROLL_DOWN_TO + HEAD_SHIFT;
+  const SCROLL_UP_TO_LIVE = C4_SCROLL_UP_TO + HEAD_SHIFT;
+
+  it("rebuildToc fires AFTER the master render+settle and on the empty-pane close", async () => {
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "open_plan", path: TRAILHEAD_MASTER_PATH } },
+      { tMs: 100, frame: { t: "open_plan", path: null } },
+    ];
+    const { seams } = makeSeams({
+      readPlan: vi.fn(async () => TRAILHEAD_MASTER_DOC),
+    });
+    const r = createReconciler(seams, story);
+    r.reconcile(0);
+    await flush();
+    // After the master open + settle, rebuildToc fired with the pane.
+    expect((seams.rebuildToc as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(1);
+    const afterOpen = (seams.rebuildToc as ReturnType<typeof vi.fn>).mock.calls.length;
+    // The empty-pane close also rebuilds (an empty ToC) — synchronous in reconcileReadingPane.
+    r.reconcile(100);
+    await flush();
+    expect((seams.rebuildToc as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(afterOpen);
+    // FALSIFIABILITY: remove the rebuildToc call from reconcileReadingPane and both counts stay 0 → RED.
+  });
+
+  it("the REAL extractToc→buildToc populates #toc-list with a 'Context' entry from the rendered master", async () => {
+    // A faithful renderInto that produces the master's headings (h1 + h2 Context + h2 Decomposition) with
+    // their data-source-line, then the REAL rebuildToc (extractToc→buildToc) over a real #toc-list. This
+    // exercises the production data flow end-to-end (no spy ToC). FALSIFIABILITY: if rebuildToc never fires
+    // (remove its reconciler call) #toc-list stays empty → the length + "Context" assertions go RED.
+    const tocList = document.createElement("div");
+    tocList.id = "toc-list";
+    document.body.appendChild(tocList);
+
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "open_plan", path: TRAILHEAD_MASTER_PATH } },
+    ];
+    const { seams, pane } = makeSeams({
+      readPlan: vi.fn(async () => TRAILHEAD_MASTER_DOC),
+      // Render the master's headings faithfully (the real markdown render stamps data-source-line).
+      renderInto: vi.fn((p: HTMLElement) => {
+        p.innerHTML =
+          '<h1 data-source-line="0">Master Plan: Trailhead — trail-finder mobile app</h1>' +
+          '<p data-source-line="4">Trailhead is an Android-first mobile app…</p>' +
+          '<h2 data-source-line="2">Context</h2>' +
+          '<h2 data-source-line="6">Decomposition</h2>';
+      }),
+      // The REAL production data flow.
+      rebuildToc: (p: HTMLElement) => buildToc(tocList, extractToc(p)),
+    });
+    const r = createReconciler(seams, story);
+    r.reconcile(0);
+    await flush();
+
+    const items = Array.from(tocList.querySelectorAll<HTMLElement>(".toc-item"));
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    const texts = items.map((el) => el.textContent);
+    expect(texts).toContain("Context");
+    expect(texts).toContain("Decomposition");
+    // The "Context" row carries the heading's source line (the scroll anchor key).
+    const contextRow = items.find((el) => el.textContent === "Context");
+    expect(contextRow?.dataset.line).toBe("2");
+    void pane;
+  });
+
+  it("setSidebarTab drives 'contents' during the c4 navigation, then 'plans' before commenting", () => {
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, TRAILHEAD_BEAT);
+    // At the Contents switch → setSidebarTab last-called with "contents".
+    r.reconcile(CONTENTS_SWITCH_LIVE);
+    expect(lastCall(seams, "setSidebarTab")![0]).toBe("contents");
+    // At the Plans restore → "plans".
+    r.reconcile(PLANS_SWITCH_LIVE);
+    expect(lastCall(seams, "setSidebarTab")![0]).toBe("plans");
+    // FALSIFIABILITY: drop the "contents" sidebar_tab frame and the first assertion goes RED ("plans").
+  });
+
+  it("scroll is HIGH (~1) at the end of the low-entry beat and ~0 after the Context beat; windows don't overlap", () => {
+    // projectScroll over the LIVE beat: just before the down window closes → frac near 1 (scrolled down);
+    // just before the up window closes → frac near 0 (scrolled back to the top). FALSIFIABILITY: swap the
+    // two scroll directions (down toFrac 0, up toFrac 1) and these go RED.
+    const downEnd = projectScroll(TRAILHEAD_BEAT, SCROLL_DOWN_TO_LIVE - 1);
+    expect(downEnd).not.toBeNull();
+    expect(downEnd!.frac).toBeGreaterThan(0.95);
+    const upEnd = projectScroll(TRAILHEAD_BEAT, SCROLL_UP_TO_LIVE - 1);
+    expect(upEnd).not.toBeNull();
+    expect(upEnd!.frac).toBeLessThan(0.05);
+    // NO overlap: scan the union of the two windows; never are both active (projectScroll is last-wins, so
+    // an overlap would be silently masked — assert directly on the frame windows that no T is in both).
+    const scrolls = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "scroll");
+    const down = scrolls.find((sf) => (sf.frame as { toFrac: number }).toFrac === 1)!.frame as { fromMs: number; toMs: number };
+    const up = scrolls.find((sf) => (sf.frame as { toFrac: number }).toFrac === 0)!.frame as { fromMs: number; toMs: number };
+    for (let T = down.fromMs; T < up.toMs; T += 50) {
+      const inDown = down.fromMs <= T && T < down.toMs;
+      const inUp = up.fromMs <= T && T < up.toMs;
+      expect(inDown && inUp, `no scroll-window overlap at T=${T}`).toBe(false);
+    }
+  });
+
+  it("setSidebarTab scrub-revert: forward-then-back to before the c4 nav restores 'plans'", () => {
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, TRAILHEAD_BEAT);
+    // Sweep forward through the c4 nav (contents) then back to T=0 (before any sidebar_tab frame).
+    r.reconcile(CONTENTS_SWITCH_LIVE);
+    r.reconcile(PLANS_SWITCH_LIVE);
+    r.reconcile(0);
+    // The default "plans" is re-asserted (projectSidebarTab is a pure last-≤-T re-derivation).
+    expect(projectSidebarTab(TRAILHEAD_BEAT, 0)).toBe("plans");
+    expect(lastCall(seams, "setSidebarTab")![0]).toBe("plans");
   });
 });

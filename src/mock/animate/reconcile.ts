@@ -28,6 +28,7 @@ import {
   projectFieldText,
   projectModalState,
   projectScroll,
+  projectSidebarTab,
 } from "./storyboard";
 import type { ConversationModel } from "../../conversation/stream";
 import type { CommentRecord, PlanRecord, ReviewRequest } from "../../types";
@@ -58,6 +59,11 @@ export interface ReconcilerSeams {
   // The reading-pane element + a fn deriving the plan dir from a path (so the reconciler stays DOM-light).
   readingPane: HTMLElement;
   planDirOf: (path: string) => string;
+  // (c4) Rebuild the sidebar Contents ToC from the CURRENTLY-rendered reading pane (the player wires the
+  // REAL extractToc→buildToc over #reading-pane → #toc-list). Called AFTER the reading-pane render+settle
+  // (so the headings exist) and on the empty-pane close (an empty pane ⇒ an empty ToC). OPTIONAL so the
+  // pre-c4 player wiring + unit tests that omit it still typecheck (the reconciler guards each call).
+  rebuildToc?: (pane: HTMLElement) => void;
 
   // ---- sidebar ----
   // Stash the full plan set the mock list_plans returns, then …
@@ -76,6 +82,11 @@ export interface ReconcilerSeams {
 
   // ---- active tab (click the real tab button; never un-hide #conversation-stream) ----
   setActiveTab: (tab: "plan" | "conversation") => void;
+
+  // ---- (c4) sidebar tab (Plans / Contents) — click the real sidebar `.tab-row .tab[data-tab=…]` so
+  // main.ts's initTabs switching runs. Distinct from setActiveTab (the READER Plan/Conversation tab).
+  // OPTIONAL so pre-c4 player wiring + unit tests that omit it still typecheck (reconciler guards it).
+  setSidebarTab?: (tab: "plans" | "contents") => void;
 
   // ---- overlay seams (cosmetic; reconciler-owned DOM) --------------------------------------------
   // All overlay seams are OPTIONAL so the player (index.ts) can wire them incrementally (P2) without a
@@ -169,6 +180,9 @@ export function createReconciler(
   // Cursor: the last-GOOD resolved position. Held when a target is absent OR resolves to a zero-area
   // rect (e.g. a display:none modal), so the cursor never lerps toward (0,0) — it dwells in place.
   let lastCursorPos: { x: number; y: number } | null = null;
+  // (c4) Sidebar tab: the last-applied projected value, so setSidebarTab fires only on change (mirrors
+  // reconcileActiveTab). null ⇒ never applied.
+  let lastSidebarTab: "plans" | "contents" | null = null;
 
   function reconcileReadingPane(surface: SurfaceState): void {
     const key = `${surface.openPlanPath ?? " null"}|${commentsKey(surface.comments)}`;
@@ -180,6 +194,9 @@ export function createReconciler(
       // Bump the epoch so any in-flight async read aborts (it would otherwise re-fill the pane).
       void ++openEpoch;
       seams.renderInto(seams.readingPane, "", seams.planDirOf(""));
+      // (c4) An empty pane ⇒ an empty ToC (the real buildToc clears #toc-list). Re-derives from the
+      // now-empty pane, so a backward scrub to no-open-plan reverts the ToC cleanly.
+      seams.rebuildToc?.(seams.readingPane);
       // Synchronous, fully-settled close: nothing async is pending, so any prior in-flight barrier is
       // now superseded and the pane is in its final empty state. Drop the barrier to idle.
       inFlightSettle = null;
@@ -203,6 +220,11 @@ export function createReconciler(
       seams.applyComments(seams.readingPane, comments);
       // Guard again before the (async) settle so a delayed settle from a superseded read can't run.
       if (gen === openEpoch) await seams.settle(seams.readingPane);
+      // (c4) Rebuild the Contents ToC from the freshly-rendered+settled pane (the headings now exist).
+      // Guarded on the epoch so a superseded render never clobbers a newer render's ToC. The real
+      // extractToc→buildToc is the SAME data flow production uses (the sidebar never queries #reading-pane
+      // itself). A backward scrub re-renders the projected markdown, so the ToC re-derives from scratch.
+      if (gen === openEpoch) seams.rebuildToc?.(seams.readingPane);
       // Only the LATEST chain clears the barrier (a stale chain returned above without touching it).
       if (gen === openEpoch) inFlightSettle = null;
     })();
@@ -249,6 +271,17 @@ export function createReconciler(
   function reconcileActiveTab(surface: SurfaceState, prev: SurfaceState | null): void {
     if (prev !== null && prev.activeTab === surface.activeTab) return;
     seams.setActiveTab(surface.activeTab);
+  }
+
+  // (c4) Drive the SIDEBAR tab (Plans / Contents) to the projected value only on change (mirrors
+  // reconcileActiveTab). A pure last-≤-T fn of T (projectSidebarTab), so a backward scrub reverts to the
+  // default "plans". Distinct from reconcileActiveTab (the reader Plan/Conversation tab).
+  function reconcileSidebarTab(T: number): void {
+    if (!seams.setSidebarTab) return;
+    const tab = projectSidebarTab(story, T);
+    if (tab === lastSidebarTab) return;
+    lastSidebarTab = tab;
+    seams.setSidebarTab(tab);
   }
 
   // ---- overlay passes ---------------------------------------------------------------------------
@@ -412,6 +445,9 @@ export function createReconciler(
     reconcileReviewBar(surface, prev);
     reconcileGate(surface, prev);
     reconcileActiveTab(surface, prev);
+    // (c4) Switch the sidebar Plans/Contents tab BEFORE the cursor pass — switching to Contents un-hides
+    // #tab-contents, giving the `.toc-item` elements the cursor targets a non-zero rect to resolve to.
+    reconcileSidebarTab(T);
 
     // ---- overlays: drive the cosmetic seams. ORDER MATTERS: every pass that may change DOM geometry
     // (composer/popover/question-UI) runs BEFORE the cursor, so reconcileCursor reads
