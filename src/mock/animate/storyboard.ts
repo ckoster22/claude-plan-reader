@@ -91,7 +91,15 @@ export type SurfaceFrame =
   // The FULL pending-reviews set at this point.
   | { t: "pending_reviews"; reviews: ReviewRequest[] }
   // The prototype gate state: on/off (+ optional round 1..3 when on).
-  | { t: "prototype_gate"; on: boolean; round?: number };
+  | { t: "prototype_gate"; on: boolean; round?: number }
+  // (c5) The IN-PROCESS approval-review gate state: when ON with a `planPath`, main.ts's #review-bar
+  // shows in VIEWING / IN-PROCESS mode (Submit relabeled "Request changes") for the plan at `planPath`
+  // — which MUST equal the currently-open plan so viewingGate() matches WITHOUT a re-open (a re-open
+  // would wipe the inline comment highlights). Submit is DISABLED at 0 comments, ENABLED once the open
+  // plan's projected comment count is >=1 (the bar derives this from the SAME set_comments projection).
+  // off ⇒ the gate clears and the bar reverts. Projected by projectSurfaceState (last-≤-T), reconciled
+  // by reconcileReviewGate (drives the in-process orchestrator gate seam + pushes the comment count).
+  | { t: "review_gate"; on: boolean; planPath: string | null };
 
 // ---- OverlayFrame variants ---------------------------------------------------------------------
 //
@@ -136,6 +144,7 @@ const SURFACE_KINDS = new Set<Frame["t"]>([
   "set_comments",
   "pending_reviews",
   "prototype_gate",
+  "review_gate",
 ]);
 
 // The discriminator values that belong to the OVERLAY family (mirrors SURFACE_KINDS). Overlay frames
@@ -220,6 +229,7 @@ export function applyModelFrame(
     case "set_comments":
     case "pending_reviews":
     case "prototype_gate":
+    case "review_gate":
       break;
     // OverlayFrames are model no-ops too — projected by projectPulseSet/projectCursorState/
     // projectFieldText/projectModalState and reconciled onto cosmetic overlay seams, never the model.
@@ -280,6 +290,9 @@ export interface SurfaceState {
   plans: PlanRecord[];
   pendingReviews: ReviewRequest[];
   prototypeGate: { on: boolean; round: number };
+  // (c5) The IN-PROCESS approval-review gate: when on with a planPath, the #review-bar shows in VIEWING /
+  // IN-PROCESS mode ("Request changes") for that plan. Last-≤-T review_gate frame; off/null by default.
+  reviewGate: { on: boolean; planPath: string | null };
   activeTab: "plan" | "conversation";
 }
 
@@ -293,6 +306,8 @@ export function projectSurfaceState(story: ReadonlyArray<StoryFrame>, T: number)
   let plans: PlanRecord[] | null = null;
   let pendingReviews: ReviewRequest[] = [];
   let prototypeGate: { on: boolean; round: number } = { on: false, round: 1 };
+  // (c5) The in-process review gate — last-≤-T review_gate frame; off/null before any.
+  let reviewGate: { on: boolean; planPath: string | null } = { on: false, planPath: null };
   // Comments keyed by path so the open-plan's comments are the last set_comments for THAT path.
   const commentsByPath = new Map<string, CommentRecord[]>();
 
@@ -319,6 +334,9 @@ export function projectSurfaceState(story: ReadonlyArray<StoryFrame>, T: number)
           round: Math.min(3, Math.max(1, Math.floor(frame.round ?? 1))),
         };
         break;
+      case "review_gate":
+        reviewGate = { on: frame.on, planPath: frame.on ? frame.planPath : null };
+        break;
       // ModelFrames contribute nothing to the surface projection.
       default:
         break;
@@ -332,6 +350,7 @@ export function projectSurfaceState(story: ReadonlyArray<StoryFrame>, T: number)
     plans: plans ?? clonePlans(),
     pendingReviews,
     prototypeGate,
+    reviewGate,
     // activeTab is structural: a plan is open ⇒ Plan tab, else Conversation tab.
     activeTab: openPlanPath !== null ? "plan" : "conversation",
   };
@@ -614,9 +633,13 @@ export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): str
 //     on the open V1 prose. The pane then switches to the REVISED master (open_plan{TRAILHEAD_MASTER_V2}
 //     at 24800, LEFT OPEN — no closing null) — because comments are scoped to the open path and V2 has
 //     none, the highlights clear to 0 on the revised doc (a clean iteration reveal, Plan tab). A system
-//     echo (seq 26) announces the revision. HIGHLIGHTS-ONLY: this beat drives NO pending_reviews frame
-//     and shows NO review-bar count (driving the bar would auto-open the plan and re-render the pane,
-//     WIPING the highlights — see the comment consts below).
+//     echo (seq 26) announces the revision. (c5) BEFORE the comments land, an IN-PROCESS review_gate
+//     turns ON for the OPEN master so the REAL #review-bar shows in VIEWING / IN-PROCESS mode (Submit
+//     relabeled "Request changes", DISABLED at 0 comments → ENABLED as the set_comments grow); the
+//     cursor then travels to "Request changes" (#review-submit) and clicks. The gate is fanned through
+//     main.ts's onSnapshot observer ONLY (a held pendingApproval whose planPath EQUALS the open master),
+//     NOT the external pending_reviews path — so it does NOT re-open the plan and the inline highlights
+//     SURVIVE alongside the bar (the c5 invariant). The gate turns OFF just before the V2 reveal.
 //
 //   Chapter "Execution" + "Done" (open_plan{null} + seq 27..49):
 //     The plan is approved and the assistant EXECUTES the four 04.* trail-detail leaves FLAT (per-leaf,
@@ -861,6 +884,28 @@ export const C4_TOC_CONTEXT_SELECTOR = '#toc-list .toc-item[data-line="2"]';
 export const C4_CONTENTS_TAB_SELECTOR = '.tab-row .tab[data-tab="contents"]';
 export const C4_PLANS_TAB_SELECTOR = '.tab-row .tab[data-tab="plans"]';
 
+// ---- (c5 — review2) IN-PROCESS "Request changes" review bar -------------------------------------
+// review2 c5: the comment chapter was MISSING the review surface the real app shows at the TOP of the
+// reading column while the user reviews a plan they are VIEWING. We now drive the REAL in-process
+// #review-bar (VIEWING / IN-PROCESS mode → Submit relabeled "Request changes") for the OPEN master,
+// then travel the cursor to "Request changes" (#review-submit) and click it. Authored in COMMENT_AND_V2
+// literal space (shifted by HEAD_SHIFT + C4_SHIFT in the splice loop, exactly like the comments). The
+// gate turns ON at REVIEW_GATE_ON_MS (BEFORE the first comment lands, so the bar appears with the master
+// fully shown and Submit DISABLED at 0 comments); the three set_comments then grow the count 1→2→3 and
+// Submit ENABLES. After the cursor click the gate turns OFF (resolved) just before the V2 reveal.
+//
+// FAITHFUL SURFACE (load-bearing): this is the orchestrator's held APPROVAL gate (pendingApproval) whose
+// planPath EQUALS the open master — fanned through main.ts's onSnapshot observer ONLY (NOT
+// onAwaitingApproval, which re-opens + wipes highlights). The bar coexists with the inline comment
+// highlights the SAME T (the c5 invariant). The cursor move/click below REPLACE the old bare
+// #review-submit cursor beat (which drove no review surface at all).
+export const REVIEW_GATE_ON_MS = 56000; // review_gate{on} for the open master — bar appears (0 comments → Submit disabled)
+export const REVIEW_BAR_DWELL_FROM = 67900; // pulse #review-bar after the 3rd comment lands (count=3 → Submit enabled) …
+export const REVIEW_BAR_DWELL_TO = 68900; //   … through the cursor's arrival at "Request changes"
+export const REVIEW_SUBMIT_MOVE_MS = 68500; // cursor → "Request changes" (#review-submit), a slow legible travel
+export const REVIEW_SUBMIT_CLICK_MS = 69000; // cosmetic press on #review-submit ("Request changes")
+export const REVIEW_GATE_OFF_MS = 69300; // review_gate{off} — the gate resolves (the bar reverts) just before V2 loads
+
 // ---- Named tMs constants for the P4 prototype ACT (tests pin to THESE, not magic numbers) -------
 // The prototype chapter narration (seq 59) lands at PROTO_NARR_MS; the act then plays out as a sequence
 // of dwells (pulses spanning tMs gaps) the player's hold-state covers. All overlay frames; no seqs.
@@ -923,12 +968,15 @@ const PLATFORM_ANSWER = "Android first — that's where most of our trail users 
 // it as a `.cmt-hl` highlight in the reading pane. `block_line: null` ⇒ whole-pane occurrence scan
 // (the render facade's applyComments path), `occurrence: 0` ⇒ the first match.
 //
-// HIGHLIGHTS-ONLY (load-bearing): these drive ONLY `set_comments` SurfaceFrames → the reconciler's
-// applyComments → inline `.cmt-hl` highlights. We deliberately DO NOT emit any `pending_reviews`
-// frame and DO NOT assert a review-bar count: that would be the review-bar surface, NOT content. In
-// the real app opening the review bar AUTO-OPENS the plan and re-renders the pane, which WIPES the
-// freshly-applied highlights — so a review-bar count and the inline highlights are mutually exclusive
-// in one frame. This slice delivers the inline highlights + the V1→V2 iteration only.
+// HIGHLIGHTS + IN-PROCESS BAR (load-bearing): these drive `set_comments` SurfaceFrames → the
+// reconciler's applyComments → inline `.cmt-hl` highlights. They DO NOT use the EXTERNAL
+// `pending_reviews` path — that path (emitReviewRequested) makes main.ts AUTO-OPEN the review's plan
+// and re-render the pane, WIPING the freshly-applied highlights, and labels Submit "Submit" (NOT
+// "Request changes"). (c5) The review surface is instead the IN-PROCESS approval gate (the `review_gate`
+// SurfaceFrame, fanned through main.ts's onSnapshot observer whose pendingApproval.planPath EQUALS the
+// already-open master): viewingGate() matches WITHOUT a re-open, so the inline highlights and the
+// "Request changes" bar coexist at the SAME T. This slice delivers the highlights + the in-process bar
+// + the V1→V2 iteration.
 // Exported so the storyboard test can assert the highlights anchor the EXACT records the beat drives
 // (and that each quote is verbatim V1 prose). Order is c1, c2, c3 — the order the beat reveals them.
 export const TRAILHEAD_COMMENT_1: CommentRecord = {
@@ -2625,12 +2673,22 @@ const COMMENT_AND_V2: StoryFrame[] = [
   // Context paragraph = line 4 carries BOTH c1's and c2's quotes; the closing paragraph = line 53 carries
   // c3's quote). c1 + c2 share the Context block; c3 anchors the distinct closing block.
 
+  // ---- (c5) IN-PROCESS review bar appears (Submit DISABLED at 0 comments) ----
+  {
+    // SURFACE — drive the REAL in-process #review-bar (VIEWING / IN-PROCESS mode → "Request changes")
+    // for the OPEN master. It appears at the TOP of the reading column BEFORE the user comments, so the
+    // viewer sees the same surface the real app shows while reviewing a plan they are viewing. At 0
+    // comments Submit is DISABLED; the three set_comments below grow the count and Submit ENABLES. Driven
+    // via main.ts's onSnapshot observer ONLY (no re-open) so the inline highlights below survive.
+    tMs: REVIEW_GATE_ON_MS,
+    chapterLabel: "Comment & iterate",
+    frame: { t: "review_gate", on: true, planPath: TRAILHEAD_MASTER_PATH },
+  },
+
   // ---- Comment 1 act (anchors to the Context paragraph, data-source-line="4") ----
   {
-    // OVERLAY — EMPHASIZE the target block before typing (pulse the Context block ~1s). The chapter
-    // label moves here (the c4 navigation beat above carries the "Review the plan" label).
+    // OVERLAY — EMPHASIZE the target block before typing (pulse the Context block ~1s).
     tMs: 56200,
-    chapterLabel: "Comment & iterate",
     frame: { t: "pulse", target: '#reading-pane [data-source-line="4"]', fromMs: 56200, toMs: 57200 },
   },
   {
@@ -2775,26 +2833,43 @@ const COMMENT_AND_V2: StoryFrame[] = [
     },
   },
   {
-    // OVERLAY — the cursor travels to "Request changes" (#review-submit) to send the comments back.
-    tMs: 68400,
-    frame: { t: "cursor_move", target: "#review-submit", moveMs: 300 },
+    // (c5) OVERLAY — DWELL on the in-process review bar now that all 3 comments are in (Submit ENABLED):
+    // a pulse over #review-bar draws the eye to the "Request changes" surface before the cursor arrives.
+    tMs: REVIEW_BAR_DWELL_FROM,
+    frame: { t: "pulse", target: "#review-bar", fromMs: REVIEW_BAR_DWELL_FROM, toMs: REVIEW_BAR_DWELL_TO },
   },
   {
-    // OVERLAY — a COSMETIC press on #review-submit ("Request changes"); the V2 load below is frame-driven.
-    tMs: 68700,
+    // (c5) OVERLAY — the cursor travels (slow, legible) to "Request changes" (#review-submit) — the REAL
+    // in-process review-bar button — to send the 3 comments back. This REPLACES the old bare
+    // #review-submit beat (which drove no review surface). The bar shows Submit relabeled "Request
+    // changes" + ENABLED (count=3); the highlights are still painted at this SAME T (the c5 invariant).
+    tMs: REVIEW_SUBMIT_MOVE_MS,
+    frame: { t: "cursor_move", target: "#review-submit", moveMs: 400 },
+  },
+  {
+    // (c5) OVERLAY — a COSMETIC press on #review-submit ("Request changes"); the V2 load below is
+    // frame-driven (the real requestChanges handler stays inert in the mock).
+    tMs: REVIEW_SUBMIT_CLICK_MS,
     frame: { t: "cursor_click", target: "#review-submit" },
+  },
+  {
+    // (c5) SURFACE — the in-process gate RESOLVES (the user requested changes): turn review_gate OFF so
+    // the bar reverts before the revised plan loads. Mirrors the real flow (requestChanges clears the
+    // pendingApproval gate → the next snapshot reverts the bar).
+    tMs: REVIEW_GATE_OFF_MS,
+    frame: { t: "review_gate", on: false, planPath: null },
   },
   {
     // SURFACE — switch the reading pane to the REVISED master (V2). No closing open_plan{null} — the
     // master stays open, so the beat ends on the Plan tab showing the revised doc. Because comments are
     // scoped to the OPEN path (projectSurfaceState), and V2 has no set_comments, projectSurfaceState
     // .comments is [] for T ≥ this frame (the V1 comments do not paint on V2 — a clean iteration reveal).
-    tMs: 69000,
+    tMs: 69500,
     frame: { t: "open_plan", path: TRAILHEAD_MASTER_V2_PATH },
   },
   {
     // seq 26 — a system echo announcing the revision (a system bubble on the hidden Conversation tab).
-    tMs: 69400,
+    tMs: 69600,
     frame: {
       t: "system_message",
       seq: 64,

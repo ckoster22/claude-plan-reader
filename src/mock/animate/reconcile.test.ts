@@ -93,6 +93,8 @@ function makeSeams(over?: Partial<ReconcilerSeams>): {
     emitReviewCancelled: vi.fn(),
     emitGate: vi.fn(),
     clearGate: vi.fn(),
+    emitReviewGate: vi.fn(),
+    clearReviewGate: vi.fn(),
     setActiveTab: vi.fn(),
     setSidebarTab: vi.fn(),
     // ---- overlay seams (P1) ----
@@ -224,6 +226,57 @@ describe("reconcile — gate on→off (invariant D)", () => {
     expect(seams.emitGate).toHaveBeenCalledTimes(1);
     r.reconcile(0); // rewind before the gate frame → projected gate off → clearGate.
     expect(seams.clearGate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("reconcile — (c5) in-process review_gate seam (Request changes bar)", () => {
+  const MASTER = "/Users/mock/.claude/plans/master.md";
+
+  it("review_gate on ⇒ emitReviewGate(planPath, commentCount); count re-fires as comments grow; off ⇒ clearReviewGate", () => {
+    // The faithful c5 surface: the in-process gate turns ON for the OPEN plan (Submit disabled at 0
+    // comments), then the comment set grows 1→2 and the seam RE-FIRES with the new count (Submit
+    // enables), then the gate turns OFF.
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "open_plan", path: MASTER } },
+      { tMs: 100, frame: { t: "review_gate", on: true, planPath: MASTER } },
+      { tMs: 200, frame: { t: "set_comments", path: MASTER, comments: [comment(1)] } },
+      { tMs: 300, frame: { t: "set_comments", path: MASTER, comments: [comment(1), comment(2)] } },
+      { tMs: 400, frame: { t: "review_gate", on: false, planPath: null } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    // Gate ON with 0 comments → emitReviewGate(MASTER, 0) (Submit would be DISABLED).
+    r.reconcile(100);
+    expect(seams.emitReviewGate).toHaveBeenCalledWith(MASTER, 0);
+    expect(seams.clearReviewGate).not.toHaveBeenCalled();
+
+    // First comment lands → re-fires with count 1 (Submit would ENABLE). FALSIFIABILITY: if the seam
+    // keyed only on (on, planPath) and ignored the count, this re-fire would NOT happen → RED.
+    r.reconcile(200);
+    expect(seams.emitReviewGate).toHaveBeenCalledWith(MASTER, 1);
+
+    // Second comment → count 2.
+    r.reconcile(300);
+    expect(seams.emitReviewGate).toHaveBeenCalledWith(MASTER, 2);
+
+    // Gate OFF → clearReviewGate.
+    r.reconcile(400);
+    expect(seams.clearReviewGate).toHaveBeenCalledTimes(1);
+  });
+
+  it("a backward scrub from gate-on to before-gate ⇒ clearReviewGate fires (un-invertible revert)", () => {
+    const story: StoryFrame[] = [
+      { tMs: 0, frame: { t: "open_plan", path: MASTER } },
+      { tMs: 1000, frame: { t: "review_gate", on: true, planPath: MASTER } },
+    ];
+    const { seams } = makeSeams();
+    const r = createReconciler(seams, story);
+
+    r.reconcile(1000);
+    expect(seams.emitReviewGate).toHaveBeenCalledTimes(1);
+    r.reconcile(0); // rewind before the gate frame → projected gate off → clearReviewGate.
+    expect(seams.clearReviewGate).toHaveBeenCalledTimes(1);
   });
 });
 

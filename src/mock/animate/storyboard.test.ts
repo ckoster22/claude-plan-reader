@@ -102,8 +102,14 @@ import {
   B4_SIZER_MS,
   B4_OUTCOME_MS,
   EXEC_BASE_MS,
+  // (c5) in-process "Request changes" review-bar constants.
+  REVIEW_GATE_ON_MS,
+  REVIEW_GATE_OFF_MS,
+  REVIEW_SUBMIT_MOVE_MS,
+  REVIEW_SUBMIT_CLICK_MS,
   type StoryFrame,
 } from "./storyboard";
+import { applyReviewBarState } from "../../review";
 import { WAITING_INPUT_LABEL } from "../../conversation/stream";
 import type { ToolPermissionRequested } from "../../conversation/types";
 import type { CommentRecord, PlanRecord, ReviewRequest } from "../../types";
@@ -1099,7 +1105,9 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
   const C1_PAINT_MS = 59800 + CMT_SHIFT;
   const C2_PAINT_MS = 63800 + CMT_SHIFT;
   const C3_PAINT_MS = 67800 + CMT_SHIFT;
-  const V2_OPEN_MS = 69000 + CMT_SHIFT;
+  // (c5) The V2 reveal slid from literal 69000 → 69500 (the in-process review-bar dwell + the slower
+  // cursor travel to "Request changes" + the gate-OFF frame now sit between the 3rd comment and V2).
+  const V2_OPEN_MS = 69500 + CMT_SHIFT;
 
   it("projectSurfaceState.comments grows 1 → 2 → 3 over the set_comments frames (on the open V1 master)", () => {
     // The V1 master is open; comments are scoped to that open path.
@@ -1200,6 +1208,111 @@ describe("storyboard — TRAILHEAD_BEAT comment-and-iterate chapter", () => {
     expect(model.derive().working).not.toBeNull();
     applyUpToTime(model, TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT));
     expect(model.derive().working).toBeNull();
+  });
+});
+
+// ---- (c5 — review2) IN-PROCESS "Request changes" review bar ------------------------------------
+//
+// review2 c5: the comment chapter was MISSING the review surface the real app shows at the TOP of the
+// reading column. We now drive the REAL in-process #review-bar (VIEWING / IN-PROCESS mode → Submit
+// "Request changes") for the OPEN master, THEN travel the cursor to "Request changes" + click. The bar
+// must coexist with the inline comment highlights at the SAME T (the c5 invariant), Submit must be
+// DISABLED at 0 comments and ENABLED at >=1 (applyReviewBarState keyed on the count), and the FAITHFUL
+// source MUST be "in-process" (the EXTERNAL path yields "Submit" + would wipe highlights — falsified
+// below). Live tMs = the COMMENT_AND_V2 literal + CMT_SHIFT (= PROTO_ACT_SHIFT + CLARIFIER_SHIFT +
+// C4_SHIFT), exactly like the comment-chapter tests above.
+describe("storyboard — (c5) in-process Request-changes review bar", () => {
+  const CMT_SHIFT = PROTO_ACT_SHIFT + CLARIFIER_SHIFT + C4_SHIFT;
+  const GATE_ON_MS = REVIEW_GATE_ON_MS + CMT_SHIFT;
+  const GATE_OFF_MS = REVIEW_GATE_OFF_MS + CMT_SHIFT;
+  const SUBMIT_MOVE_MS = REVIEW_SUBMIT_MOVE_MS + CMT_SHIFT;
+  const SUBMIT_CLICK_MS = REVIEW_SUBMIT_CLICK_MS + CMT_SHIFT;
+  const C3_PAINT_MS = 67800 + CMT_SHIFT; // the 3rd comment lands (count = 3)
+
+  it("at the comment-chapter T the in-process review_gate is ON for the open master AND the inline highlights are present at the SAME T", () => {
+    // THE c5 INVARIANT: pick a T AFTER all three comments land (count=3) and inside the gate window —
+    // both the in-process gate (the "Request changes" bar) AND the comment highlights are live.
+    const T = C3_PAINT_MS;
+    const at = projectSurfaceState(TRAILHEAD_BEAT, T);
+    // (1) the open plan is the master and (2) it carries all THREE comment records (the highlights).
+    expect(at.openPlanPath).toBe(TRAILHEAD_MASTER_PATH);
+    expect(at.comments).toHaveLength(3);
+    // (3) the in-process review gate is ON for THAT SAME open plan (so viewingGate() matches without a
+    // re-open). FALSIFIABILITY: drive the EXTERNAL pending-reviews path instead of review_gate and
+    // at.reviewGate.on stays false → RED.
+    expect(at.reviewGate.on).toBe(true);
+    expect(at.reviewGate.planPath).toBe(TRAILHEAD_MASTER_PATH);
+
+    // (4) the highlights actually PAINT: render the master + applyComments and count the .cmt-hl spans.
+    const pane = document.createElement("div");
+    pane.id = "reading-pane";
+    document.body.appendChild(pane);
+    renderInto(pane, TRAILHEAD_MASTER_DOC, "/Users/mock/.claude/plans");
+    applyComments(pane, at.comments);
+    expect(pane.querySelectorAll(".cmt-hl").length).toBeGreaterThanOrEqual(3);
+    document.body.removeChild(pane);
+
+    // (5) the REAL bar derivation at this T (in-process, 3 comments) → VISIBLE, "Request changes",
+    // ENABLED. This is the production derivation main.ts feeds from orchSnapshot — the bar would render
+    // exactly this. FALSIFIABILITY: source "external" → submitLabel "Submit" (asserted below).
+    const bar = applyReviewBarState({ pendingCount: 1, viewing: true, viewedCommentCount: 3, source: "in-process" });
+    expect(bar.barVisible).toBe(true);
+    expect(bar.submitLabel).toBe("Request changes");
+    expect(bar.submitDisabled).toBe(false);
+  });
+
+  it("applyReviewBarState transitions Submit DISABLED→ENABLED keyed on the comment count (in-process)", () => {
+    // 0 comments → DISABLED; >=1 → ENABLED. This is the disabled→enabled gate the comment-chapter beat
+    // exercises (gate ON at 0 comments, then the three set_comments enable it). FALSIFIABILITY: if
+    // submitDisabled were keyed on something other than the count (e.g. always false), the 0-comment
+    // assertion goes RED.
+    const at0 = applyReviewBarState({ pendingCount: 1, viewing: true, viewedCommentCount: 0, source: "in-process" });
+    expect(at0.barVisible).toBe(true);
+    expect(at0.submitDisabled).toBe(true);
+    expect(at0.submitLabel).toBe("Request changes");
+
+    const at1 = applyReviewBarState({ pendingCount: 1, viewing: true, viewedCommentCount: 1, source: "in-process" });
+    expect(at1.submitDisabled).toBe(false);
+
+    const at3 = applyReviewBarState({ pendingCount: 1, viewing: true, viewedCommentCount: 3, source: "in-process" });
+    expect(at3.submitDisabled).toBe(false);
+  });
+
+  it("FALSIFIABILITY — the EXTERNAL source yields 'Submit' (NOT 'Request changes'): the in-process source is load-bearing", () => {
+    // The naive/wrong path (emitReviewRequested → source "external") produces the WRONG label. This
+    // pins WHY the c5 surface must be in-process. If applyReviewBarState ever returned "Request changes"
+    // for an external review, this goes RED.
+    const ext = applyReviewBarState({ pendingCount: 1, viewing: true, viewedCommentCount: 3, source: "external" });
+    expect(ext.submitLabel).toBe("Submit");
+  });
+
+  it("the gate window brackets the cursor's Request-changes click: ON < the 3rd comment < cursor click < OFF", () => {
+    // Ordering: the bar appears BEFORE the comments finish, the cursor clicks "Request changes" while the
+    // gate is still ON, and the gate clears AFTER the click (the user requested changes). The cursor
+    // move/click target #review-submit — the REAL in-process bar button.
+    expect(GATE_ON_MS).toBeLessThan(C3_PAINT_MS);
+    expect(C3_PAINT_MS).toBeLessThan(SUBMIT_MOVE_MS);
+    expect(SUBMIT_MOVE_MS).toBeLessThan(SUBMIT_CLICK_MS);
+    expect(SUBMIT_CLICK_MS).toBeLessThan(GATE_OFF_MS);
+
+    // The gate is ON across the click and OFF after it (pure projection of T).
+    expect(projectSurfaceState(TRAILHEAD_BEAT, SUBMIT_CLICK_MS).reviewGate.on).toBe(true);
+    expect(projectSurfaceState(TRAILHEAD_BEAT, GATE_OFF_MS).reviewGate.on).toBe(false);
+
+    // The cursor's move + click target #review-submit (the "Request changes" button).
+    const moves = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "cursor_move" && sf.frame.target === "#review-submit");
+    const clicks = TRAILHEAD_BEAT.filter((sf) => sf.frame.t === "cursor_click" && sf.frame.target === "#review-submit");
+    // (one #review-submit move/click also lives in the prototype chapter — assert the c5 pair lands in
+    // the comment-chapter window, after the gate turns on).
+    expect(moves.some((sf) => sf.tMs >= GATE_ON_MS && sf.tMs <= GATE_OFF_MS)).toBe(true);
+    expect(clicks.some((sf) => sf.tMs >= GATE_ON_MS && sf.tMs <= GATE_OFF_MS)).toBe(true);
+  });
+
+  it("after the gate turns OFF (and the master/V2 reveal) the review_gate is off at duration", () => {
+    // A backward-revertible pure projection: the gate is OFF at the very end (no stuck in-process bar).
+    expect(projectSurfaceState(TRAILHEAD_BEAT, storyDurationMs(TRAILHEAD_BEAT)).reviewGate.on).toBe(false);
+    // And it was genuinely ON earlier (so the off-at-duration assertion is meaningful, not vacuous).
+    expect(projectSurfaceState(TRAILHEAD_BEAT, C3_PAINT_MS).reviewGate.on).toBe(true);
   });
 });
 

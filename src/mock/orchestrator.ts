@@ -29,7 +29,7 @@ import {
   type OrchestratorObserver,
   type PlanTreeSnapshot2,
 } from "../conversation/orchestrator";
-import { gateSnapshot, placeholderSnapshot } from "./fixtures/reviews";
+import { gateSnapshot, approvalGateSnapshot, placeholderSnapshot } from "./fixtures/reviews";
 import type { ProtoPreviewOverride } from "./fixtures/reviews";
 
 // The observers main.ts (and anyone else) subscribes. emitGate() fans to all of them.
@@ -114,6 +114,28 @@ export function emitGate(
   } else if (which === "acceptance" && snap.pendingAcceptance) {
     for (const o of observers) o.onAcceptanceReview?.(snap.pendingAcceptance);
   }
+}
+
+// Drive the bar into the IN-PROCESS APPROVAL "Request changes" VIEWING mode (review2 c5): register as
+// active, then fan a real snapshot carrying a held pendingApproval gate whose `planPath` EQUALS the
+// already-open plan. We fan ONLY onSnapshot (sets orchSnapshot + refreshReviewBar) — NOT
+// onAwaitingApproval, whose production hook calls openPlan(gate.planPath) and re-renders the reading
+// pane, WIPING the freshly-applied comment highlights. Because the plan is already open, main.ts's
+// viewingGate() matches WITHOUT a re-open, so currentReviewSource() reports "in-process" → the Submit
+// button relabels to "Request changes" and #review-bar shows in VIEWING mode. Leaves the fake as the
+// active orchestrator until clearGate()/clearApprovalGate() runs.
+export function emitApprovalGate(planPath: string): void {
+  active = true;
+  __setActiveOrchestratorForTest(handle);
+  const snap = approvalGateSnapshot(planPath);
+  lastSnapshot = snap;
+  for (const o of observers) o.onSnapshot?.(snap);
+}
+
+// Clear the in-process approval gate (mirrors clearGate but documented for the c5 path). Deregisters
+// as active and fans a terminal so main.ts drops orchSnapshot and refreshReviewBar hides the bar.
+export function clearApprovalGate(): void {
+  clearGate();
 }
 
 // Drive ONLY the sidebar live-run placeholder (no review-bar mode): register as active + fan a

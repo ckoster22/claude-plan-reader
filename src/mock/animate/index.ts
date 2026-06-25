@@ -34,12 +34,18 @@ import { ConversationModel } from "../../conversation/stream";
 import { renderTree } from "../../conversation/render";
 import { createMinimap } from "../../conversation/minimap";
 import { invoke } from "../core";
-import { setPlans, setPendingReviews } from "../state";
+import { setPlans, setPendingReviews, setCommentCount } from "../state";
 import { emitMockEvent } from "../event";
-import { emitGate, clearGate, installMockOrchestrator } from "../orchestrator";
+import {
+  emitGate,
+  clearGate,
+  emitApprovalGate,
+  clearApprovalGate,
+  installMockOrchestrator,
+} from "../orchestrator";
 import { applyComments, renderInto, settle } from "../../render";
 import { extractToc } from "../../render/toc";
-import { buildToc } from "../../main";
+import { buildToc, refreshCommentCount } from "../../main";
 import { trailheadProtoPreviewOverride } from "../fixtures/markdown";
 import {
   applyUpToTime,
@@ -850,6 +856,19 @@ function mountPlayer(): void {
       emitGate: (_which: "prototype", round?: number): void =>
         emitGate("prototype", round, trailheadProtoPreviewOverride(round ?? 1)),
       clearGate,
+      // (c5) In-process approval-review gate: set the mock comment count FIRST (the value the real
+      // get_comment_count returns), fan the onSnapshot-only gate for the OPEN plan (viewingGate()
+      // matches WITHOUT a re-open → #review-bar VIEWING / IN-PROCESS, Submit "Request changes"), then
+      // re-read the count through the REAL refreshCommentCount (→ refreshReviewBar with the authoritative
+      // count, so Submit is disabled at 0 / enabled at >=1). No onAwaitingApproval → highlights survive.
+      emitReviewGate: (planPath: string, commentCount: number): void => {
+        setCommentCount(commentCount);
+        emitApprovalGate(planPath);
+        void refreshCommentCount();
+      },
+      clearReviewGate: (): void => {
+        clearApprovalGate();
+      },
       // Active tab: click the real tab button (never un-hide #conversation-stream).
       setActiveTab: (tab: "plan" | "conversation"): void => {
         clickTab(tab);

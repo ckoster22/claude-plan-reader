@@ -24,6 +24,7 @@ import type { ReviewRequest } from "../../types";
 import type {
   PrototypeGate,
   AcceptanceGate,
+  ApprovalGate2,
   PlanTreeSnapshot2,
   TreeNode,
   RecursiveLedger,
@@ -166,6 +167,40 @@ export function gateSnapshot(
     pendingClarify: null,
     pendingPrototype: which === "prototype" ? proto : null,
     pendingAcceptance: which === "acceptance" ? accept : null,
+  };
+}
+
+// ---- in-process APPROVAL gate fixture (the "Request changes" VIEWING bar) --------------------
+//
+// The mock-ANIMATE comment chapter (review2 c5) shows the user requesting changes on the master plan
+// THEY ARE ALREADY VIEWING. The faithful surface is the orchestrator's held APPROVAL gate
+// (pendingApproval, an ApprovalGate2) whose `planPath` EQUALS the open plan — so main.ts's
+// viewingGate() matches (gate.planPath === openPath) WITHOUT a re-open, currentReviewSource() reports
+// "in-process" (→ Submit label "Request changes"), and orchGatePending=1 makes the bar visible. The
+// gate is fanned through main.ts's OWN subscribed onSnapshot observer (NOT onAwaitingApproval, which
+// would openPlan(gate.planPath) and re-render the pane, wiping the freshly-applied comment highlights).
+//
+// `planPath` is the SOLE field viewingGate() reads (it matches it against openPath). The rest satisfy
+// the exhaustive ApprovalGate2 shape — a "decomposition" gate for the master plan, redraftCount 0.
+export function approvalGateSnapshot(planPath: string): PlanTreeSnapshot2 {
+  const gate: ApprovalGate2 = {
+    path: [parseNn(1)],
+    kind: "decomposition",
+    toolUseId: "toolu_mock_master_review",
+    planPath,
+    plansDirPath: `${GATE_CWD}/.plan-tree`,
+    redraftCount: 0,
+  };
+  return {
+    treeId: "tree-mock-gate",
+    root: splitRoot(),
+    activePath: null,
+    writePolicy: "plan",
+    done: false,
+    pendingApproval: gate,
+    pendingClarify: null,
+    pendingPrototype: null,
+    pendingAcceptance: null,
   };
 }
 

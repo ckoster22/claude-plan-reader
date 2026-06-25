@@ -80,6 +80,17 @@ export interface ReconcilerSeams {
   emitGate: (which: "prototype", round?: number) => void;
   clearGate: () => void;
 
+  // ---- (c5) in-process approval-review gate ("Request changes" VIEWING bar) --------------------
+  // Drive the in-process orchestrator approval gate for the open plan at `planPath`, pushing the open
+  // plan's authoritative `commentCount` so #review-bar shows in VIEWING / IN-PROCESS mode (Submit
+  // "Request changes", disabled at 0 comments → enabled at >=1). The player emits an onSnapshot-only
+  // gate (NOT onAwaitingApproval, which re-opens + wipes highlights) + fires onCommentCountChanged so
+  // main.ts's commentCount + refreshReviewBar reflect the count. OPTIONAL so pre-c5 player wiring + unit
+  // tests that omit it still typecheck (the reconciler guards the call).
+  emitReviewGate?: (planPath: string, commentCount: number) => void;
+  // Clear the in-process approval gate (the bar reverts). OPTIONAL (guarded).
+  clearReviewGate?: () => void;
+
   // ---- active tab (click the real tab button; never un-hide #conversation-stream) ----
   setActiveTab: (tab: "plan" | "conversation") => void;
 
@@ -183,6 +194,10 @@ export function createReconciler(
   // (c4) Sidebar tab: the last-applied projected value, so setSidebarTab fires only on change (mirrors
   // reconcileActiveTab). null ⇒ never applied.
   let lastSidebarTab: "plans" | "contents" | null = null;
+  // (c5) In-process review gate: the last-applied key (on|planPath|count). Re-drives the gate seam when
+  // EITHER the gate toggles/moves OR the open plan's comment count changes (so Submit disabled→enabled
+  // tracks the growing comment set). null ⇒ never applied.
+  let lastReviewGateKey: string | null = null;
 
   function reconcileReadingPane(surface: SurfaceState): void {
     const key = `${surface.openPlanPath ?? " null"}|${commentsKey(surface.comments)}`;
@@ -271,6 +286,28 @@ export function createReconciler(
   function reconcileActiveTab(surface: SurfaceState, prev: SurfaceState | null): void {
     if (prev !== null && prev.activeTab === surface.activeTab) return;
     seams.setActiveTab(surface.activeTab);
+  }
+
+  // (c5) Drive the IN-PROCESS approval-review gate ("Request changes" VIEWING bar). Keyed on
+  // (on, planPath, commentCount): when on, emit the in-process gate for `planPath` + push the open
+  // plan's projected comment count (so Submit is DISABLED at 0 comments, ENABLED at >=1 — the bar
+  // re-derives as each set_comments grows the count). When off, clear the gate. Re-fires on EITHER a
+  // gate toggle/move OR a comment-count change, so the disabled→enabled transition is reconciled even
+  // while the gate stays on. A backward scrub re-derives the key from scratch (pure fn of T) so the
+  // gate clears / re-disables cleanly. Runs AFTER reconcileReadingPane (highlights painted) and
+  // reconcileGate (the prototype gate cleared) so the in-process bar is the highest-precedence surface.
+  function reconcileReviewGate(surface: SurfaceState): void {
+    if (!seams.emitReviewGate || !seams.clearReviewGate) return;
+    const gate = surface.reviewGate;
+    const count = surface.comments.length;
+    const key = gate.on && gate.planPath !== null ? `on|${gate.planPath}|${count}` : "off";
+    if (key === lastReviewGateKey) return;
+    lastReviewGateKey = key;
+    if (gate.on && gate.planPath !== null) {
+      seams.emitReviewGate(gate.planPath, count);
+    } else {
+      seams.clearReviewGate();
+    }
   }
 
   // (c4) Drive the SIDEBAR tab (Plans / Contents) to the projected value only on change (mirrors
@@ -444,6 +481,10 @@ export function createReconciler(
     reconcileSidebar(surface, prev);
     reconcileReviewBar(surface, prev);
     reconcileGate(surface, prev);
+    // (c5) The in-process approval-review gate runs AFTER reconcileGate (prototype cleared) + the
+    // reading-pane rebuild (highlights painted), so its "Request changes" VIEWING bar is the
+    // highest-precedence surface and coexists with the inline comment highlights.
+    reconcileReviewGate(surface);
     reconcileActiveTab(surface, prev);
     // (c4) Switch the sidebar Plans/Contents tab BEFORE the cursor pass — switching to Contents un-hides
     // #tab-contents, giving the `.toc-item` elements the cursor targets a non-zero rect to resolve to.
