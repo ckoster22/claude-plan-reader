@@ -53,6 +53,8 @@ import {
   TRAILHEAD_BEAT,
   WARP_POINT_MS,
   TERMINAL_LAND_MS,
+  QUOTA_START_MS,
+  QUOTA_END_MS,
   type StoryFrame,
 } from "./storyboard";
 import { createReconciler } from "./reconcile";
@@ -418,8 +420,14 @@ const SPEEDS = [0.5, 1, 2, 4, 8] as const;
 // This affects the AUTOPLAY ADVANCE ONLY — it composes with (multiplies) the UI `speed()` selector and
 // touches NOTHING about the T→frame mapping. tFromPointer (scrub/seek), the progress fraction, getDuration,
 // and every pure f(T) projection stay LINEAR in T. Pure + exported so it is unit-testable without a RAF loop.
-export const tickRate = (t: number, speed: number): number =>
-  (t >= WARP_POINT_MS && t < TERMINAL_LAND_MS ? 4 * speed : speed);
+// (P2) The quota-wall scene [QUOTA_START_MS, QUOTA_END_MS) sits INSIDE the 4× warp window, but the
+// countdown + resume beat must be LEGIBLE — so it is a 1× ISLAND: inside it the advance is the plain UI
+// speed (no 4× multiplier). Bounds are DERIVED from the storyboard (QUOTA_START_MS/QUOTA_END_MS), so a
+// re-time can't desync the island from the scene. Checked BEFORE the warp window so it wins inside it.
+export const tickRate = (t: number, speed: number): number => {
+  if (t >= QUOTA_START_MS && t < QUOTA_END_MS) return speed;
+  return t >= WARP_POINT_MS && t < TERMINAL_LAND_MS ? 4 * speed : speed;
+};
 
 // ---- player ----------------------------------------------------------------------------------
 

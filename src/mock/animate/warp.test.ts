@@ -17,6 +17,8 @@ import {
   TERMINAL_LAND_MS,
   TERMINAL_MS,
   EXEC_BASE_MS,
+  QUOTA_START_MS,
+  QUOTA_END_MS,
 } from "./storyboard";
 
 describe("tickRate (pure autoplay-rate helper)", () => {
@@ -36,6 +38,22 @@ describe("tickRate (pure autoplay-rate helper)", () => {
     // at and after TERMINAL_LAND_MS (the exclusive upper bound): the terminal "done" beat lands at 1×
     expect(tickRate(TERMINAL_LAND_MS, 1)).toBe(1);
     expect(tickRate(TERMINAL_MS, 1)).toBe(1);
+  });
+
+  it("(P2) the quota-wall scene is a 1× ISLAND inside the 4× warp window (FIX B guard)", () => {
+    // The scene sits INSIDE [WARP_POINT_MS, TERMINAL_LAND_MS) but must be legible → 1× (plain UI speed).
+    const inQuota = (QUOTA_START_MS + QUOTA_END_MS) / 2;
+    expect(inQuota).toBeGreaterThan(WARP_POINT_MS);
+    expect(inQuota).toBeLessThan(TERMINAL_LAND_MS);
+    expect(tickRate(QUOTA_START_MS, 1)).toBe(1);
+    expect(tickRate(inQuota, 1)).toBe(1);
+    expect(tickRate(QUOTA_END_MS - 1, 1)).toBe(1);
+    // A T inside the warp window but OUTSIDE the quota island still warps at 4×.
+    expect(tickRate(WARP_POINT_MS + 1, 1)).toBe(4);
+    // At/after QUOTA_END_MS (the exclusive upper bound) the 4× warp resumes (still inside the warp window).
+    expect(tickRate(QUOTA_END_MS, 1)).toBe(4);
+    // The island composes with the UI speed too (plain passthrough, no 4×).
+    expect(tickRate(inQuota, 2)).toBe(2);
   });
 
   it("composes with (multiplies) the UI speed selector so the speed control still works", () => {

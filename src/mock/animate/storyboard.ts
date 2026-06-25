@@ -74,7 +74,15 @@ export type ModelFrame =
   // A verbatim system-message echo at an explicit seq — appended via appendSystemMessageAt(text, seq).
   | { t: "system_message"; text: string; seq: number }
   // The held permission `id` was resolved (allow/deny) — appended via appendPermissionResolved(id, seq).
-  | { t: "permission_resolved"; id: string; seq: number };
+  | { t: "permission_resolved"; id: string; seq: number }
+  // (P2) The quota-exhaustion WAITING banner — appended via appendQuotaBanner(). Its reveal time (the
+  // StoryFrame.tMs handed to applyModelFrame as `tMs`) is the scene's quotaStartMs; the banner's
+  // frozenRemainingMs is a PURE fn of (tMs, T) via quotaFrozenRemainingMs, so the countdown races 3h04m→0
+  // as scrub-time advances. Carries no seq — appendQuotaBanner places the singleton at lastWireSeq + 0.5.
+  | { t: "quota_banner" }
+  // (P2) The quota refreshed — appended via clearQuotaBanner() (tombstones the singleton → buildTree
+  // drops the banner node). Carries no seq.
+  | { t: "quota_resumed" };
 
 // ---- SurfaceFrame variants ---------------------------------------------------------------------
 //
@@ -182,6 +190,29 @@ function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
+// ---- (P2) Quota-wall scene timing — a PURE, scrub-driven countdown ------------------------------
+//
+// The quota-exhaustion beat between subplan 03 and 04: a "Usage limit reached" banner whose countdown
+// STARTS at 3h 04m and races to 0:00:00 as a pure function of scrub-time T (compressed over ~8s of demo
+// time). The banner first holds READABLE for QUOTA_READ_HOLD_MS (so it lands on 03:04:00 long enough to
+// read), THEN races linearly over QUOTA_RACE_MS. Both applyModelFrame (the displayed value) AND
+// modelSignature (the per-second re-render key) call quotaFrozenRemainingMs so they can NEVER disagree.
+export const QUOTA_TOTAL_MS = 11_040_000; // 3h 04m — the displayed starting remaining.
+const QUOTA_READ_HOLD_MS = 2000; // banner sits at the full 03:04:00 this long before the countdown moves.
+const QUOTA_RACE_MS = 8000; // the compressed race-to-zero window (≈8s of demo time).
+// A FIXED epoch-ms reset time so the banner's secondary "Resets at {clock}" line is stable across every
+// re-apply (a pure-of-T value would otherwise drift the clock each scrub tick). Value is arbitrary but
+// constant; the demo never compares it to Date.now() (frozenRemainingMs drives the countdown instead).
+const QUOTA_RESET_EPOCH_MS = 1_800_000_000_000;
+
+// The banner's remaining-ms at scrub time T, given the banner's reveal time `frameTMs` (= quotaStartMs).
+// Holds at QUOTA_TOTAL_MS for the first QUOTA_READ_HOLD_MS, then races linearly to 0 over QUOTA_RACE_MS.
+// PURE fn of (frameTMs, T) — the single source of truth shared by applyModelFrame + modelSignature.
+export function quotaFrozenRemainingMs(frameTMs: number, T: number): number {
+  const frac = clamp01((T - frameTMs - QUOTA_READ_HOLD_MS) / QUOTA_RACE_MS);
+  return Math.round(QUOTA_TOTAL_MS * (1 - frac));
+}
+
 // Apply a single MODEL frame onto the model at scrub time T. SurfaceFrames are model no-ops (handled
 // by projectSurfaceState/reconcile, never the model). The switch is exhaustive over Frame's `t`
 // discriminator so adding a new envelope variant is a compile error until handled here.
@@ -222,6 +253,22 @@ export function applyModelFrame(
       break;
     case "permission_resolved":
       model.appendPermissionResolved(frame.id, frame.seq);
+      break;
+    case "quota_banner": {
+      // (P2) The waiting banner. `tMs` is the scene's quotaStartMs; frozenRemainingMs is a PURE fn of
+      // (tMs, T) so the countdown races as scrub-time advances. The singleton lands at lastWireSeq + 0.5.
+      model.appendQuotaBanner({
+        state: "waiting",
+        resetAt: QUOTA_RESET_EPOCH_MS,
+        remaining: 1,
+        source: "rate_limit_event",
+        frozenRemainingMs: quotaFrozenRemainingMs(tMs, T),
+      });
+      break;
+    }
+    case "quota_resumed":
+      // (P2) Quota refreshed — tombstone the singleton so buildTree drops the banner node.
+      model.clearQuotaBanner();
       break;
     // SurfaceFrames are model no-ops — projected by projectSurfaceState, never applied here.
     case "open_plan":
@@ -551,6 +598,12 @@ export function projectSidebarTab(story: ReadonlyArray<StoryFrame>, T: number): 
 export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): string {
   let countModelFramesLeqT = 0;
   let revealPrefixLen = 0;
+  // (P2 / FIX A) The quota-banner countdown ticks WITHOUT any new frame entering the ≤T set, so the
+  // count|reveal key alone is static during the race and the countdown would render once and freeze.
+  // Fold in the currently-displayed countdown SECOND whenever a quota_banner frame is active (its tMs ≤
+  // T and it has NOT yet been cleared by a quota_resumed frame ≤ T) so the pane re-renders each second.
+  let quotaBannerTMs: number | null = null;
+  let quotaResumed = false;
   for (const sf of story) {
     if (sf.tMs > T) continue;
     if (isSurfaceFrame(sf.frame) || isOverlayFrame(sf.frame)) continue;
@@ -566,8 +619,14 @@ export function modelSignature(story: ReadonlyArray<StoryFrame>, T: number): str
       const fraction = clamp01((T - sf.tMs) / frame.revealMs);
       revealPrefixLen += Math.floor(fraction * frame.ev.text.length);
     }
+    if (frame.t === "quota_banner") quotaBannerTMs = sf.tMs;
+    if (frame.t === "quota_resumed") quotaResumed = true;
   }
-  return `${countModelFramesLeqT}|${revealPrefixLen}`;
+  const quotaKey =
+    quotaBannerTMs !== null && !quotaResumed
+      ? `|q${Math.floor(quotaFrozenRemainingMs(quotaBannerTMs, T) / 1000)}`
+      : "";
+  return `${countModelFramesLeqT}|${revealPrefixLen}${quotaKey}`;
 }
 
 // ---- TRAILHEAD_BEAT — a fictional, public-safe conversation beat -----------------------------
@@ -3376,13 +3435,26 @@ const EXEC_SUBPLANS: ExecSubplan[] = [
 // wrap-up + the terminal `result` (strictly highest seq AND tMs).
 const EXEC_STEP_MS = 600; // inter-frame tMs step within the Execution chapter (atomic pairs share one tMs).
 
-function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminalMs: number; warpPointMs: number } {
+function buildExecution(): {
+  frames: StoryFrame[];
+  terminalSeq: number;
+  terminalMs: number;
+  warpPointMs: number;
+  quotaStartMs: number;
+  quotaEndMs: number;
+} {
   const frames: StoryFrame[] = [];
   let seq = EXEC_SEQ_BASE;
   let tMs = EXEC_BASE_MS;
   const step = () => {
     tMs += EXEC_STEP_MS;
   };
+
+  // (P2) The quota-wall scene bounds, captured from the running cursor when the beat is emitted at the
+  // 03→04 boundary (see emitQuotaBeat). Both are DERIVED from the builder — never hard-coded — so a
+  // re-time can't desync them from the frames OR from index.ts's tickRate 1× island.
+  let quotaStartMs = 0;
+  let quotaEndMs = 0;
 
   // (c6 — review2) The autoplay 4× WARP begins HERE: the tMs at which subplan 01 has FULLY played in
   // detail — i.e. the boundary frame where the SECOND subplan's row appears. Captured from the builder's
@@ -3502,7 +3574,48 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
     deferredResult: "Execution order: start with subplan 01 (Trail data & search) — it is the root dependency for 02/03/04. Subplans 01–04 then run in order.",
   });
 
+  // (P2) The quota-wall scene, authored INSIDE the loop at the 03→04 boundary via the SAME step()/seq++
+  // cursor — so everything downstream (04.x, terminal, duration, warp/land constants) flows automatically
+  // (no SHIFT constants, no bumped literals). Replays the real quota-exhaustion flow: a brief narration, a
+  // "Usage limit reached" WAITING banner whose countdown races 3h04m→0 as a pure f(T), then a tombstone +
+  // a visible "resuming" notice. quotaStartMs/quotaEndMs are captured from the running cursor.
+  const emitQuotaBeat = (): void => {
+    // Lead-in narration (matches the chapter's per-beat narrate style). Anchors the banner's seq: the
+    // singleton lands at lastWireSeq + 0.5, i.e. just after this assistant_text.
+    narrate(
+      "Mid-turn I hit the usage limit. Nothing to do here — the session pauses and auto-resumes the in-flight turn the moment the quota refreshes.",
+      700,
+    );
+    // The WAITING banner appears. Its tMs IS quotaStartMs (handed to applyModelFrame, which drives the
+    // pure-of-T countdown via quotaFrozenRemainingMs).
+    step();
+    quotaStartMs = tMs;
+    frames.push({ tMs: quotaStartMs, chapterLabel: "Quota wait", frame: { t: "quota_banner" } });
+
+    // Let the banner READ (~QUOTA_READ_HOLD_MS) then the countdown RACE (~QUOTA_RACE_MS) to 0:00:00, plus
+    // a short beat to read the zero, before resuming. Advance the running cursor via the SAME step()
+    // machinery so the downstream tMs/seq flow is untouched.
+    const resumeAtMs = quotaStartMs + QUOTA_READ_HOLD_MS + QUOTA_RACE_MS + 1400;
+    while (tMs < resumeAtMs) step();
+
+    // Quota refreshed: tombstone the banner, then a visible "resuming" notice (a system bubble, consuming
+    // a builder seq++ so 04's frames get the next contiguous integers — never a colliding explicit seq).
+    frames.push({ tMs, frame: { t: "quota_resumed" } });
+    frames.push({
+      tMs,
+      frame: { t: "system_message", text: "Quota refreshed — resuming the in-flight turn.", seq: seq++ },
+    });
+
+    // Close the scene one beat later — quotaEndMs is the cursor BEFORE subplan 04.01's row reveals.
+    step();
+    quotaEndMs = tMs;
+  };
+
   for (const sp of EXEC_SUBPLANS) {
+    // (P2) Insert the quota-wall scene at the 03→04 boundary: after subplan 03's done/review beat (the
+    // prior loop iteration) and before subplan 04.01 reveals.
+    if (sp.id === "04.01") emitQuotaBeat();
+
     // (a) The subplan's ROW(s) APPEAR — grow the revealed set, then emit the full pre-ordered snapshot.
     // The snapshot frame carries a per-subplan chapterLabel so the scrubber has a navigable marker at
     // each subplan's turn (the progressive chapter is long; one "Execution" marker would be too sparse).
@@ -3574,7 +3687,7 @@ function buildExecution(): { frames: StoryFrame[]; terminalSeq: number; terminal
     },
   });
 
-  return { frames, terminalSeq, terminalMs, warpPointMs };
+  return { frames, terminalSeq, terminalMs, warpPointMs, quotaStartMs, quotaEndMs };
 }
 
 const EXEC_BUILT = buildExecution();
@@ -3597,6 +3710,12 @@ export const TERMINAL_MS = EXEC_BUILT.terminalMs;
 //   • TERMINAL_LAND_MS = a fixed lead-in before the terminal "done"/result beat, so that beat plays back
 //     at 1× and LANDS. Derived from TERMINAL_MS minus a one-beat lead.
 export const WARP_POINT_MS = EXEC_BUILT.warpPointMs;
+
+// (P2) The quota-wall scene bounds — captured from the Execution builder's running cursor at the 03→04
+// boundary. Exposed for index.ts's tickRate 1× island so the beat plays at normal speed (it sits INSIDE
+// the 4× warp window). DERIVED, never literals, so a re-time keeps the island anchored to the scene.
+export const QUOTA_START_MS = EXEC_BUILT.quotaStartMs;
+export const QUOTA_END_MS = EXEC_BUILT.quotaEndMs;
 // The terminal-landing lead: long enough that the final integration wrap-up + the "done" result beat play
 // at 1×. The wrap-up narration and the terminal result are the last two emitted frames (each +EXEC_STEP_MS
 // apart); land a couple of beats before TERMINAL_MS so the close reads at normal speed.

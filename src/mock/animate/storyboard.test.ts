@@ -112,8 +112,14 @@ import {
   REVIEW_GATE_OFF_MS,
   REVIEW_SUBMIT_MOVE_MS,
   REVIEW_SUBMIT_CLICK_MS,
+  // (P2) quota-wall scene constants/helper.
+  QUOTA_START_MS,
+  QUOTA_END_MS,
+  QUOTA_TOTAL_MS,
+  quotaFrozenRemainingMs,
   type StoryFrame,
 } from "./storyboard";
+import { formatCountdown } from "../../conversation/render";
 import { applyReviewBarState } from "../../review";
 import { WAITING_INPUT_LABEL } from "../../conversation/stream";
 import type { ToolPermissionRequested } from "../../conversation/types";
@@ -2517,5 +2523,78 @@ describe("storyboard — projectModalState (last-≤-T per kind, backward scrub)
     const back = projectModalState(STORY, 1700);
     expect(back.composer).toBe(true);
     expect(back.popover).toEqual({ on: true, target: "#blk" });
+  });
+});
+
+// ---- (P2) Quota-wall scene — the real quota-exhaustion flow between subplan 03 and 04 -------------
+//
+// A "Usage limit reached" WAITING banner whose countdown STARTS at 3h 04m and races to 0:00:00 as a PURE
+// fn of scrub-time T (held readable, then compressed over ~8s), then a tombstone + a visible "resuming"
+// notice — before subplan 04.01 begins. Falsifiable, invariant-first; uses the SAME projection the demo
+// uses (applyUpToTime → derive). The countdown second is folded into modelSignature (FIX A) so the pane
+// re-renders each second; without it the value is written once and freezes.
+describe("(P2) quota-wall scene — countdown 3h04m→resume between subplan 03 and 04", () => {
+  let model: ConversationModel;
+  beforeEach(() => {
+    model = new ConversationModel();
+  });
+
+  // The frozen remaining-ms of the (single) quota-banner node at the current model state, or undefined.
+  const frozenAt = (m: ConversationModel): number | undefined => {
+    const n = m.derive().nodes.find((x) => x.type === "quota-banner");
+    return n && n.type === "quota-banner" ? n.frozenRemainingMs : undefined;
+  };
+
+  it("BANNER PRESENT — a waiting banner reading 03:04:00 just after the scene opens", () => {
+    applyUpToTime(model, TRAILHEAD_BEAT, QUOTA_START_MS + 200);
+    const node = model.derive().nodes.find((n) => n.type === "quota-banner");
+    expect(node).toBeDefined();
+    expect(node && node.type === "quota-banner" && node.state).toBe("waiting");
+    const frozen = frozenAt(model);
+    // Still inside the read-hold → the banner sits at the full 3h 04m.
+    expect(frozen).toBe(QUOTA_TOTAL_MS);
+    expect(frozen).toBe(11_040_000);
+    expect(formatCountdown(frozen!)).toBe("03:04:00");
+  });
+
+  it("COUNTDOWN RACES + SIGNATURE CHANGES — value strictly decreases and modelSignature differs across 1s (FIX A guard)", () => {
+    // Two T's 1000ms apart INSIDE the race window (after the 2s read-hold, before the resume).
+    const T1 = QUOTA_START_MS + 4000;
+    const T2 = T1 + 1000;
+    applyUpToTime(model, TRAILHEAD_BEAT, T1);
+    const f1 = frozenAt(model);
+    applyUpToTime(model, TRAILHEAD_BEAT, T2);
+    const f2 = frozenAt(model);
+    expect(f1).toBeDefined();
+    expect(f2).toBeDefined();
+    // (i) the displayed remaining strictly DECREASES as scrub-time advances.
+    expect(f2!).toBeLessThan(f1!);
+    // (ii) the model signature DIFFERS across the 1s — the regression guard for the freeze bug.
+    expect(modelSignature(TRAILHEAD_BEAT, T1)).not.toBe(modelSignature(TRAILHEAD_BEAT, T2));
+  });
+
+  it("RESUME — past quotaEndMs the banner is gone, the resume notice is present, and subplan 04 begins after", () => {
+    applyUpToTime(model, TRAILHEAD_BEAT, QUOTA_END_MS + 50);
+    const nodes = model.derive().nodes;
+    // The banner node is tombstoned (cleared by quota_resumed) → no quota-banner in the tree.
+    expect(nodes.find((n) => n.type === "quota-banner")).toBeUndefined();
+    // The visible "resuming" notice IS present.
+    const resume = nodes.find(
+      (n) => n.type === "system" && n.text === "Quota refreshed — resuming the in-flight turn.",
+    );
+    expect(resume).toBeDefined();
+    // Subplan 04.01's row reveal is sequenced STRICTLY AFTER the quota window (04 begins after the wall).
+    const sp0401 = TRAILHEAD_BEAT.find((sf) => sf.chapterLabel === "Subplan 04.01");
+    expect(sp0401).toBeDefined();
+    expect(sp0401!.tMs).toBeGreaterThan(QUOTA_END_MS);
+  });
+
+  it("helper — quotaFrozenRemainingMs holds at 3h04m through the read-hold, then races to exactly 0", () => {
+    // Read-hold: at +200ms it is still the full total.
+    expect(quotaFrozenRemainingMs(QUOTA_START_MS, QUOTA_START_MS + 200)).toBe(QUOTA_TOTAL_MS);
+    // Mid-race it is strictly below the full total.
+    expect(quotaFrozenRemainingMs(QUOTA_START_MS, QUOTA_START_MS + 5000)).toBeLessThan(QUOTA_TOTAL_MS);
+    // After read-hold (2s) + race (8s) it has reached exactly 0.
+    expect(quotaFrozenRemainingMs(QUOTA_START_MS, QUOTA_START_MS + 10_000)).toBe(0);
   });
 });
